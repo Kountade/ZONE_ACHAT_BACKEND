@@ -25,7 +25,13 @@ SECRET_KEY = "django-insecure-$232vni+0*(&kifn+=h=+z4le9mc=6fa@d*4fdw+xw-84@^&kj
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = [
+    "zone-achat-backend.onrender.com",
+    "localhost",
+    "127.0.0.1",
+]
+CSRF_TRUSTED_ORIGINS = ['https://zone-achat-backend.onrender.com']
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
 
 # Application definition
@@ -61,7 +67,7 @@ MIDDLEWARE = [
 # --- CORS Configuration ---
 CORS_ALLOW_ALL_ORIGINS = True  # À restreindre en production si possible
 CORS_ALLOWED_ORIGINS = [
-    "https://sodepci-backend.onrender.com",
+    "https://zone-achat-backend.onrender.com",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
 ]
