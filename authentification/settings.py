@@ -48,7 +48,9 @@ INSTALLED_APPS = [
     'django_filters',
     'django_rest_passwordreset',
     'rest_framework',
-    "users"
+    "users",
+    "produits_stocks",
+    "config"
 ]
 
 MIDDLEWARE = [
