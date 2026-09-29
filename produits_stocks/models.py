@@ -111,10 +111,18 @@ class Product(models.Model):
     )
 
     # Identifiants
-    code = models.CharField(max_length=50, unique=True,
-                            verbose_name="Code produit")
+    code = models.CharField(
+        max_length=50, unique=True,
+        verbose_name="Code produit"
+    )
     barcode = models.CharField(
-        max_length=100, unique=True, null=True, blank=True, verbose_name="Code-barres")
+        max_length=100,
+        unique=False,
+        null=True,
+        blank=True,
+        default=None,
+        verbose_name="Code-barres"
+    )
     name = models.CharField(max_length=200, verbose_name="Nom")
     description = models.TextField(blank=True, verbose_name="Description")
 
@@ -131,16 +139,23 @@ class Product(models.Model):
         UnitMeasure,
         on_delete=models.SET_NULL,
         null=True,
+        blank=True,
         verbose_name="Unité de mesure"
     )
     type = models.CharField(
-        max_length=20, choices=TYPE_CHOICES, default='standard', verbose_name="Type")
+        max_length=20, choices=TYPE_CHOICES,
+        default='standard', verbose_name="Type"
+    )
 
     # Prix
     purchase_price = models.DecimalField(
-        max_digits=10, decimal_places=2, verbose_name="Prix d'achat")
+        max_digits=10, decimal_places=2,
+        verbose_name="Prix d'achat"
+    )
     selling_price = models.DecimalField(
-        max_digits=10, decimal_places=2, verbose_name="Prix de vente")
+        max_digits=10, decimal_places=2,
+        verbose_name="Prix de vente"
+    )
     wholesale_price = models.DecimalField(
         max_digits=10, decimal_places=2,
         null=True, blank=True,
@@ -154,11 +169,14 @@ class Product(models.Model):
 
     # Taxes
     tax_rate = models.DecimalField(
-        max_digits=5, decimal_places=2, default=0, verbose_name="Taux de TVA (%)")
+        max_digits=5, decimal_places=2,
+        default=0, verbose_name="Taux de TVA (%)"
+    )
 
     # Gestion des dates d'expiration
     has_expiry = models.BooleanField(
-        default=False, verbose_name="A une date d'expiration")
+        default=False, verbose_name="A une date d'expiration"
+    )
     shelf_life_days = models.IntegerField(
         null=True, blank=True,
         help_text="Durée de conservation en jours",
@@ -174,32 +192,41 @@ class Product(models.Model):
     min_stock = models.IntegerField(default=0, verbose_name="Stock minimum")
     max_stock = models.IntegerField(default=0, verbose_name="Stock maximum")
     reorder_point = models.IntegerField(
-        default=0, verbose_name="Point de commande")
+        default=0, verbose_name="Point de commande"
+    )
     reorder_quantity = models.IntegerField(
-        default=0, verbose_name="Quantité de réapprovisionnement")
+        default=0, verbose_name="Quantité de réapprovisionnement"
+    )
 
     # Images
     image = models.ImageField(
-        upload_to='products/', null=True, blank=True, verbose_name="Image principale")
+        upload_to='products/', null=True, blank=True,
+        verbose_name="Image principale"
+    )
     gallery = models.JSONField(
-        default=list, blank=True, verbose_name="Galerie d'images")
+        default=list, blank=True, verbose_name="Galerie d'images"
+    )
 
     # Statut
     status = models.CharField(
-        max_length=20, choices=STATUS_CHOICES, default='active', verbose_name="Statut")
+        max_length=20, choices=STATUS_CHOICES,
+        default='active', verbose_name="Statut"
+    )
     is_featured = models.BooleanField(
-        default=False, verbose_name="Produit vedette")
+        default=False, verbose_name="Produit vedette"
+    )
 
     # Métadonnées
     created_at = models.DateTimeField(
-        auto_now_add=True, verbose_name="Date création")
+        auto_now_add=True, verbose_name="Date création"
+    )
     updated_at = models.DateTimeField(
-        auto_now=True, verbose_name="Date modification")
+        auto_now=True, verbose_name="Date modification"
+    )
     created_by = models.ForeignKey(
         CustomUser,
         on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
+        null=True, blank=True,
         verbose_name="Créé par"
     )
 
@@ -207,13 +234,31 @@ class Product(models.Model):
         verbose_name = "Produit"
         verbose_name_plural = "Produits"
         ordering = ['name']
+        constraints = [
+            # Contrainte d'unicité conditionnelle sur le code-barres
+            models.UniqueConstraint(
+                fields=['barcode'],
+                condition=models.Q(
+                    barcode__isnull=False) & ~models.Q(barcode=''),
+                name='unique_barcode_when_not_null'
+            )
+        ]
+        indexes = [
+            models.Index(fields=['code']),
+            models.Index(fields=['barcode']),
+            models.Index(fields=['status']),
+            models.Index(fields=['category', 'status']),
+        ]
 
     def __str__(self):
         return f"{self.code} - {self.name}"
 
+    # ============ Propriétés calculées ============
     @property
     def current_stock(self):
-        return self.stocks.aggregate(total=models.Sum('quantity'))['total'] or 0
+        return self.stocks.aggregate(
+            total=models.Sum('quantity')
+        )['total'] or 0
 
     @property
     def current_stock_value(self):
@@ -241,9 +286,28 @@ class Product(models.Model):
 
     @property
     def available_lots(self):
-        return self.lots.filter(status__in=['good', 'expiring'], current_quantity__gt=0)
+        return self.lots.filter(
+            status__in=['good', 'expiring'],
+            current_quantity__gt=0
+        )
+
+    @property
+    def profit_margin(self):
+        """Marge bénéficiaire en %"""
+        if self.purchase_price and self.purchase_price > 0:
+            return (
+                (self.selling_price - self.purchase_price) /
+                self.purchase_price * 100
+            )
+        return 0
+
+    @property
+    def profit_per_unit(self):
+        """Bénéfice par unité"""
+        return self.selling_price - self.purchase_price
 
     def update_status(self):
+        """Met à jour le statut selon le stock actuel"""
         if self.current_stock <= 0:
             self.status = 'out_of_stock'
         elif self.status == 'out_of_stock' and self.current_stock > 0:

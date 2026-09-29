@@ -1,6 +1,4 @@
 from django.db import models
-
-from django.db import models
 from django.contrib.auth.models import AbstractUser
 from django.contrib.auth.base_user import BaseUserManager
 from django_rest_passwordreset.signals import reset_password_token_created
@@ -35,6 +33,41 @@ class CustomUserManager(BaseUserManager):
         extra_fields.setdefault('is_superuser', True)
         return self.create_user(email, password, **extra_fields)
 
+    def create_gestionnaire(self, email, password=None, **extra_fields):
+        """Créer un utilisateur avec le rôle gestionnaire"""
+        extra_fields.setdefault('role', 'gestionnaire')
+        extra_fields.setdefault('is_staff', True)
+        extra_fields.setdefault('is_superuser', False)
+        return self.create_user(email, password, **extra_fields)
+
+    def create_comptable(self, email, password=None, **extra_fields):
+        """Créer un utilisateur avec le rôle comptable"""
+        extra_fields.setdefault('role', 'comptable')
+        extra_fields.setdefault('is_staff', False)
+        extra_fields.setdefault('is_superuser', False)
+        return self.create_user(email, password, **extra_fields)
+
+    def create_magasinier(self, email, password=None, **extra_fields):
+        """Créer un utilisateur avec le rôle magasinier"""
+        extra_fields.setdefault('role', 'magasinier')
+        extra_fields.setdefault('is_staff', False)
+        extra_fields.setdefault('is_superuser', False)
+        return self.create_user(email, password, **extra_fields)
+
+    def create_caissier(self, email, password=None, **extra_fields):
+        """Créer un utilisateur avec le rôle caissier"""
+        extra_fields.setdefault('role', 'caissier')
+        extra_fields.setdefault('is_staff', False)
+        extra_fields.setdefault('is_superuser', False)
+        return self.create_user(email, password, **extra_fields)
+
+    def create_livreur(self, email, password=None, **extra_fields):
+        """Créer un utilisateur avec le rôle livreur"""
+        extra_fields.setdefault('role', 'livreur')
+        extra_fields.setdefault('is_staff', False)
+        extra_fields.setdefault('is_superuser', False)
+        return self.create_user(email, password, **extra_fields)
+
     def create_vendeur(self, email, password=None, **extra_fields):
         """Créer un utilisateur avec le rôle vendeur"""
         extra_fields.setdefault('role', 'vendeur')
@@ -46,6 +79,11 @@ class CustomUserManager(BaseUserManager):
 class CustomUser(AbstractUser):
     ROLE_CHOICES = (
         ('admin', 'Administrateur'),
+        ('gestionnaire', 'Gestionnaire'),
+        ('comptable', 'Comptable'),
+        ('magasinier', 'Magasinier'),
+        ('caissier', 'Caissier'),
+        ('livreur', 'Livreur'),
         ('vendeur', 'Vendeur'),
     )
 
@@ -82,10 +120,30 @@ class CustomUser(AbstractUser):
     def __str__(self):
         return f"{self.get_full_name() or self.email} ({self.get_role_display()})"
 
-    # Propriétés pour vérifier les rôles facilement
+    # ============ Propriétés de vérification des rôles ============
     @property
     def is_admin(self):
         return self.role == 'admin'
+
+    @property
+    def is_gestionnaire(self):
+        return self.role == 'gestionnaire'
+
+    @property
+    def is_comptable(self):
+        return self.role == 'comptable'
+
+    @property
+    def is_magasinier(self):
+        return self.role == 'magasinier'
+
+    @property
+    def is_caissier(self):
+        return self.role == 'caissier'
+
+    @property
+    def is_livreur(self):
+        return self.role == 'livreur'
 
     @property
     def is_vendeur(self):
@@ -94,16 +152,19 @@ class CustomUser(AbstractUser):
     # Propriété pour vérifier si l'utilisateur a accès à l'administration
     @property
     def has_admin_access(self):
-        return self.role == 'admin'
+        return self.role in ['admin', 'gestionnaire']
 
-    # Méthode pour changer le rôle
+    # ============ Méthode pour changer le rôle ============
     def change_role(self, new_role):
         if new_role in dict(self.ROLE_CHOICES).keys():
             self.role = new_role
-            # Mettre à jour is_staff pour l'admin
+            # Mettre à jour is_staff / is_superuser selon le rôle
             if new_role == 'admin':
                 self.is_staff = True
                 self.is_superuser = True
+            elif new_role == 'gestionnaire':
+                self.is_staff = True
+                self.is_superuser = False
             else:
                 self.is_staff = False
                 self.is_superuser = False
@@ -111,36 +172,51 @@ class CustomUser(AbstractUser):
             return True
         return False
 
-    # Méthode pour obtenir les permissions selon le rôle
+    # ============ Permissions par rôle ============
     def get_permissions(self):
         permissions = {
             'admin': [
-                'view_all',
-                'edit_all',
-                'manage_users',
-                'view_finances',
-                'edit_finances',
-                'generate_reports',
-                'view_products',
-                'edit_products',
-                'manage_stock',
-                'process_sales',
+                'view_all', 'edit_all', 'manage_users',
+                'view_finances', 'edit_finances', 'generate_reports',
+                'view_products', 'edit_products', 'manage_stock',
+                'process_sales', 'view_sales', 'manage_cash',
+                'view_deliveries', 'update_delivery_status',
+                'delete_data', 'manage_lots', 'manage_inventory',
+                'manage_expiry_alerts',
+            ],
+            'gestionnaire': [
+                'view_all', 'edit_all',
+                'view_finances', 'generate_reports',
+                'view_products', 'edit_products', 'manage_stock',
+                'process_sales', 'view_sales', 'manage_cash',
+                'view_deliveries', 'update_delivery_status',
+                'manage_lots', 'manage_inventory', 'manage_expiry_alerts',
+            ],
+            'comptable': [
+                'view_finances', 'edit_finances', 'generate_reports',
+                'view_sales', 'view_products',
+            ],
+            'magasinier': [
+                'view_products', 'edit_products', 'manage_stock',
+                'view_sales', 'manage_lots', 'manage_inventory',
+                'manage_expiry_alerts',
+            ],
+            'caissier': [
+                'process_sales', 'view_sales', 'manage_cash',
+                'view_products', 'view_stock',
+            ],
+            'livreur': [
+                'view_deliveries', 'update_delivery_status',
                 'view_sales',
-                'manage_cash',
-                'view_deliveries',
-                'update_delivery_status',
-                'delete_data'
             ],
             'vendeur': [
-                'process_sales',
-                'view_sales',
-                'manage_cash',
-                'view_products'
-            ]
+                'process_sales', 'view_sales', 'manage_cash',
+                'view_products',
+            ],
         }
         return permissions.get(self.role, [])
 
-    # Méthode pour vérifier une permission spécifique
+    # ============ Vérification d'une permission spécifique ============
     def has_permission(self, permission):
         return permission in self.get_permissions()
 

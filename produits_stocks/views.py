@@ -1,43 +1,39 @@
-from users.permissions import IsGestionnaire
-from .serializers import TransferRequestSerializer, TransferResponseSerializer
-from .models import Warehouse, Product, Stock, Lot, StockMovement
-from django.db import transaction  # <-- AJOUT (si pas déjà importé)
-import uuid  # <-- AJOUT
-from rest_framework import viewsets, permissions, status
-from django.shortcuts import render
-
-# Create your views here.
 # apps/produits_stocks/views.py
+import uuid
+from datetime import date, timedelta
 
+from django.db import transaction
+from django.db.models import Q, Sum, F
+from django.utils import timezone
 from django.shortcuts import render
+
 from rest_framework import viewsets, status, permissions
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from django.db.models import Q, Sum, F
-from django.utils import timezone
-from datetime import date, timedelta
-from decimal import Decimal
-from django.db import transaction
 
 from .models import (
     Category, UnitMeasure, Product, Warehouse, Lot, Stock,
     StockMovement, ExpiryAlert, Inventory, InventoryLine,
 )
 from .serializers import (
-    CategorySerializer, UnitMeasureSerializer, ProductListSerializer,
-    ProductDetailSerializer, ProductWriteSerializer, WarehouseSerializer,
+    CategorySerializer, UnitMeasureSerializer,
+    ProductListSerializer, ProductDetailSerializer, ProductWriteSerializer,
+    WarehouseSerializer,
     LotListSerializer, LotDetailSerializer, LotWriteSerializer,
-    StockSerializer, StockDetailSerializer, StockMovementSerializer,
-    StockMovementCreateSerializer, ExpiryAlertSerializer,
-    InventorySerializer, InventoryCreateSerializer, InventoryLineUpdateSerializer,
-    LowStockSerializer, ExpiringProductsSerializer, InventoryLineSerializer,
-    ManualStockAddSerializer
+    StockSerializer, StockDetailSerializer,
+    StockMovementSerializer, StockMovementCreateSerializer,
+    ExpiryAlertSerializer,
+    InventorySerializer, InventoryCreateSerializer, InventoryLineSerializer,
+    InventoryLineUpdateSerializer,
+    LowStockSerializer, ExpiringProductsSerializer,
+    ManualStockAddSerializer,
+    TransferRequestSerializer, TransferResponseSerializer,
 )
 from users.permissions import IsAdmin, IsGestionnaire, IsMagasinier
 from users.models import CustomUser
 
 
-# ==================== CATEGORY VIEWSET ====================
+# ==================== CATEGORY ====================
 class CategoryViewSet(viewsets.ModelViewSet):
     queryset = Category.objects.all()
     serializer_class = CategorySerializer
@@ -59,14 +55,14 @@ class CategoryViewSet(viewsets.ModelViewSet):
         serializer.save(created_by=self.request.user)
 
 
-# ==================== UNIT MEASURE VIEWSET ====================
+# ==================== UNIT MEASURE ====================
 class UnitMeasureViewSet(viewsets.ModelViewSet):
     queryset = UnitMeasure.objects.all()
     serializer_class = UnitMeasureSerializer
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
 
 
-# ==================== PRODUCT VIEWSET COMPLET ====================
+# ==================== PRODUCT ====================
 class ProductViewSet(viewsets.ModelViewSet):
     queryset = Product.objects.all()
     permission_classes = [permissions.IsAuthenticated]
@@ -79,9 +75,8 @@ class ProductViewSet(viewsets.ModelViewSet):
         return ProductDetailSerializer
 
     def get_queryset(self):
-        queryset = super().get_queryset()
+        queryset = super().get_queryset().select_related('category', 'unit')
 
-        # Recherche
         search = self.request.query_params.get('search')
         if search:
             queryset = queryset.filter(
@@ -90,39 +85,58 @@ class ProductViewSet(viewsets.ModelViewSet):
                 Q(barcode__icontains=search)
             )
 
-        # Filtre par catégorie
         category = self.request.query_params.get('category')
         if category:
             queryset = queryset.filter(category_id=category)
 
-        # Filtre par statut
         status_filter = self.request.query_params.get('status')
         if status_filter:
             queryset = queryset.filter(status=status_filter)
 
-        # Filtre stock faible
         low_stock = self.request.query_params.get('low_stock')
         if low_stock == 'true':
             queryset = queryset.filter(min_stock__gt=0)
-            product_ids = []
-            for p in queryset:
-                if p.current_stock <= p.min_stock:
-                    product_ids.append(p.id)
+            product_ids = [
+                p.id for p in queryset
+                if p.current_stock <= p.min_stock
+            ]
             queryset = queryset.filter(id__in=product_ids)
 
-        # Filtre avec expiration
         has_expiry = self.request.query_params.get('has_expiry')
         if has_expiry == 'true':
             queryset = queryset.filter(has_expiry=True)
+
+        is_featured = self.request.query_params.get('is_featured')
+        if is_featured == 'true':
+            queryset = queryset.filter(is_featured=True)
 
         return queryset
 
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user)
 
-    # ================================================================
-    # ACTION: RÉCUPÉRER LES LOTS D'UN PRODUIT
-    # ================================================================
+    # ---------- CREATE avec réponse détaillée ----------
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        self.perform_create(serializer)
+        detail = ProductDetailSerializer(serializer.instance)
+        return Response(detail.data, status=status.HTTP_201_CREATED)
+
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop('partial', False)
+        instance = self.get_object()
+        serializer = self.get_serializer(
+            instance, data=request.data, partial=partial
+        )
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        self.perform_update(serializer)
+        detail = ProductDetailSerializer(serializer.instance)
+        return Response(detail.data)
+
+    # ---------- ACTIONS ----------
     @action(detail=True, methods=['get'])
     def lots(self, request, pk=None):
         product = self.get_object()
@@ -130,9 +144,6 @@ class ProductViewSet(viewsets.ModelViewSet):
         serializer = LotListSerializer(lots, many=True)
         return Response(serializer.data)
 
-    # ================================================================
-    # ACTION: RÉCUPÉRER LES LOTS EXPIRANTS D'UN PRODUIT
-    # ================================================================
     @action(detail=True, methods=['get'])
     def expiring_lots(self, request, pk=None):
         product = self.get_object()
@@ -145,14 +156,10 @@ class ProductViewSet(viewsets.ModelViewSet):
         serializer = LotListSerializer(lots, many=True)
         return Response(serializer.data)
 
-    # ================================================================
-    # ACTION: LISTE DES PRODUITS QUI EXPIRE BIENTÔT
-    # ================================================================
     @action(detail=False, methods=['get'])
     def expiring_soon(self, request):
         products = Product.objects.filter(has_expiry=True)
         result = []
-
         for product in products:
             alert_date = date.today() + timedelta(days=product.alert_days)
             expiring_lots = product.lots.filter(
@@ -164,19 +171,16 @@ class ProductViewSet(viewsets.ModelViewSet):
                 result.append({
                     'product': ProductListSerializer(product).data,
                     'expiring_lots': LotListSerializer(expiring_lots, many=True).data,
-                    'total_quantity': expiring_lots.aggregate(total=Sum('current_quantity'))['total']
+                    'total_quantity': expiring_lots.aggregate(
+                        total=Sum('current_quantity')
+                    )['total']
                 })
-
         return Response(result)
 
-    # ================================================================
-    # ACTION: LISTE DES PRODUITS EN STOCK FAIBLE
-    # ================================================================
     @action(detail=False, methods=['get'])
     def low_stock_list(self, request):
         products = Product.objects.filter(min_stock__gt=0)
         result = []
-
         for product in products:
             current_stock = product.current_stock
             if current_stock <= product.min_stock:
@@ -186,31 +190,23 @@ class ProductViewSet(viewsets.ModelViewSet):
                     'min_stock': product.min_stock,
                     'difference': current_stock - product.min_stock
                 })
-
         return Response(result)
 
-    # ================================================================
-    # ACTION: AJOUT MANUEL DE STOCK (SANS COMMANDE)
-    # ================================================================
-    @action(detail=False, methods=['post'], permission_classes=[permissions.IsAuthenticated, IsGestionnaire])
+    @action(
+        detail=False, methods=['post'],
+        permission_classes=[permissions.IsAuthenticated, IsGestionnaire]
+    )
     def add_stock_manual(self, request):
-        """
-        Ajoute du stock manuellement sans passer par une commande.
-        Permet de noter le lot avec des notes.
-        """
         serializer = ManualStockAddSerializer(data=request.data)
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
         data = serializer.validated_data
-
         try:
             product = Product.objects.get(id=data['product_id'])
             warehouse = Warehouse.objects.get(id=data['warehouse_id'])
 
             with transaction.atomic():
-
-                # 1. Créer ou récupérer le lot
                 lot_number = data.get('lot_number')
                 batch_number = data.get('batch_number', '')
 
@@ -235,51 +231,41 @@ class ProductViewSet(viewsets.ModelViewSet):
                 )
 
                 if not created:
-                    # Si le lot existe déjà, on ajoute la quantité
-                    old_quantity = lot.current_quantity
                     lot.current_quantity += data['quantity']
-                    lot.notes = (
-                        lot.notes or '') + f"\n[{timezone.now().strftime('%Y-%m-%d %H:%M')}] Ajout de {data['quantity']} unités - {data.get('reason', 'Ajout manuel')}"
-                    if data.get('notes'):
-                        lot.notes += f" - {data.get('notes')}"
+                    lot.notes = (lot.notes or '') + (
+                        f"\n[{timezone.now().strftime('%Y-%m-%d %H:%M')}] "
+                        f"Ajout de {data['quantity']} unités"
+                    )
                     lot.save()
 
-                # 2. Mettre à jour ou créer le stock
-                stock, stock_created = Stock.objects.get_or_create(
-                    product=product,
-                    warehouse=warehouse
+                stock, _ = Stock.objects.get_or_create(
+                    product=product, warehouse=warehouse
                 )
                 stock.update_quantity()
 
-                # 3. Créer un mouvement de stock
                 movement = StockMovement.objects.create(
                     product=product,
                     lot=lot,
                     to_warehouse=warehouse,
                     movement_type='purchase_in',
                     quantity=data['quantity'],
-                    previous_quantity=lot.current_quantity - data['quantity'],
-                    new_quantity=lot.current_quantity,
                     reason=data.get('reason', 'Ajout manuel de stock'),
-                    notes=f"Lot: {lot_number} | {data.get('notes', '')} | Ajouté par {request.user.username}",
+                    notes=data.get('notes', ''),
                     reference_type='manual_add',
                     reference_number=f"MAN-{timezone.now().strftime('%Y%m%d%H%M%S')}",
                     created_by=request.user
                 )
 
-                # 4. Mettre à jour le statut du produit
                 product.update_status()
 
-                # 5. Retourner la réponse
                 return Response({
                     'success': True,
-                    'message': f"{data['quantity']} unités ajoutées au stock de {product.name}",
+                    'message': f"{data['quantity']} unités ajoutées à {product.name}",
                     'lot': {
                         'id': lot.id,
                         'lot_number': lot.lot_number,
                         'current_quantity': lot.current_quantity,
                         'expiry_date': lot.expiry_date,
-                        'notes': lot.notes,
                         'created': created,
                     },
                     'stock': {
@@ -290,25 +276,21 @@ class ProductViewSet(viewsets.ModelViewSet):
                         'id': movement.id,
                         'type': movement.movement_type,
                         'quantity': movement.quantity,
-                        'reference_number': movement.reference_number,
                     }
                 }, status=status.HTTP_201_CREATED)
 
         except Product.DoesNotExist:
-            return Response({"error": "Produit non trouvé"}, status=status.HTTP_404_NOT_FOUND)
+            return Response({"error": "Produit non trouvé"}, status=404)
         except Warehouse.DoesNotExist:
-            return Response({"error": "Entrepôt non trouvé"}, status=status.HTTP_404_NOT_FOUND)
+            return Response({"error": "Entrepôt non trouvé"}, status=404)
         except Exception as e:
-            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return Response({"error": str(e)}, status=500)
 
-    # ================================================================
-    # ACTION: AJOUT DE STOCK PAR PRODUIT SPÉCIFIQUE
-    # ================================================================
-    @action(detail=True, methods=['post'], permission_classes=[permissions.IsAuthenticated, IsGestionnaire])
+    @action(
+        detail=True, methods=['post'],
+        permission_classes=[permissions.IsAuthenticated, IsGestionnaire]
+    )
     def add_stock(self, request, pk=None):
-        """
-        Ajoute du stock à un produit spécifique (version simplifiée)
-        """
         product = self.get_object()
         warehouse_id = request.data.get('warehouse_id')
         quantity = request.data.get('quantity')
@@ -317,23 +299,22 @@ class ProductViewSet(viewsets.ModelViewSet):
         notes = request.data.get('notes', '')
 
         if not warehouse_id:
-            return Response({"error": "L'entrepôt est requis"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"error": "L'entrepôt est requis"}, status=400)
 
         try:
             quantity = int(quantity)
         except (TypeError, ValueError):
-            return Response({"error": "La quantité doit être un nombre valide"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"error": "Quantité invalide"}, status=400)
 
         if quantity <= 0:
-            return Response({"error": "La quantité doit être supérieure à 0"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"error": "Quantité > 0 requise"}, status=400)
 
         try:
             warehouse = Warehouse.objects.get(id=warehouse_id)
         except Warehouse.DoesNotExist:
-            return Response({"error": "Entrepôt non trouvé"}, status=status.HTTP_404_NOT_FOUND)
+            return Response({"error": "Entrepôt non trouvé"}, status=404)
 
         with transaction.atomic():
-            # Créer le lot
             if not lot_number:
                 lot_number = f"MAN-{timezone.now().strftime('%Y%m%d%H%M%S')}-{product.id}"
 
@@ -345,7 +326,7 @@ class ProductViewSet(viewsets.ModelViewSet):
                 current_quantity=quantity,
                 reserved_quantity=0,
                 unit=product.unit,
-                expiry_date=expiry_date if expiry_date else None,
+                expiry_date=expiry_date or None,
                 purchase_price=product.purchase_price,
                 selling_price=product.selling_price,
                 notes=notes,
@@ -353,22 +334,17 @@ class ProductViewSet(viewsets.ModelViewSet):
                 created_by=request.user
             )
 
-            # Mettre à jour le stock
-            stock, created = Stock.objects.get_or_create(
-                product=product,
-                warehouse=warehouse
+            stock, _ = Stock.objects.get_or_create(
+                product=product, warehouse=warehouse
             )
             stock.update_quantity()
 
-            # Créer le mouvement
             StockMovement.objects.create(
                 product=product,
                 lot=lot,
                 to_warehouse=warehouse,
                 movement_type='purchase_in',
                 quantity=quantity,
-                previous_quantity=lot.current_quantity - quantity,
-                new_quantity=lot.current_quantity,
                 reason='Ajout manuel de stock',
                 notes=notes,
                 reference_type='manual_add',
@@ -379,7 +355,7 @@ class ProductViewSet(viewsets.ModelViewSet):
 
             return Response({
                 'success': True,
-                'message': f"{quantity} unités ajoutées au stock de {product.name}",
+                'message': f"{quantity} unités ajoutées à {product.name}",
                 'lot': {
                     'id': lot.id,
                     'lot_number': lot.lot_number,
@@ -392,7 +368,7 @@ class ProductViewSet(viewsets.ModelViewSet):
             }, status=status.HTTP_201_CREATED)
 
 
-# ==================== WAREHOUSE VIEWSET ====================
+# ==================== WAREHOUSE ====================
 class WarehouseViewSet(viewsets.ModelViewSet):
     queryset = Warehouse.objects.all()
     serializer_class = WarehouseSerializer
@@ -409,18 +385,16 @@ class WarehouseViewSet(viewsets.ModelViewSet):
     def stocks(self, request, pk=None):
         warehouse = self.get_object()
         stocks = warehouse.stocks.all().select_related('product')
-        serializer = StockSerializer(stocks, many=True)
-        return Response(serializer.data)
+        return Response(StockSerializer(stocks, many=True).data)
 
     @action(detail=True, methods=['get'])
     def lots(self, request, pk=None):
         warehouse = self.get_object()
         lots = warehouse.lots.all().select_related('product').order_by('expiry_date')
-        serializer = LotListSerializer(lots, many=True)
-        return Response(serializer.data)
+        return Response(LotListSerializer(lots, many=True).data)
 
 
-# ==================== LOT VIEWSET ====================
+# ==================== LOT ====================
 class LotViewSet(viewsets.ModelViewSet):
     queryset = Lot.objects.all()
     permission_classes = [permissions.IsAuthenticated, IsMagasinier]
@@ -457,7 +431,8 @@ class LotViewSet(viewsets.ModelViewSet):
         available = self.request.query_params.get('available')
         if available == 'true':
             queryset = queryset.filter(
-                current_quantity__gt=0, is_blocked=False).exclude(status='expired')
+                current_quantity__gt=0, is_blocked=False
+            ).exclude(status='expired')
         return queryset
 
     def perform_create(self, serializer):
@@ -468,7 +443,7 @@ class LotViewSet(viewsets.ModelViewSet):
         lot = self.get_object()
         quantity = request.data.get('quantity', 0)
         if quantity <= 0:
-            return Response({"error": "La quantité doit être supérieure à 0"}, status=400)
+            return Response({"error": "Quantité > 0 requise"}, status=400)
         if lot.reserve(quantity):
             return Response({
                 "message": f"{quantity} unités réservées",
@@ -482,7 +457,7 @@ class LotViewSet(viewsets.ModelViewSet):
         quantity = request.data.get('quantity', 0)
         reason = request.data.get('reason', '')
         if quantity <= 0:
-            return Response({"error": "La quantité doit être supérieure à 0"}, status=400)
+            return Response({"error": "Quantité > 0 requise"}, status=400)
         if lot.consume(quantity):
             StockMovement.objects.create(
                 product=lot.product,
@@ -513,7 +488,7 @@ class LotViewSet(viewsets.ModelViewSet):
         return Response({"message": "Lot débloqué", "status": lot.status})
 
 
-# ==================== STOCK VIEWSET ====================
+# ==================== STOCK ====================
 class StockViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = Stock.objects.all()
     serializer_class = StockSerializer
@@ -535,11 +510,10 @@ class StockViewSet(viewsets.ReadOnlyModelViewSet):
     @action(detail=True, methods=['get'])
     def detail(self, request, pk=None):
         stock = self.get_object()
-        serializer = StockDetailSerializer(stock)
-        return Response(serializer.data)
+        return Response(StockDetailSerializer(stock).data)
 
 
-# ==================== STOCK MOVEMENT VIEWSET ====================
+# ==================== STOCK MOVEMENT ====================
 class StockMovementViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = StockMovement.objects.all()
     serializer_class = StockMovementSerializer
@@ -565,7 +539,7 @@ class StockMovementViewSet(viewsets.ReadOnlyModelViewSet):
         return queryset
 
 
-# ==================== EXPIRY ALERT VIEWSET ====================
+# ==================== EXPIRY ALERT ====================
 class ExpiryAlertViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = ExpiryAlert.objects.all()
     serializer_class = ExpiryAlertSerializer
@@ -600,13 +574,8 @@ class ExpiryAlertViewSet(viewsets.ReadOnlyModelViewSet):
         return Response({"message": "Alerte marquée comme traitée"})
 
 
-# apps/produits_stocks/views.py — À AJOUTER à la fin
-
-
+# ==================== INVENTORY LINE ====================
 class InventoryLineViewSet(viewsets.ModelViewSet):
-    """
-    ViewSet pour les lignes d'inventaire (saisie des quantités réelles)
-    """
     queryset = InventoryLine.objects.all()
     serializer_class = InventoryLineSerializer
     permission_classes = [permissions.IsAuthenticated, IsGestionnaire]
@@ -624,7 +593,6 @@ class InventoryLineViewSet(viewsets.ModelViewSet):
         return InventoryLineSerializer
 
     def partial_update(self, request, *args, **kwargs):
-        """Mise à jour partielle (saisie quantité réelle)"""
         instance = self.get_object()
         serializer = InventoryLineUpdateSerializer(
             instance, data=request.data, partial=True
@@ -632,13 +600,12 @@ class InventoryLineViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         serializer.save()
 
-        # Recalcul des totaux de l'inventaire parent
         inventory = instance.inventory
         inventory.total_expected_value = inventory.lines.aggregate(
-            total=models.Sum('expected_value')
+            total=Sum('expected_value')
         )['total'] or 0
         inventory.total_actual_value = inventory.lines.aggregate(
-            total=models.Sum('actual_value')
+            total=Sum('actual_value')
         )['total'] or 0
         inventory.total_difference = (
             inventory.total_actual_value - inventory.total_expected_value
@@ -646,22 +613,19 @@ class InventoryLineViewSet(viewsets.ModelViewSet):
         inventory.save(update_fields=[
             'total_expected_value', 'total_actual_value', 'total_difference'
         ])
-
         return Response(InventoryLineSerializer(instance).data)
 
     @action(detail=True, methods=['post'], url_path='apply-adjustment')
     def apply_adjustment(self, request, pk=None):
-        """Applique l'ajustement de stock pour cette ligne"""
         line = self.get_object()
         if line.is_verified:
             return Response(
-                {"error": "Cette ligne a déjà été ajustée"},
-                status=status.HTTP_400_BAD_REQUEST
+                {"error": "Cette ligne a déjà été ajustée"}, status=400
             )
         if line.actual_quantity is None:
             return Response(
                 {"error": "Veuillez saisir la quantité réelle avant d'ajuster"},
-                status=status.HTTP_400_BAD_REQUEST
+                status=400
             )
         try:
             with transaction.atomic():
@@ -672,13 +636,10 @@ class InventoryLineViewSet(viewsets.ModelViewSet):
                 "difference": line.difference,
             })
         except Exception as e:
-            return Response(
-                {"error": str(e)},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+            return Response({"error": str(e)}, status=500)
 
 
-# ==================== INVENTORY VIEWSET ====================
+# ==================== INVENTORY ====================
 class InventoryViewSet(viewsets.ModelViewSet):
     queryset = Inventory.objects.all()
     permission_classes = [permissions.IsAuthenticated, IsGestionnaire]
@@ -698,46 +659,43 @@ class InventoryViewSet(viewsets.ModelViewSet):
         products = Product.objects.filter(status='active')
         for product in products:
             stock = Stock.objects.filter(
-                product=product, warehouse=inventory.warehouse).first()
+                product=product, warehouse=inventory.warehouse
+            ).first()
             expected_quantity = stock.quantity if stock else 0
             InventoryLine.objects.get_or_create(
                 inventory=inventory,
                 product=product,
                 defaults={'expected_quantity': expected_quantity}
             )
-        return Response({"message": "Inventaire démarré", "status": inventory.status})
+        return Response({
+            "message": "Inventaire démarré",
+            "status": inventory.status
+        })
 
     @action(detail=True, methods=['post'])
     def complete(self, request, pk=None):
         inventory = self.get_object()
         inventory.complete()
-        return Response({"message": "Inventaire terminé", "status": inventory.status})
+        return Response({
+            "message": "Inventaire terminé",
+            "status": inventory.status
+        })
 
     @action(detail=True, methods=['get'])
     def lines(self, request, pk=None):
         inventory = self.get_object()
         lines = inventory.lines.all().select_related('product', 'lot')
-        serializer = InventoryLineSerializer(lines, many=True)
-        return Response(serializer.data)
+        return Response(InventoryLineSerializer(lines, many=True).data)
 
 
-# ==================== TRANSFER VIEWSET ====================
-# apps/produits_stocks/views.py (extrait)
-
-
+# ==================== TRANSFER ====================
 class TransferViewSet(viewsets.ViewSet):
-    """
-    ViewSet pour les transferts de stock entre entrepôts.
-    """
     permission_classes = [permissions.IsAuthenticated, IsGestionnaire]
 
     def create(self, request):
-        """
-        Crée un transfert de stock entre deux entrepôts.
-        """
         serializer = TransferRequestSerializer(data=request.data)
         if not serializer.is_valid():
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+            return Response(serializer.errors, status=400)
 
         data = serializer.validated_data
         from_warehouse_id = data['from_warehouse_id']
@@ -752,12 +710,11 @@ class TransferViewSet(viewsets.ViewSet):
         except Warehouse.DoesNotExist:
             return Response(
                 {"error": "Entrepôt source ou destination introuvable."},
-                status=status.HTTP_404_NOT_FOUND
+                status=404
             )
 
         movements_created = []
 
-        # Transaction atomique pour garantir la cohérence
         with transaction.atomic():
             for item in items:
                 product_id = item['product_id']
@@ -767,7 +724,7 @@ class TransferViewSet(viewsets.ViewSet):
                 except Product.DoesNotExist:
                     return Response(
                         {"error": f"Produit {product_id} introuvable."},
-                        status=status.HTTP_404_NOT_FOUND
+                        status=404
                     )
 
                 try:
@@ -777,21 +734,18 @@ class TransferViewSet(viewsets.ViewSet):
                 except Stock.DoesNotExist:
                     return Response(
                         {"error": f"Le produit {product.name} n'a pas de stock dans l'entrepôt source."},
-                        status=status.HTTP_400_BAD_REQUEST
+                        status=400
                     )
 
-                # Consommer le stock source (FIFO)
                 success, lots_used = stock_source.consume_stock(quantity)
                 if not success:
                     return Response(
                         {"error": f"Impossible de consommer le stock pour {product.name}."},
-                        status=status.HTTP_400_BAD_REQUEST
+                        status=400
                     )
 
-                # Numéro de référence unique pour ce transfert
                 reference_number = f"TRANSF-{timezone.now().strftime('%Y%m%d%H%M%S')}"
 
-                # Créer les mouvements de sortie pour chaque lot utilisé
                 for lot_data in lots_used:
                     lot = lot_data['lot']
                     qty = lot_data['quantity']
@@ -808,21 +762,17 @@ class TransferViewSet(viewsets.ViewSet):
                         reference_number=reference_number
                     )
 
-                # Créer un nouveau lot dans l'entrepôt destination pour chaque lot source
                 for lot_data in lots_used:
                     source_lot = lot_data['lot']
                     qty = lot_data['quantity']
 
-                    # GÉNÉRATION D'UN LOT_NUMBER UNIQUE
-                    # Utilisation d'un suffixe aléatoire pour éviter les conflits
                     unique_suffix = uuid.uuid4().hex[:8]
                     new_lot_number = f"{source_lot.lot_number}-TRANSF-{unique_suffix}"
 
-                    # Créer le nouveau lot
                     new_lot = Lot.objects.create(
                         product=product,
                         warehouse=to_warehouse,
-                        lot_number=new_lot_number,  # <--- CORRECTION ICI
+                        lot_number=new_lot_number,
                         batch_number=source_lot.batch_number,
                         barcode=source_lot.barcode,
                         initial_quantity=qty,
@@ -838,7 +788,6 @@ class TransferViewSet(viewsets.ViewSet):
                         notes=f"Transfert depuis {from_warehouse.name} - {notes}"
                     )
 
-                    # Mouvement d'entrée pour le nouveau lot
                     StockMovement.objects.create(
                         product=product,
                         lot=new_lot,
@@ -852,7 +801,6 @@ class TransferViewSet(viewsets.ViewSet):
                         reference_number=reference_number
                     )
 
-                # Mettre à jour les quantités des stocks (source et destination)
                 stock_source.update_quantity()
                 stock_dest, _ = Stock.objects.get_or_create(
                     product=product, warehouse=to_warehouse
@@ -870,15 +818,14 @@ class TransferViewSet(viewsets.ViewSet):
                     ]
                 })
 
-        # Réponse finale
         response_serializer = TransferResponseSerializer({
             "message": "Transfert effectué avec succès",
             "movements": movements_created
         })
-        return Response(response_serializer.data, status=status.HTTP_201_CREATED)
-# ==================== DASHBOARD STATS VIEWSET ====================
+        return Response(response_serializer.data, status=201)
 
 
+# ==================== DASHBOARD STATS ====================
 class DashboardStatsViewSet(viewsets.ViewSet):
     permission_classes = [permissions.IsAuthenticated]
 
@@ -920,19 +867,14 @@ class DashboardStatsViewSet(viewsets.ViewSet):
                 'expiring_soon': expiring_lots,
                 'expired': expired_lots
             },
-            'warehouses': {
-                'total': total_warehouses
-            },
-            'alerts': {
-                'unprocessed': unprocessed_alerts
-            }
+            'warehouses': {'total': total_warehouses},
+            'alerts': {'unprocessed': unprocessed_alerts}
         })
 
     @action(detail=False, methods=['get'])
     def expiring_products(self, request):
         result = []
         alert_date = date.today() + timedelta(days=30)
-
         lots = Lot.objects.filter(
             expiry_date__lte=alert_date,
             expiry_date__gte=date.today(),
@@ -960,14 +902,14 @@ class DashboardStatsViewSet(viewsets.ViewSet):
                 'days_left': days_left,
                 'severity': severity
             })
-
         return Response(result)
 
     @action(detail=False, methods=['get'])
     def low_stock(self, request):
         result = []
-        stocks = Stock.objects.filter(quantity__lte=F(
-            'product__min_stock')).select_related('product', 'warehouse')
+        stocks = Stock.objects.filter(
+            quantity__lte=F('product__min_stock')
+        ).select_related('product', 'warehouse')
 
         for stock in stocks:
             result.append({
@@ -980,7 +922,6 @@ class DashboardStatsViewSet(viewsets.ViewSet):
                 'warehouse_name': stock.warehouse.name,
                 'difference': stock.quantity - stock.min_stock
             })
-
         return Response(result)
 
     @action(detail=False, methods=['get'])
@@ -988,10 +929,8 @@ class DashboardStatsViewSet(viewsets.ViewSet):
         total_value = 0
         lots = Lot.objects.filter(
             current_quantity__gt=0).exclude(status='expired')
-
         for lot in lots:
             total_value += lot.current_quantity * lot.purchase_price
-
         return Response({
             'total_stock_value': float(total_value),
             'currency': 'XOF'

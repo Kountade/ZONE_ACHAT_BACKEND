@@ -26,7 +26,6 @@ class RegisterSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         if 'role' not in validated_data:
-            # Changé de 'commercial' à 'vendeur'
             validated_data['role'] = 'vendeur'
         user = User.objects.create_user(**validated_data)
         return user
@@ -34,10 +33,13 @@ class RegisterSerializer(serializers.ModelSerializer):
 
 class UserSerializer(serializers.ModelSerializer):
     """Sérialiseur de lecture pour la liste des utilisateurs."""
+    role_display = serializers.CharField(
+        source='get_role_display', read_only=True)
+
     class Meta:
         model = User
         fields = (
-            'id', 'email', 'username', 'role',
+            'id', 'email', 'username', 'role', 'role_display',
             'phone_number', 'is_active', 'profile_picture', 'created_at'
         )
         read_only_fields = fields
@@ -45,6 +47,9 @@ class UserSerializer(serializers.ModelSerializer):
 
 class UserDetailSerializer(serializers.ModelSerializer):
     """Sérialiseur de lecture détaillée."""
+    role_display = serializers.CharField(
+        source='get_role_display', read_only=True)
+
     class Meta:
         model = User
         fields = '__all__'
@@ -65,9 +70,17 @@ class UserWriteSerializer(serializers.ModelSerializer):
             'address', 'birthday', 'is_active'
         ]
 
+    def validate_role(self, value):
+        """Vérifie que le rôle est valide."""
+        valid_roles = [choice[0] for choice in CustomUser.ROLE_CHOICES]
+        if value not in valid_roles:
+            raise serializers.ValidationError(
+                f"Rôle invalide. Choix possibles : {', '.join(valid_roles)}"
+            )
+        return value
+
     def create(self, validated_data):
         password = validated_data.pop('password', None)
-        # Si aucun rôle n'est spécifié, mettre 'vendeur' par défaut
         if 'role' not in validated_data:
             validated_data['role'] = 'vendeur'
         user = User.objects.create_user(**validated_data)
