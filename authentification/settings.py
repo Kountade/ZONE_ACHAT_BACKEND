@@ -50,6 +50,9 @@ INSTALLED_APPS = [
     'rest_framework',
     "users",
     "produits_stocks",
+    "tresorerie",
+    "achats_fournisseurs",
+    "finances",
     "config"
 ]
 
