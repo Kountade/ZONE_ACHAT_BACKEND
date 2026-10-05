@@ -10,6 +10,7 @@ urlpatterns = [
     path('', include('config.urls')),
     path('', include('produits_stocks.urls')),
     path('', include('achats_fournisseurs.urls')),
+    path('', include('ventes_clients.urls')),
 
 
 

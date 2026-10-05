@@ -53,7 +53,9 @@ INSTALLED_APPS = [
     "tresorerie",
     "achats_fournisseurs",
     "finances",
+    "ventes_clients",
     "config"
+    
 ]
 
 MIDDLEWARE = [
