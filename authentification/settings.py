@@ -55,7 +55,7 @@ INSTALLED_APPS = [
     "finances",
     "ventes_clients",
     "config"
-    
+
 ]
 
 MIDDLEWARE = [
