@@ -1,3 +1,4 @@
+# apps/users/models.py
 from django.db import models
 from django.contrib.auth.models import AbstractUser
 from django.contrib.auth.base_user import BaseUserManager
@@ -24,55 +25,65 @@ class CustomUserManager(BaseUserManager):
         extra_fields.setdefault('is_superuser', True)
         extra_fields.setdefault('role', 'admin')
         extra_fields.setdefault('is_active', True)
+        extra_fields.setdefault('is_approved', True)
         return self.create_user(email, password, **extra_fields)
 
     def create_admin(self, email, password=None, **extra_fields):
-        """Créer un utilisateur avec le rôle admin"""
         extra_fields.setdefault('role', 'admin')
         extra_fields.setdefault('is_staff', True)
         extra_fields.setdefault('is_superuser', True)
+        extra_fields.setdefault('is_approved', True)
         return self.create_user(email, password, **extra_fields)
 
     def create_gestionnaire(self, email, password=None, **extra_fields):
-        """Créer un utilisateur avec le rôle gestionnaire"""
         extra_fields.setdefault('role', 'gestionnaire')
         extra_fields.setdefault('is_staff', True)
         extra_fields.setdefault('is_superuser', False)
+        extra_fields.setdefault('is_approved', True)
         return self.create_user(email, password, **extra_fields)
 
     def create_comptable(self, email, password=None, **extra_fields):
-        """Créer un utilisateur avec le rôle comptable"""
         extra_fields.setdefault('role', 'comptable')
         extra_fields.setdefault('is_staff', False)
         extra_fields.setdefault('is_superuser', False)
+        extra_fields.setdefault('is_approved', True)
         return self.create_user(email, password, **extra_fields)
 
     def create_magasinier(self, email, password=None, **extra_fields):
-        """Créer un utilisateur avec le rôle magasinier"""
         extra_fields.setdefault('role', 'magasinier')
         extra_fields.setdefault('is_staff', False)
         extra_fields.setdefault('is_superuser', False)
+        extra_fields.setdefault('is_approved', True)
         return self.create_user(email, password, **extra_fields)
 
     def create_caissier(self, email, password=None, **extra_fields):
-        """Créer un utilisateur avec le rôle caissier"""
         extra_fields.setdefault('role', 'caissier')
         extra_fields.setdefault('is_staff', False)
         extra_fields.setdefault('is_superuser', False)
+        extra_fields.setdefault('is_approved', True)
         return self.create_user(email, password, **extra_fields)
 
     def create_livreur(self, email, password=None, **extra_fields):
-        """Créer un utilisateur avec le rôle livreur"""
         extra_fields.setdefault('role', 'livreur')
         extra_fields.setdefault('is_staff', False)
         extra_fields.setdefault('is_superuser', False)
+        extra_fields.setdefault('is_approved', True)
         return self.create_user(email, password, **extra_fields)
 
     def create_vendeur(self, email, password=None, **extra_fields):
-        """Créer un utilisateur avec le rôle vendeur"""
         extra_fields.setdefault('role', 'vendeur')
         extra_fields.setdefault('is_staff', False)
         extra_fields.setdefault('is_superuser', False)
+        extra_fields.setdefault('is_approved', True)
+        return self.create_user(email, password, **extra_fields)
+
+    def create_client(self, email, password=None, **extra_fields):
+        """Créer un utilisateur avec le rôle client (non approuvé par défaut)"""
+        extra_fields.setdefault('role', 'client')
+        extra_fields.setdefault('is_staff', False)
+        extra_fields.setdefault('is_superuser', False)
+        extra_fields.setdefault('is_active', True)
+        extra_fields.setdefault('is_approved', False)
         return self.create_user(email, password, **extra_fields)
 
 
@@ -85,6 +96,7 @@ class CustomUser(AbstractUser):
         ('caissier', 'Caissier'),
         ('livreur', 'Livreur'),
         ('vendeur', 'Vendeur'),
+        ('client', 'Client'),
     )
 
     email = models.EmailField(max_length=200, unique=True)
@@ -101,7 +113,25 @@ class CustomUser(AbstractUser):
         default='vendeur'
     )
 
-    # Champs supplémentaires pour la gestion
+    # ✅ Validation admin pour les clients
+    is_approved = models.BooleanField(
+        default=True,
+        verbose_name="Approuvé par un administrateur",
+        help_text="Les clients doivent être approuvés par un admin avant de pouvoir accéder à leur espace"
+    )
+
+    # ✅ Lien vers un Client existant
+    client_profile = models.ForeignKey(
+        'ventes_clients.Client',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='user_accounts',
+        verbose_name="Profil client lié",
+        help_text="Si ce compte utilisateur correspond à un client existant"
+    )
+
+    # Champs supplémentaires
     is_online = models.BooleanField(default=False)
     last_login_ip = models.GenericIPAddressField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -149,16 +179,32 @@ class CustomUser(AbstractUser):
     def is_vendeur(self):
         return self.role == 'vendeur'
 
-    # Propriété pour vérifier si l'utilisateur a accès à l'administration
+    @property
+    def is_client(self):
+        return self.role == 'client'
+
     @property
     def has_admin_access(self):
         return self.role in ['admin', 'gestionnaire']
+
+    @property
+    def can_access_client_space(self):
+        """Le client peut accéder à son espace s'il est approuvé et actif"""
+        return (
+            self.role == 'client'
+            and self.is_approved
+            and self.is_active
+        )
+
+    def get_full_name(self):
+        if self.first_name or self.last_name:
+            return f"{self.first_name} {self.last_name}".strip()
+        return self.username or self.email
 
     # ============ Méthode pour changer le rôle ============
     def change_role(self, new_role):
         if new_role in dict(self.ROLE_CHOICES).keys():
             self.role = new_role
-            # Mettre à jour is_staff / is_superuser selon le rôle
             if new_role == 'admin':
                 self.is_staff = True
                 self.is_superuser = True
@@ -182,7 +228,7 @@ class CustomUser(AbstractUser):
                 'process_sales', 'view_sales', 'manage_cash',
                 'view_deliveries', 'update_delivery_status',
                 'delete_data', 'manage_lots', 'manage_inventory',
-                'manage_expiry_alerts',
+                'manage_expiry_alerts', 'approve_clients',
             ],
             'gestionnaire': [
                 'view_all', 'edit_all',
@@ -191,6 +237,7 @@ class CustomUser(AbstractUser):
                 'process_sales', 'view_sales', 'manage_cash',
                 'view_deliveries', 'update_delivery_status',
                 'manage_lots', 'manage_inventory', 'manage_expiry_alerts',
+                'approve_clients',
             ],
             'comptable': [
                 'view_finances', 'edit_finances', 'generate_reports',
@@ -213,10 +260,17 @@ class CustomUser(AbstractUser):
                 'process_sales', 'view_sales', 'manage_cash',
                 'view_products',
             ],
+            'client': [
+                'view_own_orders',
+                'view_own_invoices',
+                'view_own_payments',
+                'view_own_wallet',
+                'view_own_stock',
+                'view_products',
+            ],
         }
         return permissions.get(self.role, [])
 
-    # ============ Vérification d'une permission spécifique ============
     def has_permission(self, permission):
         return permission in self.get_permissions()
 
@@ -241,8 +295,7 @@ def password_reset_token_created(reset_password_token, *args, **kwargs):
     plain_message = strip_tags(html_message)
 
     msg = EmailMultiAlternatives(
-        subject="Réinitialisation de votre mot de passe - {title}".format(
-            title=reset_password_token.user.get_full_name() or reset_password_token.user.email),
+        subject=f"Réinitialisation de votre mot de passe",
         body=plain_message,
         from_email="codelivecamp@gmail.com",
         to=[reset_password_token.user.email]

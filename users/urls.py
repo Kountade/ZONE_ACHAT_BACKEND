@@ -5,6 +5,8 @@ from .views import *
 
 router = DefaultRouter()
 router.register('register', RegisterViewset, basename='register')
+router.register('register-client', ClientRegisterViewset,
+                basename='register-client')
 router.register('login', LoginViewset, basename='login')
 router.register('users', UserViewset, basename='users')
 router.register('profile', ProfileViewset, basename='profile')
