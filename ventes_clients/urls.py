@@ -1,5 +1,4 @@
 # apps/ventes_clients/urls.py
-
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from .views import (
@@ -8,6 +7,9 @@ from .views import (
     RemiseViewSet, SalesDashboardStatsViewSet, DevisViewSet,
     WalletViewSet, ClientWalletViewSet
 )
+
+# ✅ AJOUTER CET IMPORT
+from .views_client import ClientSpaceViewSet
 
 router = DefaultRouter()
 
@@ -24,6 +26,9 @@ router.register('dashboard-sales-stats',
 
 # ✅ Wallet - gestion centralisée
 router.register('wallet', WalletViewSet, basename='wallet')
+
+# ✅ AJOUTER CETTE LIGNE — ESPACE CLIENT
+router.register('client-space', ClientSpaceViewSet, basename='client-space')
 
 # ✅ VenteViewSet avec différents basenames
 router.register('sales', VenteViewSet, basename='sales')

@@ -2,41 +2,67 @@
 from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from rest_framework.pagination import PageNumberPagination
 from django.db.models import Sum, Q
 from django.utils import timezone
 
 from .models import Client, Vente, Facture, Paiement, ClientWallet, WalletTransaction
 from .serializers import (
-    VenteListSerializer, FactureSerializer,
+    VenteListSerializer, VenteDetailSerializer,       # ✅ ajout VenteDetailSerializer
+    FactureSerializer,
     PaiementSerializer, ClientWalletSerializer,
     WalletTransactionSerializer
 )
 from users.permissions import IsClient
 
 
-class ClientSpaceViewSet(viewsets.ViewSet):
+# ============================================================
+# PAGINATION PERSONNALISÉE
+# ============================================================
+class ClientSpacePagination(PageNumberPagination):
+    page_size = 10
+    page_size_query_param = 'page_size'
+    max_page_size = 50
+
+
+class ClientSpaceViewSet(viewsets.GenericViewSet):
     """
     Espace client — vue personnalisée pour le client connecté.
     Toutes les données sont filtrées par son propre profil client.
     """
     permission_classes = [permissions.IsAuthenticated, IsClient]
-
-    def _get_client(self, request):
-        """Récupère le profil Client lié à l'utilisateur connecté"""
-        return getattr(request.user, 'client_profile', None)
+    serializer_class = VenteListSerializer
+    pagination_class = ClientSpacePagination
 
     # ============================================================
-    # MES ACHATS
+    # HELPERS
+    # ============================================================
+    def _get_client(self, request):
+        """Récupère le profil Client lié à l'utilisateur connecté."""
+        client = getattr(request.user, 'client_profile', None)
+        if client:
+            return client
+        client = getattr(request.user, 'client', None)
+        if client:
+            return client
+        return None
+
+    def _no_client_response(self):
+        return Response(
+            {'error': 'Aucun profil client lié à votre compte. '
+                      'Contactez un administrateur pour activer votre espace client.'},
+            status=status.HTTP_404_NOT_FOUND
+        )
+
+    # ============================================================
+    # MES ACHATS (liste)
     # ============================================================
     @action(detail=False, methods=['get'], url_path='my-orders')
     def my_orders(self, request):
         """Historique de mes achats"""
         client = self._get_client(request)
         if not client:
-            return Response(
-                {'error': 'Aucun profil client lié à votre compte'},
-                status=status.HTTP_404_NOT_FOUND
-            )
+            return self._no_client_response()
 
         ventes = Vente.objects.filter(client=client).order_by('-sale_date')
 
@@ -53,14 +79,15 @@ class ClientSpaceViewSet(viewsets.ViewSet):
         if date_to:
             ventes = ventes.filter(sale_date__date__lte=date_to)
 
-        # Statistiques
+        # Statistiques globales (avant pagination)
         stats = {
             'total_orders': ventes.count(),
-            'total_amount': ventes.aggregate(total=Sum('total'))['total'] or 0,
-            'total_paid': ventes.aggregate(total=Sum('amount_paid'))['total'] or 0,
-            'total_due': ventes.aggregate(total=Sum('amount_due'))['total'] or 0,
+            'total_amount': float(ventes.aggregate(total=Sum('total'))['total'] or 0),
+            'total_paid': float(ventes.aggregate(total=Sum('amount_paid'))['total'] or 0),
+            'total_due': float(ventes.aggregate(total=Sum('amount_due'))['total'] or 0),
         }
 
+        # Pagination
         page = self.paginate_queryset(ventes)
         if page is not None:
             serializer = VenteListSerializer(
@@ -78,6 +105,37 @@ class ClientSpaceViewSet(viewsets.ViewSet):
         })
 
     # ============================================================
+    # DÉTAIL D'UNE COMMANDE (client-safe)
+    # ============================================================
+    @action(detail=True, methods=['get'], url_path='order-detail')
+    def order_detail(self, request, pk=None):
+        """
+        Détail complet d'une commande du client connecté.
+        GET /client-space/{id}/order-detail/
+        Le client ne peut voir QUE ses propres commandes.
+        """
+        client = self._get_client(request)
+        if not client:
+            return self._no_client_response()
+
+        try:
+            vente = Vente.objects.prefetch_related(
+                'lines',
+                'lines__product',
+                'lines__lot',
+                'invoices',
+                'invoices__paiements',
+            ).get(id=pk, client=client)   # ✅ sécurité : filtre par client
+        except Vente.DoesNotExist:
+            return Response(
+                {'error': 'Commande non trouvée ou non autorisée'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        serializer = VenteDetailSerializer(vente, context={'request': request})
+        return Response(serializer.data)
+
+    # ============================================================
     # MES FACTURES
     # ============================================================
     @action(detail=False, methods=['get'], url_path='my-invoices')
@@ -85,10 +143,7 @@ class ClientSpaceViewSet(viewsets.ViewSet):
         """Mes factures"""
         client = self._get_client(request)
         if not client:
-            return Response(
-                {'error': 'Aucun profil client lié à votre compte'},
-                status=status.HTTP_404_NOT_FOUND
-            )
+            return self._no_client_response()
 
         factures = Facture.objects.filter(
             client=client
@@ -100,8 +155,8 @@ class ClientSpaceViewSet(viewsets.ViewSet):
 
         stats = {
             'total_invoices': factures.count(),
-            'total_amount': factures.aggregate(total=Sum('total'))['total'] or 0,
-            'total_paid': factures.aggregate(total=Sum('amount_paid'))['total'] or 0,
+            'total_amount': float(factures.aggregate(total=Sum('total'))['total'] or 0),
+            'total_paid': float(factures.aggregate(total=Sum('amount_paid'))['total'] or 0),
         }
 
         page = self.paginate_queryset(factures)
@@ -128,10 +183,7 @@ class ClientSpaceViewSet(viewsets.ViewSet):
         """Mes paiements"""
         client = self._get_client(request)
         if not client:
-            return Response(
-                {'error': 'Aucun profil client lié à votre compte'},
-                status=status.HTTP_404_NOT_FOUND
-            )
+            return self._no_client_response()
 
         paiements = Paiement.objects.filter(
             facture__client=client
@@ -139,7 +191,7 @@ class ClientSpaceViewSet(viewsets.ViewSet):
 
         stats = {
             'total_payments': paiements.count(),
-            'total_amount': paiements.aggregate(total=Sum('amount'))['total'] or 0,
+            'total_amount': float(paiements.aggregate(total=Sum('amount'))['total'] or 0),
         }
 
         page = self.paginate_queryset(paiements)
@@ -166,10 +218,7 @@ class ClientSpaceViewSet(viewsets.ViewSet):
         """Mon porte-monnaie"""
         client = self._get_client(request)
         if not client:
-            return Response(
-                {'error': 'Aucun profil client lié à votre compte'},
-                status=status.HTTP_404_NOT_FOUND
-            )
+            return self._no_client_response()
 
         wallet, created = ClientWallet.objects.get_or_create(client=client)
         serializer = ClientWalletSerializer(wallet)
@@ -180,20 +229,17 @@ class ClientSpaceViewSet(viewsets.ViewSet):
         """Historique de mes transactions wallet"""
         client = self._get_client(request)
         if not client:
-            return Response(
-                {'error': 'Aucun profil client lié à votre compte'},
-                status=status.HTTP_404_NOT_FOUND
-            )
+            return self._no_client_response()
 
         wallet, created = ClientWallet.objects.get_or_create(client=client)
         transactions = wallet.transactions.all().order_by('-created_at')[:100]
 
         serializer = WalletTransactionSerializer(transactions, many=True)
         return Response({
-            'balance': wallet.balance,
+            'balance': float(wallet.balance),
             'balance_display': f"{wallet.balance:,.0f} FCFA",
-            'total_deposits': wallet.total_deposits,
-            'total_used': wallet.total_used,
+            'total_deposits': float(wallet.total_deposits),
+            'total_used': float(wallet.total_used),
             'transactions': serializer.data
         })
 
@@ -205,12 +251,8 @@ class ClientSpaceViewSet(viewsets.ViewSet):
         """Produits achetés (stock client)"""
         client = self._get_client(request)
         if not client:
-            return Response(
-                {'error': 'Aucun profil client lié à votre compte'},
-                status=status.HTTP_404_NOT_FOUND
-            )
+            return self._no_client_response()
 
-        # Récupérer les produits achetés
         from ventes_clients.models import LigneVente
         from produits_stocks.models import Product
 
@@ -230,10 +272,10 @@ class ClientSpaceViewSet(viewsets.ViewSet):
                     'product_id': product.id,
                     'product_name': product.name,
                     'product_code': product.code,
-                    'product_reference': product.reference,
+                    'product_reference': getattr(product, 'reference', ''),
                     'total_quantity': ligne['total_quantity'],
                     'total_spent': float(ligne['total_spent'] or 0),
-                    'current_stock': product.stock_quantity,
+                    'current_stock': getattr(product, 'stock_quantity', 0),
                 })
             except Product.DoesNotExist:
                 continue
@@ -251,17 +293,13 @@ class ClientSpaceViewSet(viewsets.ViewSet):
         """Tableau de bord du client"""
         client = self._get_client(request)
         if not client:
-            return Response(
-                {'error': 'Aucun profil client lié à votre compte'},
-                status=status.HTTP_404_NOT_FOUND
-            )
+            return self._no_client_response()
 
         ventes = Vente.objects.filter(client=client)
         factures = Facture.objects.filter(client=client)
         paiements = Paiement.objects.filter(facture__client=client)
         wallet, _ = ClientWallet.objects.get_or_create(client=client)
 
-        # Dernières ventes
         recent_sales = ventes.order_by('-sale_date')[:5]
 
         return Response({
@@ -270,7 +308,7 @@ class ClientSpaceViewSet(viewsets.ViewSet):
                 'code': client.code,
                 'name': client.name,
                 'phone': client.phone,
-                'email': client.email if hasattr(client, 'email') else None,
+                'email': getattr(client, 'email', None),
                 'address': client.address,
             },
             'stats': {
