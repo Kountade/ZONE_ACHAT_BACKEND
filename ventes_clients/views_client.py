@@ -3,21 +3,23 @@ from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.pagination import PageNumberPagination
-from django.db.models import Sum, Q
+from django.db.models import Sum
 from django.utils import timezone
 
 from .models import (
     Client, Vente, Facture, Paiement,
     ClientWallet, WalletTransaction,
-    ClientStock, ClientStockMovement,          # 🆕
+    ClientStock, ClientStockMovement,
+    ClientDelivery, ClientDeliveryLigne,
 )
 from .serializers import (
     VenteListSerializer, VenteDetailSerializer,
     FactureSerializer,
     PaiementSerializer, ClientWalletSerializer,
     WalletTransactionSerializer,
-    ClientStockSerializer,                      # 🆕
-    ClientStockMovementSerializer,              # 🆕
+    ClientStockSerializer,
+    ClientStockMovementSerializer,
+    ClientDeliverySerializer,
 )
 from users.permissions import IsClient
 
@@ -60,6 +62,24 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
             status=status.HTTP_404_NOT_FOUND
         )
 
+    def _paginated_response(self, queryset, serializer_class, extra_data=None):
+        """
+        Helper pour construire une réponse paginée avec données extra.
+        """
+        page = self.paginate_queryset(queryset)
+        context = {'request': self.request}
+
+        if page is not None:
+            serializer = serializer_class(page, many=True, context=context)
+            data = dict(extra_data) if extra_data else {}
+            data['results'] = serializer.data
+            return self.get_paginated_response(data)
+
+        serializer = serializer_class(queryset, many=True, context=context)
+        data = dict(extra_data) if extra_data else {}
+        data['results'] = serializer.data
+        return Response(data)
+
     # ============================================================
     # MES ACHATS (liste)
     # ============================================================
@@ -72,7 +92,6 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
 
         ventes = Vente.objects.filter(client=client).order_by('-sale_date')
 
-        # Filtres
         status_filter = request.query_params.get('status')
         if status_filter:
             ventes = ventes.filter(status=status_filter)
@@ -85,7 +104,6 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
         if date_to:
             ventes = ventes.filter(sale_date__date__lte=date_to)
 
-        # Statistiques globales (avant pagination)
         stats = {
             'total_orders': ventes.count(),
             'total_amount': float(ventes.aggregate(total=Sum('total'))['total'] or 0),
@@ -93,33 +111,16 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
             'total_due': float(ventes.aggregate(total=Sum('amount_due'))['total'] or 0),
         }
 
-        # Pagination
-        page = self.paginate_queryset(ventes)
-        if page is not None:
-            serializer = VenteListSerializer(
-                page, many=True, context={'request': request})
-            return self.get_paginated_response({
-                'stats': stats,
-                'results': serializer.data
-            })
-
-        serializer = VenteListSerializer(
-            ventes, many=True, context={'request': request})
-        return Response({
-            'stats': stats,
-            'results': serializer.data
-        })
+        return self._paginated_response(
+            ventes, VenteListSerializer, {'stats': stats}
+        )
 
     # ============================================================
-    # DÉTAIL D'UNE COMMANDE (client-safe)
+    # DÉTAIL D'UNE COMMANDE
     # ============================================================
     @action(detail=True, methods=['get'], url_path='order-detail')
     def order_detail(self, request, pk=None):
-        """
-        Détail complet d'une commande du client connecté.
-        GET /client-space/{id}/order-detail/
-        Le client ne peut voir QUE ses propres commandes.
-        """
+        """Détail complet d'une commande du client connecté."""
         client = self._get_client(request)
         if not client:
             return self._no_client_response()
@@ -131,7 +132,7 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
                 'lines__lot',
                 'invoices',
                 'invoices__paiements',
-            ).get(id=pk, client=client)   # ✅ sécurité : filtre par client
+            ).get(id=pk, client=client)
         except Vente.DoesNotExist:
             return Response(
                 {'error': 'Commande non trouvée ou non autorisée'},
@@ -165,21 +166,9 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
             'total_paid': float(factures.aggregate(total=Sum('amount_paid'))['total'] or 0),
         }
 
-        page = self.paginate_queryset(factures)
-        if page is not None:
-            serializer = FactureSerializer(
-                page, many=True, context={'request': request})
-            return self.get_paginated_response({
-                'stats': stats,
-                'results': serializer.data
-            })
-
-        serializer = FactureSerializer(
-            factures, many=True, context={'request': request})
-        return Response({
-            'stats': stats,
-            'results': serializer.data
-        })
+        return self._paginated_response(
+            factures, FactureSerializer, {'stats': stats}
+        )
 
     # ============================================================
     # MES PAIEMENTS
@@ -200,21 +189,9 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
             'total_amount': float(paiements.aggregate(total=Sum('amount'))['total'] or 0),
         }
 
-        page = self.paginate_queryset(paiements)
-        if page is not None:
-            serializer = PaiementSerializer(
-                page, many=True, context={'request': request})
-            return self.get_paginated_response({
-                'stats': stats,
-                'results': serializer.data
-            })
-
-        serializer = PaiementSerializer(
-            paiements, many=True, context={'request': request})
-        return Response({
-            'stats': stats,
-            'results': serializer.data
-        })
+        return self._paginated_response(
+            paiements, PaiementSerializer, {'stats': stats}
+        )
 
     # ============================================================
     # MON PORTE-MONNAIE
@@ -250,19 +227,15 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
         })
 
     # ============================================================
-    # MON STOCK DE PRODUITS (marchandises déposées chez moi)
+    # MON STOCK DE PRODUITS
     # ============================================================
     @action(detail=False, methods=['get'], url_path='my-stock')
     def my_stock(self, request):
-        """
-        Stock de marchandises déposées chez le client.
-        Lit depuis ClientStock (dépôts admin), pas depuis les ventes.
-        """
+        """Stock de marchandises déposées chez le client."""
         client = self._get_client(request)
         if not client:
             return self._no_client_response()
 
-        # Récupérer le stock client (créé par l'admin lors du dépôt)
         stock = ClientStock.objects.filter(client=client).first()
 
         if not stock:
@@ -288,10 +261,7 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
     # ============================================================
     @action(detail=False, methods=['get'], url_path='my-stock-movements')
     def my_stock_movements(self, request):
-        """
-        Historique des mouvements de mon stock (dépôts, retraits).
-        GET /client-space/my-stock-movements/
-        """
+        """Historique des mouvements de mon stock."""
         client = self._get_client(request)
         if not client:
             return self._no_client_response()
@@ -305,7 +275,6 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
                 'movements': []
             })
 
-        # Filtres optionnels
         movement_type = request.query_params.get('type')
         date_from = request.query_params.get('date_from')
         date_to = request.query_params.get('date_to')
@@ -329,7 +298,7 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
         ).aggregate(total=Sum('quantity'))['total'] or 0
 
         total_withdrawals = stock.movements.filter(
-            movement_type='withdrawal'
+            movement_type__in=['withdrawal', 'delivery', 'sale']
         ).aggregate(total=Sum('quantity'))['total'] or 0
 
         return Response({
@@ -342,6 +311,75 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
             },
             'movements': serializer.data
         })
+
+    # ============================================================
+    # 🆕 MES LIVRAISONS (SUIVI)
+    # ============================================================
+    @action(detail=False, methods=['get'], url_path='my-deliveries')
+    def my_deliveries(self, request):
+        """
+        Suivi des livraisons de mes produits vers leurs destinataires.
+        GET /client-space/my-deliveries/
+        """
+        client = self._get_client(request)
+        if not client:
+            return self._no_client_response()
+
+        status_filter = request.query_params.get('status')
+
+        deliveries = ClientDelivery.objects.filter(
+            client=client
+        ).prefetch_related(
+            'lignes', 'lignes__product'
+        ).order_by('-created_at')
+
+        if status_filter:
+            deliveries = deliveries.filter(status=status_filter)
+
+        # Stats globales (avant pagination)
+        stats = {
+            'total': deliveries.count(),
+            'pending': deliveries.filter(status='pending').count(),
+            'in_transit': deliveries.filter(status='in_transit').count(),
+            'delivered': deliveries.filter(status='delivered').count(),
+            'cancelled': deliveries.filter(status='cancelled').count(),
+        }
+
+        return self._paginated_response(
+            deliveries,
+            ClientDeliverySerializer,
+            {
+                'client_id': client.id,
+                'client_name': client.name,
+                'stats': stats,
+            }
+        )
+
+    # ============================================================
+    # 🆕 DÉTAIL D'UNE LIVRAISON
+    # ============================================================
+    @action(detail=True, methods=['get'], url_path='my-delivery-detail')
+    def my_delivery_detail(self, request, pk=None):
+        """
+        Détail d'une livraison du client connecté.
+        GET /client-space/{id}/my-delivery-detail/
+        """
+        client = self._get_client(request)
+        if not client:
+            return self._no_client_response()
+
+        try:
+            delivery = ClientDelivery.objects.prefetch_related(
+                'lignes', 'lignes__product'
+            ).get(id=pk, client=client)
+        except ClientDelivery.DoesNotExist:
+            return Response(
+                {'error': 'Livraison non trouvée ou non autorisée'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        serializer = ClientDeliverySerializer(delivery)
+        return Response(serializer.data)
 
     # ============================================================
     # DASHBOARD CLIENT
@@ -358,8 +396,11 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
         paiements = Paiement.objects.filter(facture__client=client)
         wallet, _ = ClientWallet.objects.get_or_create(client=client)
 
-        # 🆕 Récupérer le stock client
         client_stock = ClientStock.objects.filter(client=client).first()
+
+        # Livraisons
+        deliveries_qs = ClientDelivery.objects.filter(client=client)
+        recent_deliveries = deliveries_qs.order_by('-created_at')[:5]
 
         recent_sales = ventes.order_by('-sale_date')[:5]
 
@@ -373,22 +414,32 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
                 'address': client.address,
             },
             'stats': {
+                # Achats & finances
                 'total_orders': ventes.count(),
                 'total_spent': float(ventes.aggregate(total=Sum('total'))['total'] or 0),
                 'total_paid': float(paiements.aggregate(total=Sum('amount'))['total'] or 0),
                 'total_due': float(ventes.aggregate(total=Sum('amount_due'))['total'] or 0),
                 'total_invoices': factures.count(),
                 'wallet_balance': float(wallet.balance),
-                # 🆕 Stats stock
+
+                # Stats stock
                 'stock_products': client_stock.nombre_produits if client_stock else 0,
                 'stock_quantity': float(client_stock.total_quantity) if client_stock else 0,
                 'stock_value': float(client_stock.total_value) if client_stock else 0,
+
+                # Stats livraisons
+                'total_deliveries': deliveries_qs.count(),
+                'pending_deliveries': deliveries_qs.filter(status='pending').count(),
+                'in_transit_deliveries': deliveries_qs.filter(status='in_transit').count(),
+                'delivered_deliveries': deliveries_qs.filter(status='delivered').count(),
             },
             'recent_orders': VenteListSerializer(
                 recent_sales, many=True, context={'request': request}
             ).data,
+            'recent_deliveries': ClientDeliverySerializer(
+                recent_deliveries, many=True
+            ).data,
             'wallet': ClientWalletSerializer(wallet).data,
-            # 🆕 Stock résumé
             'stock_summary': {
                 'has_stock': client_stock is not None,
                 'nombre_produits': client_stock.nombre_produits if client_stock else 0,

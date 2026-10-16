@@ -14,7 +14,11 @@ from datetime import date, timedelta
 from decimal import Decimal
 from .models import (
     Client, Vente, LigneVente, Paiement, Facture,
-    Avoir, Taxe, Remise, Devis, LigneDevis, ClientWallet, WalletTransaction ,ClientStock, ClientStockLigne, ClientStockMovement 
+    Avoir, Taxe, Remise, Devis, LigneDevis,
+    ClientWallet, WalletTransaction,
+    ClientStock, ClientStockLigne, ClientStockMovement,
+    # 🆕 Livraison Client
+    ClientDelivery, ClientDeliveryLigne,
 )
 from produits_stocks.models import Product, Lot, Stock, StockMovement
 from produits_stocks.serializers import ProductListSerializer, LotListSerializer
@@ -1302,7 +1306,147 @@ class ClientStockLigneSerializer(serializers.ModelSerializer):
         source='product.unit.symbol', read_only=True, allow_null=True
     )
     total_value = serializers.ReadOnlyField()
-    
+
+    class Meta:
+        model = ClientStockLigne
+        fields = [
+            'id', 'product', 'product_name', 'product_code', 'product_unit',
+            'quantity', 'unit_price', 'total_value', 'notes',
+            'created_at', 'updated_at'
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+
+class ClientStockMovementSerializer(serializers.ModelSerializer):
+    product_name = serializers.CharField(source='product.name', read_only=True)
+    product_code = serializers.CharField(source='product.code', read_only=True)
+    movement_type_display = serializers.CharField(
+        source='get_movement_type_display', read_only=True
+    )
+    created_by_name = serializers.SerializerMethodField()
+    client_name = serializers.CharField(
+        source='client_stock.client.name', read_only=True
+    )
+    # 🆕 Propriétés utiles
+    is_incoming = serializers.ReadOnlyField()
+    is_outgoing = serializers.ReadOnlyField()
+    quantity_signed = serializers.ReadOnlyField()
+
+    class Meta:
+        model = ClientStockMovement
+        fields = [
+            'id', 'client_stock', 'client_name',
+            'product', 'product_name', 'product_code',
+            'movement_type', 'movement_type_display',
+            'quantity', 'previous_quantity', 'new_quantity',
+            'unit_price', 'reference', 'notes',
+            # 🆕 Sens du mouvement
+            'is_incoming', 'is_outgoing', 'quantity_signed',
+            'created_by', 'created_by_name', 'created_at'
+        ]
+        read_only_fields = ['id', 'created_at']
+
+    def get_created_by_name(self, obj):
+        if obj.created_by:
+            return obj.created_by.get_full_name() or obj.created_by.email
+        return None
+
+
+class ClientStockMovementSerializer(serializers.ModelSerializer):
+    product_name = serializers.CharField(source='product.name', read_only=True)
+    product_code = serializers.CharField(source='product.code', read_only=True)
+    movement_type_display = serializers.CharField(
+        source='get_movement_type_display', read_only=True
+    )
+    created_by_name = serializers.SerializerMethodField()
+    client_name = serializers.CharField(
+        source='client_stock.client.name', read_only=True
+    )
+
+    class Meta:
+        model = ClientStockMovement
+        fields = [
+            'id', 'client_stock', 'client_name',
+            'product', 'product_name', 'product_code',
+            'movement_type', 'movement_type_display',
+            'quantity', 'previous_quantity', 'new_quantity',
+            'unit_price', 'reference', 'notes',
+            'created_by', 'created_by_name', 'created_at'
+        ]
+        read_only_fields = ['id', 'created_at']
+
+    def get_created_by_name(self, obj):
+        if obj.created_by:
+            return obj.created_by.get_full_name() or obj.created_by.email
+        return None
+
+
+class ClientStockDepositSerializer(serializers.Serializer):
+    """Ajouter du stock à un client."""
+    client_id = serializers.IntegerField(required=True)
+    product_id = serializers.IntegerField(required=True)
+    quantity = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=True, min_value=Decimal('0.01')
+    )
+    unit_price = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=False, default=Decimal('0')
+    )
+    notes = serializers.CharField(required=False, allow_blank=True, default='')
+
+    def validate_client_id(self, value):
+        if not Client.objects.filter(id=value).exists():
+            raise serializers.ValidationError(f"Client {value} non trouvé")
+        return value
+
+    def validate_product_id(self, value):
+        if not Product.objects.filter(id=value).exists():
+            raise serializers.ValidationError(f"Produit {value} non trouvé")
+        return value
+
+
+class ClientStockWithdrawalSerializer(serializers.Serializer):
+    """Retirer du stock d'un client."""
+    client_id = serializers.IntegerField(required=True)
+    product_id = serializers.IntegerField(required=True)
+    quantity = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=True, min_value=Decimal('0.01')
+    )
+    notes = serializers.CharField(required=False, allow_blank=True, default='')
+
+    def validate(self, data):
+        # Vérifier que le stock existe et est suffisant
+        try:
+            stock = ClientStock.objects.get(client_id=data['client_id'])
+            ligne = ClientStockLigne.objects.get(
+                stock=stock, product_id=data['product_id']
+            )
+            if ligne.quantity < data['quantity']:
+                raise serializers.ValidationError({
+                    'quantity': f"Stock insuffisant. Disponible : {ligne.quantity}"
+                })
+        except ClientStock.DoesNotExist:
+            raise serializers.ValidationError(
+                "Ce client n'a pas de stock enregistré"
+            )
+        except ClientStockLigne.DoesNotExist:
+            raise serializers.ValidationError(
+                "Ce produit n'est pas dans le stock du client"
+            )
+        return data
+
+
+# ============================================================
+# STOCK CLIENT SERIALIZERS
+# ============================================================
+
+class ClientStockLigneSerializer(serializers.ModelSerializer):
+    product_name = serializers.CharField(source='product.name', read_only=True)
+    product_code = serializers.CharField(source='product.code', read_only=True)
+    product_unit = serializers.CharField(
+        source='product.unit.symbol', read_only=True, allow_null=True
+    )
+    total_value = serializers.ReadOnlyField()
+
     class Meta:
         model = ClientStockLigne
         fields = [
@@ -1321,7 +1465,7 @@ class ClientStockSerializer(serializers.ModelSerializer):
     total_quantity = serializers.ReadOnlyField()
     total_value = serializers.ReadOnlyField()
     nombre_produits = serializers.ReadOnlyField()
-    
+
     class Meta:
         model = ClientStock
         fields = [
@@ -1343,7 +1487,11 @@ class ClientStockMovementSerializer(serializers.ModelSerializer):
     client_name = serializers.CharField(
         source='client_stock.client.name', read_only=True
     )
-    
+    # Propriétés utiles
+    is_incoming = serializers.ReadOnlyField()
+    is_outgoing = serializers.ReadOnlyField()
+    quantity_signed = serializers.ReadOnlyField()
+
     class Meta:
         model = ClientStockMovement
         fields = [
@@ -1352,10 +1500,11 @@ class ClientStockMovementSerializer(serializers.ModelSerializer):
             'movement_type', 'movement_type_display',
             'quantity', 'previous_quantity', 'new_quantity',
             'unit_price', 'reference', 'notes',
+            'is_incoming', 'is_outgoing', 'quantity_signed',
             'created_by', 'created_by_name', 'created_at'
         ]
         read_only_fields = ['id', 'created_at']
-    
+
     def get_created_by_name(self, obj):
         if obj.created_by:
             return obj.created_by.get_full_name() or obj.created_by.email
@@ -1373,12 +1522,12 @@ class ClientStockDepositSerializer(serializers.Serializer):
         max_digits=12, decimal_places=2, required=False, default=Decimal('0')
     )
     notes = serializers.CharField(required=False, allow_blank=True, default='')
-    
+
     def validate_client_id(self, value):
         if not Client.objects.filter(id=value).exists():
             raise serializers.ValidationError(f"Client {value} non trouvé")
         return value
-    
+
     def validate_product_id(self, value):
         if not Product.objects.filter(id=value).exists():
             raise serializers.ValidationError(f"Produit {value} non trouvé")
@@ -1393,9 +1542,8 @@ class ClientStockWithdrawalSerializer(serializers.Serializer):
         max_digits=12, decimal_places=2, required=True, min_value=Decimal('0.01')
     )
     notes = serializers.CharField(required=False, allow_blank=True, default='')
-    
+
     def validate(self, data):
-        # Vérifier que le stock existe et est suffisant
         try:
             stock = ClientStock.objects.get(client_id=data['client_id'])
             ligne = ClientStockLigne.objects.get(
@@ -1414,3 +1562,201 @@ class ClientStockWithdrawalSerializer(serializers.Serializer):
                 "Ce produit n'est pas dans le stock du client"
             )
         return data
+
+
+# ============================================================
+# LIVRAISON CLIENT SERIALIZERS
+# ============================================================
+
+class ClientDeliveryLigneSerializer(serializers.ModelSerializer):
+    product_name = serializers.CharField(source='product.name', read_only=True)
+    product_code = serializers.CharField(source='product.code', read_only=True)
+    product_unit = serializers.CharField(
+        source='product.unit.symbol', read_only=True, allow_null=True
+    )
+
+    class Meta:
+        model = ClientDeliveryLigne
+        fields = [
+            'id',
+            'product', 'product_name', 'product_code', 'product_unit',
+            'client_stock_ligne',
+            'quantity', 'unit_price', 'total_value',
+            'quantity_before', 'quantity_after',
+            'notes', 'created_at',
+        ]
+        read_only_fields = [
+            'id', 'total_value', 'quantity_before', 'quantity_after', 'created_at'
+        ]
+
+
+class ClientDeliveryLigneCreateSerializer(serializers.ModelSerializer):
+    """Utilisé uniquement pour la création (validation quantité > 0)."""
+
+    class Meta:
+        model = ClientDeliveryLigne
+        fields = ['product', 'quantity', 'unit_price', 'notes']
+
+    def validate_quantity(self, value):
+        if value is None or value <= 0:
+            raise serializers.ValidationError(
+                "La quantité doit être supérieure à 0"
+            )
+        return value
+
+    def validate_unit_price(self, value):
+        if value is not None and value < 0:
+            raise serializers.ValidationError(
+                "Le prix unitaire ne peut pas être négatif"
+            )
+        return value
+
+
+class ClientDeliverySerializer(serializers.ModelSerializer):
+    client_name = serializers.CharField(source='client.name', read_only=True)
+    client_code = serializers.CharField(source='client.code', read_only=True)
+    client_phone = serializers.CharField(source='client.phone', read_only=True)
+    created_by_name = serializers.SerializerMethodField()
+    validated_by_name = serializers.SerializerMethodField()
+    status_display = serializers.CharField(
+        source='get_status_display', read_only=True
+    )
+    lignes = ClientDeliveryLigneSerializer(many=True, read_only=True)
+    is_pending = serializers.ReadOnlyField()
+    is_in_transit = serializers.ReadOnlyField()
+    is_delivered = serializers.ReadOnlyField()
+
+    class Meta:
+        model = ClientDelivery
+        fields = [
+            'id', 'delivery_number',
+            # Client source
+            'client', 'client_name', 'client_code', 'client_phone',
+            'client_stock',
+            # Destinataire
+            'recipient_name', 'recipient_phone', 'recipient_address',
+            'recipient_email', 'recipient_notes',
+            # Statut
+            'status', 'status_display',
+            'is_pending', 'is_in_transit', 'is_delivered',
+            # Dates
+            'request_date', 'shipped_date', 'delivered_date',
+            # Transport
+            'delivery_method', 'carrier', 'tracking_number',
+            'vehicle_plate', 'driver_name', 'driver_phone',
+            # Totaux
+            'total_quantity', 'total_value',
+            # Notes
+            'notes', 'client_notes',
+            # Métadonnées
+            'created_by', 'created_by_name',
+            'validated_by', 'validated_by_name',
+            'lignes',
+            'created_at', 'updated_at',
+        ]
+        read_only_fields = [
+            'id', 'delivery_number', 'request_date',
+            'shipped_date', 'delivered_date',
+            'total_quantity', 'total_value',
+            'created_at', 'updated_at',
+        ]
+
+    def get_created_by_name(self, obj):
+        if obj.created_by:
+            return obj.created_by.get_full_name() or obj.created_by.email
+        return None
+
+    def get_validated_by_name(self, obj):
+        if obj.validated_by:
+            return obj.validated_by.get_full_name() or obj.validated_by.email
+        return None
+
+
+class ClientDeliveryCreateSerializer(serializers.Serializer):
+    """
+    Création d'une livraison client.
+    Le destinataire est obligatoire.
+    """
+    client_id = serializers.IntegerField(required=True)
+
+    # Destinataire
+    recipient_name = serializers.CharField(required=True, max_length=200)
+    recipient_phone = serializers.CharField(required=True, max_length=20)
+    recipient_address = serializers.CharField(
+        required=False, allow_blank=True, default=''
+    )
+    recipient_email = serializers.EmailField(
+        required=False, allow_blank=True, default=''
+    )
+    recipient_notes = serializers.CharField(
+        required=False, allow_blank=True, default=''
+    )
+
+    # Transport
+    delivery_method = serializers.CharField(
+        required=False, allow_blank=True, default=''
+    )
+    carrier = serializers.CharField(
+        required=False, allow_blank=True, default=''
+    )
+    tracking_number = serializers.CharField(
+        required=False, allow_blank=True, default=''
+    )
+    vehicle_plate = serializers.CharField(
+        required=False, allow_blank=True, default=''
+    )
+    driver_name = serializers.CharField(
+        required=False, allow_blank=True, default=''
+    )
+    driver_phone = serializers.CharField(
+        required=False, allow_blank=True, default=''
+    )
+
+    # Notes
+    notes = serializers.CharField(required=False, allow_blank=True, default='')
+    client_notes = serializers.CharField(
+        required=False, allow_blank=True, default=''
+    )
+
+    # Produits
+    lignes = ClientDeliveryLigneCreateSerializer(many=True, required=True)
+
+    def validate_client_id(self, value):
+        if not Client.objects.filter(id=value).exists():
+            raise serializers.ValidationError(f"Client {value} non trouvé")
+        return value
+
+    def validate_recipient_phone(self, value):
+        import re
+        if not re.match(r'^[0-9+\-\s()]+$', value):
+            raise serializers.ValidationError("Numéro de téléphone invalide")
+        return value
+
+    def validate_lignes(self, value):
+        if not value:
+            raise serializers.ValidationError("Au moins un produit est requis")
+
+        product_ids = [
+            ligne['product'].id if hasattr(ligne['product'], 'id')
+            else ligne['product']
+            for ligne in value
+        ]
+        if len(product_ids) != len(set(product_ids)):
+            raise serializers.ValidationError(
+                "Un produit ne peut apparaître qu'une seule fois."
+            )
+        return value
+
+
+class ClientDeliveryStatusUpdateSerializer(serializers.Serializer):
+    """Mise à jour du statut + infos transport."""
+    status = serializers.ChoiceField(
+        choices=['pending', 'in_transit', 'delivered', 'cancelled']
+    )
+    carrier = serializers.CharField(required=False, allow_blank=True)
+    tracking_number = serializers.CharField(required=False, allow_blank=True)
+    vehicle_plate = serializers.CharField(required=False, allow_blank=True)
+    driver_name = serializers.CharField(required=False, allow_blank=True)
+    driver_phone = serializers.CharField(required=False, allow_blank=True)
+    delivery_method = serializers.CharField(required=False, allow_blank=True)
+    notes = serializers.CharField(required=False, allow_blank=True)

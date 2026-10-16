@@ -3012,17 +3012,34 @@ class ClientStockLigne(models.Model):
         return self.quantity * self.unit_price
 
 
+
+
+
+# ============================================================
+# MOUVEMENT DE STOCK CLIENT
+# ============================================================
+
 class ClientStockMovement(models.Model):
     """
     Mouvement de stock client (entrée/sortie).
-    Trace l'historique des dépôts et retraits chez le client.
+    Trace l'historique des dépôts, retraits, livraisons, etc.
+
+    Types de mouvement :
+    - deposit     : Ajout de stock par l'admin (dépôt)
+    - withdrawal  : Retrait manuel de stock par l'admin
+    - adjustment  : Ajustement (correction d'inventaire)
+    - sale        : Vente au client (le produit sort du stock)
+    - return      : Retour client (produit remis en stock)
+    - delivery    : Livraison vers un destinataire (retrait réel)
     """
+
     TYPE_CHOICES = (
         ('deposit', 'Dépôt'),
         ('withdrawal', 'Retrait'),
         ('adjustment', 'Ajustement'),
         ('sale', 'Vente au client'),
         ('return', 'Retour client'),
+        ('delivery', 'Livraison vers destinataire'),   # ⭐ NOUVEAU
     )
 
     client_stock = models.ForeignKey(
@@ -3109,3 +3126,432 @@ class ClientStockMovement(models.Model):
             f"{self.get_movement_type_display()} - "
             f"{self.product.name} x {self.quantity}"
         )
+
+    # ============================================================
+    # PROPRIÉTÉS UTILES
+    # ============================================================
+    @property
+    def is_incoming(self):
+        """Mouvement entrant (stock qui augmente)"""
+        return self.movement_type in ['deposit', 'return', 'adjustment']
+
+    @property
+    def is_outgoing(self):
+        """Mouvement sortant (stock qui diminue)"""
+        return self.movement_type in ['withdrawal', 'sale', 'delivery']
+
+    @property
+    def quantity_signed(self):
+        """Quantité signée (+ pour entrée, - pour sortie)"""
+        if self.is_incoming:
+            return self.quantity
+        elif self.is_outgoing:
+            return -self.quantity
+        return self.quantity
+
+    @property
+    def type_display(self):
+        return self.get_movement_type_display()
+
+class ClientDelivery(models.Model):
+    """
+    Livraison des produits stockés chez le client vers un destinataire.
+    L'admin enregistre la livraison, le client suit l'évolution.
+
+    Workflow :
+    - pending      : livraison enregistrée par l'admin
+    - in_transit   : en cours d'acheminement
+    - delivered    : livré (le stock client est déduit)
+    - cancelled    : annulé
+    """
+
+    STATUS_CHOICES = (
+        ('pending', 'En attente'),
+        ('in_transit', 'En cours de livraison'),
+        ('delivered', 'Livré'),
+        ('cancelled', 'Annulé'),
+    )
+
+    # ============================================================
+    # IDENTIFICATION
+    # ============================================================
+    delivery_number = models.CharField(
+        max_length=50,
+        unique=True,
+        verbose_name="Numéro de livraison"
+    )
+
+    # ============================================================
+    # ⭐ CLIENT SOURCE (celui qui a le stock)
+    # ============================================================
+    client = models.ForeignKey(
+        Client,
+        on_delete=models.PROTECT,
+        related_name='client_deliveries',
+        verbose_name="Client (source du stock)"
+    )
+
+    client_stock = models.ForeignKey(
+        ClientStock,
+        on_delete=models.CASCADE,
+        related_name='deliveries',
+        verbose_name="Stock client concerné"
+    )
+
+    # ============================================================
+    # ⭐ DESTINATAIRE (la personne qui reçoit les produits)
+    # ============================================================
+    recipient_name = models.CharField(
+        max_length=200,
+        verbose_name="Nom du destinataire"
+    )
+    recipient_phone = models.CharField(
+        max_length=20,
+        verbose_name="Téléphone du destinataire"
+    )
+    recipient_address = models.TextField(
+        blank=True,
+        verbose_name="Adresse de livraison"
+    )
+    recipient_email = models.EmailField(
+        blank=True,
+        verbose_name="Email du destinataire"
+    )
+    recipient_notes = models.TextField(
+        blank=True,
+        verbose_name="Notes sur le destinataire"
+    )
+
+    # ============================================================
+    # STATUT & DATES
+    # ============================================================
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default='pending',
+        verbose_name="Statut"
+    )
+
+    request_date = models.DateTimeField(
+        auto_now_add=True,
+        verbose_name="Date de la demande"
+    )
+    shipped_date = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name="Date d'expédition"
+    )
+    delivered_date = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name="Date de livraison"
+    )
+
+    # ============================================================
+    # INFORMATIONS DE TRANSPORT
+    # ============================================================
+    delivery_method = models.CharField(
+        max_length=50,
+        blank=True,
+        verbose_name="Mode de livraison"
+    )
+    carrier = models.CharField(
+        max_length=100,
+        blank=True,
+        verbose_name="Transporteur"
+    )
+    tracking_number = models.CharField(
+        max_length=100,
+        blank=True,
+        verbose_name="Numéro de suivi"
+    )
+    vehicle_plate = models.CharField(
+        max_length=50,
+        blank=True,
+        verbose_name="Immatriculation véhicule"
+    )
+    driver_name = models.CharField(
+        max_length=100,
+        blank=True,
+        verbose_name="Nom du chauffeur"
+    )
+    driver_phone = models.CharField(
+        max_length=20,
+        blank=True,
+        verbose_name="Téléphone du chauffeur"
+    )
+
+    # ============================================================
+    # TOTAUX
+    # ============================================================
+    total_quantity = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+        verbose_name="Quantité totale"
+    )
+    total_value = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+        verbose_name="Valeur totale"
+    )
+
+    # ============================================================
+    # NOTES
+    # ============================================================
+    notes = models.TextField(
+        blank=True,
+        verbose_name="Notes internes"
+    )
+    client_notes = models.TextField(
+        blank=True,
+        verbose_name="Message au client"
+    )
+
+    # ============================================================
+    # MÉTADONNÉES
+    # ============================================================
+    created_by = models.ForeignKey(
+        CustomUser,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='client_deliveries_created',
+        verbose_name="Créé par"
+    )
+    validated_by = models.ForeignKey(
+        CustomUser,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='client_deliveries_validated',
+        verbose_name="Validé par"
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Livraison client"
+        verbose_name_plural = "Livraisons client"
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['client', '-created_at']),
+            models.Index(fields=['status', '-created_at']),
+            models.Index(fields=['delivery_number']),
+        ]
+
+    def __str__(self):
+        return (
+            f"{self.delivery_number} - {self.client.name} "
+            f"→ {self.recipient_name} ({self.get_status_display()})"
+        )
+
+    def save(self, *args, **kwargs):
+        if not self.delivery_number:
+            last = ClientDelivery.objects.order_by('-id').first()
+            if last and last.delivery_number:
+                try:
+                    num = int(last.delivery_number.split('-')[-1]) + 1
+                except (ValueError, IndexError):
+                    num = 1
+            else:
+                num = 1
+            self.delivery_number = f"LIV-{date.today().year}-{num:04d}"
+        super().save(*args, **kwargs)
+
+    @property
+    def status_display(self):
+        return self.get_status_display()
+
+    @property
+    def is_pending(self):
+        return self.status == 'pending'
+
+    @property
+    def is_in_transit(self):
+        return self.status == 'in_transit'
+
+    @property
+    def is_delivered(self):
+        return self.status == 'delivered'
+
+    def recalculate_totals(self):
+        total_qty = self.lignes.aggregate(
+            total=models.Sum('quantity')
+        )['total'] or Decimal('0')
+
+        total_val = self.lignes.aggregate(
+            total=models.Sum('total_value')
+        )['total'] or Decimal('0')
+
+        self.total_quantity = total_qty
+        self.total_value = total_val
+        self.save(update_fields=['total_quantity',
+                  'total_value', 'updated_at'])
+
+
+# ============================================================
+# LIGNE DE LIVRAISON CLIENT
+# ============================================================
+
+class ClientDeliveryLigne(models.Model):
+    """
+    Ligne de livraison (produit + quantité retirés du stock client).
+    """
+    delivery = models.ForeignKey(
+        ClientDelivery,
+        on_delete=models.CASCADE,
+        related_name='lignes',
+        verbose_name="Livraison"
+    )
+
+    product = models.ForeignKey(
+        'produits_stocks.Product',
+        on_delete=models.PROTECT,
+        related_name='client_delivery_lignes',
+        verbose_name="Produit"
+    )
+
+    client_stock_ligne = models.ForeignKey(
+        ClientStockLigne,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='delivery_lignes',
+        verbose_name="Ligne de stock client"
+    )
+
+    quantity = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        verbose_name="Quantité"
+    )
+
+    unit_price = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+        verbose_name="Prix unitaire"
+    )
+
+    total_value = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+        verbose_name="Valeur totale"
+    )
+
+    quantity_before = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+        verbose_name="Quantité avant livraison"
+    )
+
+    quantity_after = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+        verbose_name="Quantité après livraison"
+    )
+
+    notes = models.TextField(blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Ligne de livraison client"
+        verbose_name_plural = "Lignes de livraison client"
+        ordering = ['id']
+
+    def __str__(self):
+        return f"{self.product.name} x {self.quantity}"
+
+    def save(self, *args, **kwargs):
+        self.total_value = self.quantity * self.unit_price
+        super().save(*args, **kwargs)
+
+
+
+# ============================================================
+# LIGNE DE LIVRAISON CLIENT
+# ============================================================
+
+class ClientDeliveryLigne(models.Model):
+    """
+    Ligne de livraison (produit + quantité retirés du stock client).
+    """
+    delivery = models.ForeignKey(
+        ClientDelivery,
+        on_delete=models.CASCADE,
+        related_name='lignes',
+        verbose_name="Livraison"
+    )
+
+    product = models.ForeignKey(
+        'produits_stocks.Product',
+        on_delete=models.PROTECT,
+        related_name='client_delivery_lignes',
+        verbose_name="Produit"
+    )
+
+    client_stock_ligne = models.ForeignKey(
+        ClientStockLigne,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='delivery_lignes',
+        verbose_name="Ligne de stock client"
+    )
+
+    quantity = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        verbose_name="Quantité"
+    )
+
+    unit_price = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+        verbose_name="Prix unitaire"
+    )
+
+    total_value = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+        verbose_name="Valeur totale"
+    )
+
+    quantity_before = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+        verbose_name="Quantité avant livraison"
+    )
+
+    quantity_after = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+        verbose_name="Quantité après livraison"
+    )
+
+    notes = models.TextField(blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Ligne de livraison client"
+        verbose_name_plural = "Lignes de livraison client"
+        ordering = ['id']
+
+    def __str__(self):
+        return f"{self.product.name} x {self.quantity}"
+
+    def save(self, *args, **kwargs):
+        self.total_value = self.quantity * self.unit_price
+        super().save(*args, **kwargs)
