@@ -2065,15 +2065,15 @@ logger = logging.getLogger(__name__)
 class Avoir(models.Model):
     """
     Avoir client (note de crédit).
-    
+
     Représente une créance de l'entreprise envers le client.
-    
+
     Types :
     - refund   : Remboursement
     - return   : Retour de marchandise (restaure le stock)
     - discount : Remise / Geste commercial
     - error    : Erreur de facturation
-    
+
     Un avoir contient PLUSIEURS lignes (LigneAvoir) permettant
     de gérer les retours PARTIELS (ex: 5 produits sur 10).
     """
@@ -2251,7 +2251,7 @@ class Avoir(models.Model):
     def can_restore_stock(self):
         """
         Indique si cet avoir peut déclencher une restauration de stock.
-        
+
         Conditions :
         - Une vente doit être associée
         - Le type doit être 'refund' ou 'return'
@@ -2293,12 +2293,12 @@ class Avoir(models.Model):
         """
         Restaure le stock UNIQUEMENT pour les produits retournés
         (lignes de l'avoir).
-        
+
         Pour chaque ligne :
         - Restaure la quantité dans le lot d'origine (si traçable)
         - Met à jour le stock (recalcul depuis les lots ou ajout manuel)
         - Crée un StockMovement avec le type 'return_in'
-        
+
         Retourne un dict :
         {
             'success': bool,
@@ -2466,7 +2466,8 @@ class Avoir(models.Model):
         # ------------------------------------------------------------
         self.restore_stock = True
         self.stock_restored_at = timezone.now()
-        self.save(update_fields=["restore_stock", "stock_restored_at", "updated_at"])
+        self.save(update_fields=["restore_stock",
+                  "stock_restored_at", "updated_at"])
 
         # ------------------------------------------------------------
         # RÉSULTAT FINAL
@@ -2494,6 +2495,8 @@ class Avoir(models.Model):
 # ============================================================
 # LIGNE AVOIR
 # ============================================================
+
+
 class LigneAvoir(models.Model):
     """Produit retourné dans un avoir."""
 
@@ -2890,3 +2893,219 @@ class WalletTransaction(models.Model):
 
     def __str__(self):
         return f"{self.get_type_display()} - {self.amount:,.0f} FCFA"
+
+
+# ============================================================
+# STOCK CLIENT (MARCHANDISES DÉPOSÉES CHEZ LE CLIENT)
+# ============================================================
+
+class ClientStock(models.Model):
+    """
+    Stock de marchandises déposées chez un client.
+    Permet à l'admin de gérer le stock que le client a en sa possession.
+
+    ⚠️ DIFFÉRENT de Stock (produits_stocks) :
+    - Stock = stock dans NOS entrepôts
+    - ClientStock = stock chez LE CLIENT (dépôt/consignation)
+    """
+    client = models.OneToOneField(
+        Client,
+        on_delete=models.CASCADE,
+        related_name='client_stock',
+        verbose_name="Client"
+    )
+
+    is_active = models.BooleanField(
+        default=True,
+        verbose_name="Stock actif"
+    )
+
+    notes = models.TextField(
+        blank=True,
+        verbose_name="Notes"
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Stock client"
+        verbose_name_plural = "Stocks clients"
+        ordering = ['-updated_at']
+
+    def __str__(self):
+        return f"Stock de {self.client.name}"
+
+    @property
+    def total_quantity(self):
+        """Quantité totale de tous les produits"""
+        return self.lignes.aggregate(
+            total=models.Sum('quantity')
+        )['total'] or Decimal('0')
+
+    @property
+    def total_value(self):
+        """Valeur totale du stock client"""
+        return sum(
+            (ligne.total_value for ligne in self.lignes.all()),
+            Decimal('0')
+        )
+
+    @property
+    def nombre_produits(self):
+        """Nombre de produits différents"""
+        return self.lignes.count()
+
+
+class ClientStockLigne(models.Model):
+    """
+    Ligne de stock client : un produit avec sa quantité.
+    """
+    stock = models.ForeignKey(
+        ClientStock,
+        on_delete=models.CASCADE,
+        related_name='lignes',
+        verbose_name="Stock client"
+    )
+
+    product = models.ForeignKey(
+        'produits_stocks.Product',
+        on_delete=models.PROTECT,
+        related_name='client_stock_lignes',
+        verbose_name="Produit"
+    )
+
+    quantity = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+        verbose_name="Quantité"
+    )
+
+    unit_price = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+        verbose_name="Prix unitaire de référence"
+    )
+
+    notes = models.TextField(
+        blank=True,
+        verbose_name="Notes"
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Ligne de stock client"
+        verbose_name_plural = "Lignes de stock client"
+        unique_together = [['stock', 'product']]
+        ordering = ['product__name']
+
+    def __str__(self):
+        return f"{self.product.name} x {self.quantity}"
+
+    @property
+    def total_value(self):
+        """Valeur totale de cette ligne"""
+        return self.quantity * self.unit_price
+
+
+class ClientStockMovement(models.Model):
+    """
+    Mouvement de stock client (entrée/sortie).
+    Trace l'historique des dépôts et retraits chez le client.
+    """
+    TYPE_CHOICES = (
+        ('deposit', 'Dépôt'),
+        ('withdrawal', 'Retrait'),
+        ('adjustment', 'Ajustement'),
+        ('sale', 'Vente au client'),
+        ('return', 'Retour client'),
+    )
+
+    client_stock = models.ForeignKey(
+        ClientStock,
+        on_delete=models.CASCADE,
+        related_name='movements',
+        verbose_name="Stock client"
+    )
+
+    product = models.ForeignKey(
+        'produits_stocks.Product',
+        on_delete=models.PROTECT,
+        related_name='client_stock_movements',
+        verbose_name="Produit"
+    )
+
+    movement_type = models.CharField(
+        max_length=20,
+        choices=TYPE_CHOICES,
+        verbose_name="Type de mouvement"
+    )
+
+    quantity = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        verbose_name="Quantité"
+    )
+
+    previous_quantity = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+        verbose_name="Quantité précédente"
+    )
+
+    new_quantity = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+        verbose_name="Nouvelle quantité"
+    )
+
+    unit_price = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+        verbose_name="Prix unitaire"
+    )
+
+    reference = models.CharField(
+        max_length=100,
+        blank=True,
+        verbose_name="Référence"
+    )
+
+    notes = models.TextField(
+        blank=True,
+        verbose_name="Notes"
+    )
+
+    created_by = models.ForeignKey(
+        CustomUser,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='client_stock_movements_created',
+        verbose_name="Créé par"
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Mouvement de stock client"
+        verbose_name_plural = "Mouvements de stock client"
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['client_stock', '-created_at']),
+            models.Index(fields=['product', '-created_at']),
+            models.Index(fields=['movement_type']),
+        ]
+
+    def __str__(self):
+        return (
+            f"{self.get_movement_type_display()} - "
+            f"{self.product.name} x {self.quantity}"
+        )

@@ -5,7 +5,7 @@ from .views import (
     ClientViewSet, VenteViewSet, PaiementViewSet,
     FactureViewSet, AvoirViewSet, TaxeViewSet,
     RemiseViewSet, SalesDashboardStatsViewSet, DevisViewSet,
-    WalletViewSet, ClientWalletViewSet
+    WalletViewSet, ClientWalletViewSet, ClientStockViewSet
 )
 
 # ✅ AJOUTER CET IMPORT
@@ -29,6 +29,7 @@ router.register('wallet', WalletViewSet, basename='wallet')
 
 # ✅ AJOUTER CETTE LIGNE — ESPACE CLIENT
 router.register('client-space', ClientSpaceViewSet, basename='client-space')
+router.register('client-stock', ClientStockViewSet, basename='client-stock')
 
 # ✅ VenteViewSet avec différents basenames
 router.register('sales', VenteViewSet, basename='sales')

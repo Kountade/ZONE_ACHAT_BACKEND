@@ -6,12 +6,18 @@ from rest_framework.pagination import PageNumberPagination
 from django.db.models import Sum, Q
 from django.utils import timezone
 
-from .models import Client, Vente, Facture, Paiement, ClientWallet, WalletTransaction
+from .models import (
+    Client, Vente, Facture, Paiement,
+    ClientWallet, WalletTransaction,
+    ClientStock, ClientStockMovement,          # 🆕
+)
 from .serializers import (
-    VenteListSerializer, VenteDetailSerializer,       # ✅ ajout VenteDetailSerializer
+    VenteListSerializer, VenteDetailSerializer,
     FactureSerializer,
     PaiementSerializer, ClientWalletSerializer,
-    WalletTransactionSerializer
+    WalletTransactionSerializer,
+    ClientStockSerializer,                      # 🆕
+    ClientStockMovementSerializer,              # 🆕
 )
 from users.permissions import IsClient
 
@@ -244,45 +250,97 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
         })
 
     # ============================================================
-    # MON STOCK DE PRODUITS (produits achetés)
+    # MON STOCK DE PRODUITS (marchandises déposées chez moi)
     # ============================================================
     @action(detail=False, methods=['get'], url_path='my-stock')
     def my_stock(self, request):
-        """Produits achetés (stock client)"""
+        """
+        Stock de marchandises déposées chez le client.
+        Lit depuis ClientStock (dépôts admin), pas depuis les ventes.
+        """
         client = self._get_client(request)
         if not client:
             return self._no_client_response()
 
-        from ventes_clients.models import LigneVente
-        from produits_stocks.models import Product
+        # Récupérer le stock client (créé par l'admin lors du dépôt)
+        stock = ClientStock.objects.filter(client=client).first()
 
-        lignes = LigneVente.objects.filter(
-            sale__client=client,
-            sale__status__in=['confirmed', 'paid', 'delivered']
-        ).values('product').annotate(
-            total_quantity=Sum('quantity'),
-            total_spent=Sum('total')
-        ).order_by('-total_quantity')
+        if not stock:
+            return Response({
+                'count': 0,
+                'total_quantity': 0,
+                'total_value': 0,
+                'results': []
+            })
 
-        resultats = []
-        for ligne in lignes:
-            try:
-                product = Product.objects.get(id=ligne['product'])
-                resultats.append({
-                    'product_id': product.id,
-                    'product_name': product.name,
-                    'product_code': product.code,
-                    'product_reference': getattr(product, 'reference', ''),
-                    'total_quantity': ligne['total_quantity'],
-                    'total_spent': float(ligne['total_spent'] or 0),
-                    'current_stock': getattr(product, 'stock_quantity', 0),
-                })
-            except Product.DoesNotExist:
-                continue
+        serializer = ClientStockSerializer(stock)
 
         return Response({
-            'count': len(resultats),
-            'results': resultats
+            'count': stock.nombre_produits,
+            'total_quantity': float(stock.total_quantity),
+            'total_value': float(stock.total_value),
+            'results': serializer.data['lignes'],
+            'last_update': stock.updated_at,
+        })
+
+    # ============================================================
+    # HISTORIQUE DES MOUVEMENTS DE MON STOCK
+    # ============================================================
+    @action(detail=False, methods=['get'], url_path='my-stock-movements')
+    def my_stock_movements(self, request):
+        """
+        Historique des mouvements de mon stock (dépôts, retraits).
+        GET /client-space/my-stock-movements/
+        """
+        client = self._get_client(request)
+        if not client:
+            return self._no_client_response()
+
+        stock = ClientStock.objects.filter(client=client).first()
+
+        if not stock:
+            return Response({
+                'client_id': client.id,
+                'client_name': client.name,
+                'movements': []
+            })
+
+        # Filtres optionnels
+        movement_type = request.query_params.get('type')
+        date_from = request.query_params.get('date_from')
+        date_to = request.query_params.get('date_to')
+
+        movements = stock.movements.select_related('product', 'created_by')
+
+        if movement_type:
+            movements = movements.filter(movement_type=movement_type)
+        if date_from:
+            movements = movements.filter(created_at__date__gte=date_from)
+        if date_to:
+            movements = movements.filter(created_at__date__lte=date_to)
+
+        movements = movements.order_by('-created_at')[:100]
+
+        serializer = ClientStockMovementSerializer(movements, many=True)
+
+        # Stats
+        total_deposits = stock.movements.filter(
+            movement_type='deposit'
+        ).aggregate(total=Sum('quantity'))['total'] or 0
+
+        total_withdrawals = stock.movements.filter(
+            movement_type='withdrawal'
+        ).aggregate(total=Sum('quantity'))['total'] or 0
+
+        return Response({
+            'client_id': client.id,
+            'client_name': client.name,
+            'stats': {
+                'total_deposits': float(total_deposits),
+                'total_withdrawals': float(total_withdrawals),
+                'current_quantity': float(stock.total_quantity),
+            },
+            'movements': serializer.data
         })
 
     # ============================================================
@@ -299,6 +357,9 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
         factures = Facture.objects.filter(client=client)
         paiements = Paiement.objects.filter(facture__client=client)
         wallet, _ = ClientWallet.objects.get_or_create(client=client)
+
+        # 🆕 Récupérer le stock client
+        client_stock = ClientStock.objects.filter(client=client).first()
 
         recent_sales = ventes.order_by('-sale_date')[:5]
 
@@ -318,9 +379,20 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
                 'total_due': float(ventes.aggregate(total=Sum('amount_due'))['total'] or 0),
                 'total_invoices': factures.count(),
                 'wallet_balance': float(wallet.balance),
+                # 🆕 Stats stock
+                'stock_products': client_stock.nombre_produits if client_stock else 0,
+                'stock_quantity': float(client_stock.total_quantity) if client_stock else 0,
+                'stock_value': float(client_stock.total_value) if client_stock else 0,
             },
             'recent_orders': VenteListSerializer(
                 recent_sales, many=True, context={'request': request}
             ).data,
             'wallet': ClientWalletSerializer(wallet).data,
+            # 🆕 Stock résumé
+            'stock_summary': {
+                'has_stock': client_stock is not None,
+                'nombre_produits': client_stock.nombre_produits if client_stock else 0,
+                'total_quantity': float(client_stock.total_quantity) if client_stock else 0,
+                'total_value': float(client_stock.total_value) if client_stock else 0,
+            } if client_stock else None,
         })

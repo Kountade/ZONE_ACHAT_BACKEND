@@ -3,6 +3,7 @@ from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from django.contrib.auth import get_user_model, authenticate
+from django.db import transaction
 from knox.models import AuthToken
 from django.db.models import Q
 
@@ -41,7 +42,6 @@ class LoginViewset(viewsets.ViewSet):
                     else True
                 )
 
-                # Message d'avertissement si client non approuvé
                 warning_message = None
                 if user.role == 'client' and not is_approved:
                     warning_message = (
@@ -148,6 +148,9 @@ class UserViewset(viewsets.ViewSet):
     def is_admin(self, user):
         return user.role in self.ADMIN_ROLES
 
+    # ============================================================
+    # LIST
+    # ============================================================
     def list(self, request):
         if self.is_admin(request.user):
             queryset = User.objects.all().order_by('-created_at')
@@ -182,6 +185,9 @@ class UserViewset(viewsets.ViewSet):
         serializer = UserSerializer(queryset, many=True)
         return Response(serializer.data)
 
+    # ============================================================
+    # CREATE
+    # ============================================================
     def create(self, request):
         if request.user.role != 'admin':
             return Response(
@@ -195,6 +201,9 @@ class UserViewset(viewsets.ViewSet):
             return Response(UserSerializer(user).data, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
+    # ============================================================
+    # RETRIEVE
+    # ============================================================
     def retrieve(self, request, pk=None):
         try:
             user = User.objects.get(pk=pk)
@@ -211,6 +220,9 @@ class UserViewset(viewsets.ViewSet):
 
         return Response({"error": "Permission refusée"}, status=403)
 
+    # ============================================================
+    # UPDATE
+    # ============================================================
     def update(self, request, pk=None):
         try:
             user = User.objects.get(pk=pk)
@@ -236,6 +248,9 @@ class UserViewset(viewsets.ViewSet):
 
         return Response({"error": "Permission refusée"}, status=403)
 
+    # ============================================================
+    # PARTIAL UPDATE
+    # ============================================================
     def partial_update(self, request, pk=None):
         try:
             user = User.objects.get(pk=pk)
@@ -262,6 +277,9 @@ class UserViewset(viewsets.ViewSet):
 
         return Response({"error": "Permission refusée"}, status=403)
 
+    # ============================================================
+    # DESTROY
+    # ============================================================
     def destroy(self, request, pk=None):
         if request.user.role != 'admin':
             return Response(
@@ -284,13 +302,31 @@ class UserViewset(viewsets.ViewSet):
         return Response(status=204)
 
     # ============================================================
-    # ACTIONS CLIENTS
+    # ACTION : /users/me/
     # ============================================================
+    @action(detail=False, methods=['get'], url_path='me')
+    def me(self, request):
+        """
+        Retourne les informations de l'utilisateur connecté.
+        GET /users/me/
+        """
+        user = request.user
+        serializer = UserDetailSerializer(user)
+        return Response(serializer.data)
 
+    # ============================================================
+    # ACTION : APPROUVER UN CLIENT
+    # ============================================================
     @action(detail=True, methods=['post'], url_path='approve',
             permission_classes=[CanApproveClients])
     def approve_client(self, request, pk=None):
-        """Approuver un compte client en attente"""
+        """
+        Approuver un compte client en attente.
+        ✅ S'assure que le profil Client existe et est actif.
+        ✅ Crée le wallet si absent.
+        """
+        from ventes_clients.models import Client, ClientWallet
+
         try:
             user = User.objects.get(pk=pk)
         except User.DoesNotExist:
@@ -311,16 +347,81 @@ class UserViewset(viewsets.ViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        user.is_approved = True
-        user.is_active = True
-        user.save(update_fields=['is_approved', 'is_active', 'updated_at'])
+        try:
+            with transaction.atomic():
+                # ✅ ÉTAPE 1 : S'assurer que le Client existe
+                client = user.client_profile
 
-        return Response({
-            'status': 'success',
-            'message': f'Le client {user.email} a été approuvé avec succès',
-            'user': UserSerializer(user).data
-        })
+                if not client:
+                    # Créer le Client si absent
+                    count = Client.objects.count()
+                    code = f"CLI-{count + 1:05d}"
+                    while Client.objects.filter(code=code).exists():
+                        count += 1
+                        code = f"CLI-{count + 1:05d}"
 
+                    full_name = (
+                        f"{user.first_name} {user.last_name}".strip()
+                        or user.email
+                    )
+
+                    client = Client.objects.create(
+                        code=code,
+                        name=full_name,
+                        type='particulier',
+                        phone=user.phone_number or '',
+                        address=user.address or '',
+                        statut='actif',
+                        notes=(
+                            f"Client créé lors de l'approbation par "
+                            f"{request.user.get_full_name() or request.user.email}"
+                        )
+                    )
+                    user.client_profile = client
+
+                # ✅ ÉTAPE 2 : Approuver l'utilisateur
+                user.is_approved = True
+                user.is_active = True
+                user.save(update_fields=[
+                    'is_approved', 'is_active', 'client_profile', 'updated_at'
+                ])
+
+                # ✅ ÉTAPE 3 : S'assurer que le Client est actif
+                client.statut = 'actif'
+                client.save(update_fields=['statut', 'updated_at'])
+
+                # ✅ ÉTAPE 4 : Créer le wallet automatiquement
+                ClientWallet.objects.get_or_create(client=client)
+
+                print(
+                    f"✅ [APPROBATION] Client approuvé : "
+                    f"{user.email} → Client {client.code} ({client.name})"
+                )
+
+                return Response({
+                    'status': 'success',
+                    'message': f'Le client {user.email} a été approuvé avec succès',
+                    'user': UserSerializer(user).data,
+                    'client': {
+                        'id': client.id,
+                        'code': client.code,
+                        'name': client.name,
+                        'statut': client.statut,
+                    }
+                })
+
+        except Exception as e:
+            print(f"❌ Erreur approbation client : {e}")
+            import traceback
+            traceback.print_exc()
+            return Response(
+                {"error": f"Erreur lors de l'approbation : {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+    # ============================================================
+    # ACTION : REJETER UN CLIENT
+    # ============================================================
     @action(detail=True, methods=['post'], url_path='reject',
             permission_classes=[CanApproveClients])
     def reject_client(self, request, pk=None):
@@ -349,6 +450,9 @@ class UserViewset(viewsets.ViewSet):
             'user': UserSerializer(user).data
         })
 
+    # ============================================================
+    # ACTION : LISTE DES CLIENTS EN ATTENTE
+    # ============================================================
     @action(detail=False, methods=['get'], url_path='pending-clients',
             permission_classes=[CanApproveClients])
     def pending_clients(self, request):
@@ -364,6 +468,9 @@ class UserViewset(viewsets.ViewSet):
             'results': UserSerializer(clients, many=True).data
         })
 
+    # ============================================================
+    # ACTION : LISTE DES CLIENTS APPROUVÉS
+    # ============================================================
     @action(detail=False, methods=['get'], url_path='approved-clients',
             permission_classes=[CanApproveClients])
     def approved_clients(self, request):
@@ -377,6 +484,38 @@ class UserViewset(viewsets.ViewSet):
         return Response({
             'count': clients.count(),
             'results': UserSerializer(clients, many=True).data
+        })
+
+    # ============================================================
+    # ACTION : DIAGNOSTIC — Vérifier le lien client
+    # ============================================================
+    @action(detail=True, methods=['get'], url_path='check-client-profile')
+    def check_client_profile(self, request, pk=None):
+        """
+        Diagnostic : vérifier si un utilisateur a bien un profil client lié.
+        GET /users/{id}/check-client-profile/
+        """
+        try:
+            user = User.objects.get(pk=pk)
+        except User.DoesNotExist:
+            return Response(
+                {"error": "Utilisateur non trouvé"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        has_profile = user.client_profile is not None
+
+        return Response({
+            'user_id': user.id,
+            'email': user.email,
+            'role': user.role,
+            'is_approved': user.is_approved,
+            'is_active': user.is_active,
+            'has_client_profile': has_profile,
+            'client_profile_id': user.client_profile.id if has_profile else None,
+            'client_profile_code': user.client_profile.code if has_profile else None,
+            'client_profile_name': user.client_profile.name if has_profile else None,
+            'client_profile_statut': user.client_profile.statut if has_profile else None,
         })
 
 

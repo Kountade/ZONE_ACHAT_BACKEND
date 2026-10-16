@@ -1,24 +1,25 @@
 # apps/ventes_clients/views.py
 # ============================================================
-# IMPORTATIONS AVEC ALIAS
+# IMPORTATIONS
 # ============================================================
 
-from django.db.models import Sum, Q
-from decimal import Decimal
 import logging
-from io import BytesIO
 import json
+from io import BytesIO
 from datetime import date, timedelta
 import datetime as dt
+from decimal import Decimal
+
+from django.db import transaction
+from django.db.models import Q, Sum, Count
+from django.core.exceptions import ValidationError
+from django.http import HttpResponse
+from django.utils import timezone
 
 from rest_framework import viewsets, status, permissions
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from django.db.models import Q, Sum, Count
-from django.utils import timezone
-from django.http import HttpResponse
-from django.db import transaction
-from django.core.exceptions import ValidationError
+
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
@@ -27,31 +28,64 @@ from reportlab.lib.units import inch
 from reportlab.lib.enums import TA_CENTER
 from PIL import Image as PILImage
 
-# === Modèles ===
+# === Modèles ventes_clients ===
 from .models import (
     Client, ClientWallet, Vente, LigneVente, Paiement, Facture,
-    Avoir, Taxe, Remise, Devis, LigneDevis
+    Avoir, Taxe, Remise, Devis, LigneDevis,
+    # 🆕 Stock Client
+    ClientStock, ClientStockLigne, ClientStockMovement,
 )
-from produits_stocks.models import Stock, StockMovement, Warehouse
+
+# === Modèles produits_stocks ===
+from produits_stocks.models import Stock, StockMovement, Warehouse, Product
+
+# === Permissions ===
 from users.permissions import IsAdmin, IsGestionnaire, IsCaissier
 
-# === Serializers ===
+# === Serializers ventes_clients ===
 from .serializers import (
-    ClientSerializer, ClientListSerializer, ClientWalletSerializer,
-    VenteListSerializer, VenteDetailSerializer,
-    VenteCreateSerializer, VenteUpdateSerializer,
+    # Client
+    ClientSerializer,
+    ClientListSerializer,
+    ClientWalletSerializer,
+    # Vente
+    VenteListSerializer,
+    VenteDetailSerializer,
+    VenteCreateSerializer,
+    VenteUpdateSerializer,
     VenteStatusUpdateSerializer,
-    LigneVenteSerializer, LigneVenteCreateSerializer,
-    PaiementSerializer, PaiementCreateSerializer,
-    FactureSerializer, FactureCreateSerializer,
-    AvoirSerializer, AvoirCreateSerializer,
-    TaxeSerializer, RemiseSerializer,
-    DevisListSerializer, DevisDetailSerializer,
-    DevisCreateSerializer, DevisUpdateSerializer,
+    LigneVenteSerializer,
+    LigneVenteCreateSerializer,
+    # Paiement
+    PaiementSerializer,
+    PaiementCreateSerializer,
+    # Facture
+    FactureSerializer,
+    FactureCreateSerializer,
+    # Avoir
+    AvoirSerializer,
+    AvoirCreateSerializer,
+    # Taxe / Remise
+    TaxeSerializer,
+    RemiseSerializer,
+    # Devis
+    DevisListSerializer,
+    DevisDetailSerializer,
+    DevisCreateSerializer,
+    DevisUpdateSerializer,
     DevisStatusUpdateSerializer,
-    LigneDevisSerializer, LigneDevisCreateSerializer,
-    WalletDepositSerializer, ClientWalletCreateSerializer,
-    WalletTransactionSerializer
+    LigneDevisSerializer,
+    LigneDevisCreateSerializer,
+    # Wallet
+    WalletDepositSerializer,
+    ClientWalletCreateSerializer,
+    WalletTransactionSerializer,
+    # 🆕 Stock Client
+    ClientStockSerializer,
+    ClientStockLigneSerializer,
+    ClientStockMovementSerializer,
+    ClientStockDepositSerializer,
+    ClientStockWithdrawalSerializer,
 )
 
 # === Trésorerie ===
@@ -194,6 +228,9 @@ def creer_mouvement_paiement_manuel(paiement, facture, request_user):
 # ============================================================
 # CLIENT VIEWSET
 # ============================================================
+# ============================================================
+# CLIENT VIEWSET
+# ============================================================
 class ClientViewSet(viewsets.ModelViewSet):
     queryset = Client.objects.all()
     permission_classes = [permissions.IsAuthenticated]
@@ -205,64 +242,88 @@ class ClientViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         queryset = super().get_queryset()
+
+        # ---------- Recherche ----------
         search = self.request.query_params.get('search')
         if search:
             queryset = queryset.filter(
                 Q(name__icontains=search) |
                 Q(code__icontains=search) |
-                Q(phone__icontains=search) |
-                Q(email__icontains=search)
+                Q(phone__icontains=search)
+                # ✅ email supprimé (le modèle Client n'a pas ce champ)
             )
+
+        # ---------- Filtre par type ----------
         type_filter = self.request.query_params.get('type')
         if type_filter:
             queryset = queryset.filter(type=type_filter)
+
+        # ---------- Filtre par statut ----------
         statut = self.request.query_params.get('statut')
         if statut:
             queryset = queryset.filter(statut=statut)
+
+        # ---------- Filtre favoris ----------
         is_favorite = self.request.query_params.get('is_favorite')
         if is_favorite == 'true':
             queryset = queryset.filter(is_favorite=True)
+
         return queryset
 
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user)
 
+    # ============================================================
+    # VENTES D'UN CLIENT
+    # ============================================================
     @action(detail=True, methods=['get'])
     def sales(self, request, pk=None):
         client = self.get_object()
         sales = client.sales.all().order_by('-sale_date')
-        serializer = VenteListSerializer(sales, many=True)
+        serializer = VenteListSerializer(
+            sales, many=True, context={'request': request})
         return Response(serializer.data)
 
+    # ============================================================
+    # DEVIS D'UN CLIENT
+    # ============================================================
     @action(detail=True, methods=['get'])
     def devis(self, request, pk=None):
         client = self.get_object()
         devis = client.devis.all().order_by('-devis_date')
-        serializer = DevisListSerializer(devis, many=True)
+        serializer = DevisListSerializer(
+            devis, many=True, context={'request': request})
         return Response(serializer.data)
 
+    # ============================================================
+    # STATISTIQUES D'UN CLIENT
+    # ============================================================
     @action(detail=True, methods=['get'])
     def statistics(self, request, pk=None):
         client = self.get_object()
         sales = client.sales.all()
+
         stats = {
             'total_orders': sales.count(),
             'total_purchases': sales.aggregate(total=Sum('total'))['total'] or 0,
             'orders_by_status': {},
             'average_order_value': 0,
         }
+
         for status_choice in Vente.STATUS_CHOICES:
             status_code = status_choice[0]
             count = sales.filter(status=status_code).count()
             if count > 0:
                 stats['orders_by_status'][status_code] = count
+
         if stats['total_orders'] > 0:
             stats['average_order_value'] = stats['total_purchases'] / \
                 stats['total_orders']
+
         return Response(stats)
 
     # ============================================================
-    # Récupérer les factures impayées d'un client
+    # FACTURES IMPAYÉES D'UN CLIENT
     # ============================================================
     @action(detail=True, methods=['get'], url_path='unpaid-invoices')
     def unpaid_invoices(self, request, pk=None):
@@ -292,7 +353,7 @@ class ClientViewSet(viewsets.ModelViewSet):
         return Response(serializer.data)
 
     # ============================================================
-    # ✅ NOUVEAU : Récupérer le wallet d'un client
+    # WALLET D'UN CLIENT
     # ============================================================
     @action(detail=True, methods=['get'], url_path='wallet')
     def get_client_wallet(self, request, pk=None):
@@ -305,10 +366,24 @@ class ClientViewSet(viewsets.ModelViewSet):
         serializer = ClientWalletSerializer(wallet)
         return Response(serializer.data)
 
-
+    # ============================================================
+    # 🆕 STOCK D'UN CLIENT
+    # ============================================================
+    @action(detail=True, methods=['get'], url_path='stock')
+    def get_client_stock(self, request, pk=None):
+        """
+        Récupère le stock d'un client
+        GET /clients/{id}/stock/
+        """
+        client = self.get_object()
+        stock, created = ClientStock.objects.get_or_create(client=client)
+        serializer = ClientStockSerializer(stock)
+        return Response(serializer.data)
 # ============================================================
 # DEVIS VIEWSET
 # ============================================================
+
+
 class DevisViewSet(viewsets.ModelViewSet):
     queryset = Devis.objects.all()
     permission_classes = [permissions.IsAuthenticated]
@@ -3333,3 +3408,270 @@ class ClientWalletViewSet(viewsets.ViewSet):
 
 # On garde tous les ViewSets déjà exportés
 # On ajoute ClientWalletViewSet
+# ============================================================
+# CLIENT STOCK VIEWSET
+# ============================================================
+
+class ClientStockViewSet(viewsets.ViewSet):
+    """
+    API pour gérer le stock des clients (dépôt/retrait de marchandises).
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def _is_admin(self, user):
+        return user.role == 'admin' or user.is_staff or user.is_superuser
+
+    # ============================================================
+    # 1. LISTE DE TOUS LES STOCKS CLIENTS
+    # ============================================================
+    @action(detail=False, methods=['get'], url_path='list')
+    def list_stocks(self, request):
+        """Liste tous les stocks clients"""
+        if not self._is_admin(request.user):
+            return Response(
+                {"error": "Permission non accordée"},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        stocks = ClientStock.objects.select_related('client').prefetch_related(
+            'lignes', 'lignes__product'
+        ).all()
+
+        # Filtres
+        search = request.query_params.get('search')
+        if search:
+            stocks = stocks.filter(
+                Q(client__name__icontains=search) |
+                Q(client__code__icontains=search) |
+                Q(client__phone__icontains=search)
+            )
+
+        serializer = ClientStockSerializer(stocks, many=True)
+
+        # Stats globales
+        total_value = sum(s.total_value for s in stocks)
+        total_quantity = sum(s.total_quantity for s in stocks)
+
+        return Response({
+            'count': stocks.count(),
+            'total_value': float(total_value),
+            'total_quantity': float(total_quantity),
+            'results': serializer.data
+        })
+
+    # ============================================================
+    # 2. STOCK D'UN CLIENT SPÉCIFIQUE
+    # ============================================================
+    @action(detail=True, methods=['get'], url_path='client-stock')
+    def get_client_stock(self, request, pk=None):
+        """Récupère le stock d'un client spécifique (pk = client_id)"""
+        try:
+            client = Client.objects.get(id=pk)
+            stock, created = ClientStock.objects.get_or_create(client=client)
+            serializer = ClientStockSerializer(stock)
+            return Response(serializer.data)
+        except Client.DoesNotExist:
+            return Response(
+                {"error": f"Client {pk} non trouvé"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+    # ============================================================
+    # 3. AJOUTER DU STOCK À UN CLIENT (DÉPÔT)
+    # ============================================================
+    @action(detail=False, methods=['post'], url_path='deposit')
+    def deposit_stock(self, request):
+        """
+        Ajoute du stock à un client.
+        POST /client-stock/deposit/
+        Body: {
+            "client_id": 1,
+            "product_id": 5,
+            "quantity": 100,
+            "unit_price": 500,
+            "notes": "..."
+        }
+        """
+        if not self._is_admin(request.user):
+            return Response(
+                {"error": "Permission non accordée"},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        serializer = ClientStockDepositSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        data = serializer.validated_data
+
+        try:
+            with transaction.atomic():
+                client = Client.objects.get(id=data['client_id'])
+                product = Product.objects.get(id=data['product_id'])
+
+                # Récupérer ou créer le stock client
+                stock, _ = ClientStock.objects.get_or_create(client=client)
+
+                # Récupérer ou créer la ligne
+                ligne, ligne_created = ClientStockLigne.objects.get_or_create(
+                    stock=stock,
+                    product=product,
+                    defaults={
+                        'quantity': Decimal('0'),
+                        'unit_price': data.get('unit_price') or product.selling_price
+                    }
+                )
+
+                previous_quantity = ligne.quantity
+                ligne.quantity += data['quantity']
+
+                # Mettre à jour le prix si fourni
+                if data.get('unit_price'):
+                    ligne.unit_price = data['unit_price']
+
+                if data.get('notes'):
+                    ligne.notes = (
+                        f"{ligne.notes}\n{data['notes']}".strip()
+                        if ligne.notes else data['notes']
+                    )
+
+                ligne.save()
+
+                # Créer le mouvement
+                movement = ClientStockMovement.objects.create(
+                    client_stock=stock,
+                    product=product,
+                    movement_type='deposit',
+                    quantity=data['quantity'],
+                    previous_quantity=previous_quantity,
+                    new_quantity=ligne.quantity,
+                    unit_price=ligne.unit_price,
+                    reference=f"DEP-{timezone.now().strftime('%Y%m%d%H%M%S')}",
+                    notes=data.get('notes', ''),
+                    created_by=request.user
+                )
+
+                logger.info(
+                    f"✅ Dépôt stock client: {product.name} x {data['quantity']} "
+                    f"chez {client.name}"
+                )
+
+                return Response({
+                    'status': 'success',
+                    'message': f'Ajout de {data["quantity"]} {product.name} effectué',
+                    'client_stock': ClientStockSerializer(stock).data,
+                    'movement': ClientStockMovementSerializer(movement).data
+                }, status=status.HTTP_201_CREATED)
+
+        except Exception as e:
+            logger.exception("Erreur dépôt stock client")
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+    # ============================================================
+    # 4. RETIRER DU STOCK D'UN CLIENT
+    # ============================================================
+    @action(detail=False, methods=['post'], url_path='withdraw')
+    def withdraw_stock(self, request):
+        """
+        Retire du stock d'un client.
+        POST /client-stock/withdraw/
+        Body: {
+            "client_id": 1,
+            "product_id": 5,
+            "quantity": 50,
+            "notes": "..."
+        }
+        """
+        if not self._is_admin(request.user):
+            return Response(
+                {"error": "Permission non accordée"},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        serializer = ClientStockWithdrawalSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        data = serializer.validated_data
+
+        try:
+            with transaction.atomic():
+                client = Client.objects.get(id=data['client_id'])
+                product = Product.objects.get(id=data['product_id'])
+
+                stock = ClientStock.objects.get(client=client)
+                ligne = ClientStockLigne.objects.get(
+                    stock=stock, product=product
+                )
+
+                previous_quantity = ligne.quantity
+                ligne.quantity -= data['quantity']
+                ligne.save()
+
+                movement = ClientStockMovement.objects.create(
+                    client_stock=stock,
+                    product=product,
+                    movement_type='withdrawal',
+                    quantity=data['quantity'],
+                    previous_quantity=previous_quantity,
+                    new_quantity=ligne.quantity,
+                    unit_price=ligne.unit_price,
+                    reference=f"RET-{timezone.now().strftime('%Y%m%d%H%M%S')}",
+                    notes=data.get('notes', ''),
+                    created_by=request.user
+                )
+
+                logger.info(
+                    f"✅ Retrait stock client: {product.name} x {data['quantity']} "
+                    f"chez {client.name}"
+                )
+
+                return Response({
+                    'status': 'success',
+                    'message': f'Retrait de {data["quantity"]} {product.name} effectué',
+                    'client_stock': ClientStockSerializer(stock).data,
+                    'movement': ClientStockMovementSerializer(movement).data
+                }, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            logger.exception("Erreur retrait stock client")
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+    # ============================================================
+    # 5. HISTORIQUE DES MOUVEMENTS D'UN CLIENT
+    # ============================================================
+    @action(detail=True, methods=['get'], url_path='movements')
+    def get_movements(self, request, pk=None):
+        """Historique des mouvements de stock d'un client (pk = client_id)"""
+        try:
+            client = Client.objects.get(id=pk)
+            stock = ClientStock.objects.filter(client=client).first()
+
+            if not stock:
+                return Response({
+                    'client_id': client.id,
+                    'client_name': client.name,
+                    'movements': []
+                })
+
+            movements = stock.movements.select_related(
+                'product', 'created_by'
+            ).order_by('-created_at')[:100]
+
+            serializer = ClientStockMovementSerializer(movements, many=True)
+            return Response({
+                'client_id': client.id,
+                'client_name': client.name,
+                'movements': serializer.data
+            })
+        except Client.DoesNotExist:
+            return Response(
+                {"error": f"Client {pk} non trouvé"},
+                status=status.HTTP_404_NOT_FOUND
+            )

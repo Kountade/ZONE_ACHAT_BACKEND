@@ -55,39 +55,50 @@ class ClientRegisterSerializer(serializers.ModelSerializer):
         validated_data['is_staff'] = False
         validated_data['is_superuser'] = False
 
+        # ✅ Créer l'utilisateur
         user = User.objects.create_user(password=password, **validated_data)
 
-        # ✅ Créer un profil Client et le lier
-        try:
-            from ventes_clients.models import Client
+        # ✅ TOUJOURS créer un Client et le lier (pas de try/except silencieux)
+        from ventes_clients.models import Client, ClientWallet
 
-            # Vérifier si un client avec cet email existe déjà
-            existing_client = Client.objects.filter(
-                email__iexact=user.email
-            ).first() if hasattr(Client, 'email') else None
+        # Générer un code unique CLI-00001
+        count = Client.objects.count()
+        code = f"CLI-{count + 1:05d}"
+        while Client.objects.filter(code=code).exists():
+            count += 1
+            code = f"CLI-{count + 1:05d}"
 
-            if existing_client:
-                user.client_profile = existing_client
-                user.save(update_fields=['client_profile'])
-            else:
-                # Générer un code unique
-                count = Client.objects.count()
-                code = f"CLI-{count + 1:05d}"
-                while Client.objects.filter(code=code).exists():
-                    count += 1
-                    code = f"CLI-{count + 1:05d}"
+        # Nom complet
+        full_name = f"{user.first_name} {user.last_name}".strip()
+        if not full_name:
+            full_name = user.email
 
-                new_client = Client.objects.create(
-                    code=code,
-                    name=f"{user.first_name} {user.last_name}".strip() or user.email,
-                    phone=user.phone_number or '',
-                    address=user.address or '',
-                    statut='actif'
-                )
-                user.client_profile = new_client
-                user.save(update_fields=['client_profile'])
-        except Exception as e:
-            print(f"⚠️ Erreur création profil client: {e}")
+        # ✅ Créer le Client
+        new_client = Client.objects.create(
+            code=code,
+            name=full_name,
+            type='particulier',
+            phone=user.phone_number or '',
+            address=user.address or '',
+            statut='actif',
+            notes=(
+                f"Créé automatiquement lors de l'inscription de {user.email}. "
+                f"Compte en attente d'approbation."
+            )
+        )
+
+        # ✅ Lier le Client au User (ESSENTIEL)
+        user.client_profile = new_client
+        user.save(update_fields=['client_profile'])
+
+        # ✅ Créer le wallet automatiquement
+        ClientWallet.objects.get_or_create(client=new_client)
+
+        # ✅ Log pour debug
+        print(
+            f"✅ [INSCRIPTION] Client créé : {new_client.code} - {new_client.name} "
+            f"(lié à user #{user.id} {user.email})"
+        )
 
         return user
 
