@@ -89,7 +89,8 @@ from .serializers import (
     ClientStockMovementSerializer,
     ClientStockDepositSerializer,
     ClientStockWithdrawalSerializer,
-    # 🆕 Livraison Client
+    ClientDeliveryValidateSerializer,        # 🆕
+    ClientDeliveryRejectSerializer, 
     ClientDeliverySerializer,
     ClientDeliveryLigneSerializer,
     ClientDeliveryLigneCreateSerializer,
@@ -3691,15 +3692,34 @@ class ClientStockViewSet(viewsets.ViewSet):
 # ============================================================
 # apps/ventes_clients/views.py
 
+# ============================================================
+# CLIENT DELIVERY VIEWSET (ADMIN)
+# ============================================================
 class ClientDeliveryViewSet(viewsets.ViewSet):
     """
     Gestion des livraisons des produits du stock client vers un destinataire.
-    Workflow : pending → in_transit → delivered
+    
+    Workflow :
+    - pending    : Demande créée (client ou admin) → à valider
+    - confirmed  : Validée par l'admin → à démarrer
+    - in_transit : En cours de livraison
+    - delivered  : Livré (stock client déduit)
+    - cancelled  : Annulée
+    - rejected   : Rejetée (par l'admin)
     """
     permission_classes = [permissions.IsAuthenticated]
 
+    # ============================================================
+    # HELPERS
+    # ============================================================
     def _is_admin(self, user):
         return user.role == 'admin' or user.is_staff or user.is_superuser
+
+    def _forbidden(self):
+        return Response(
+            {"error": "Permission non accordée"},
+            status=status.HTTP_403_FORBIDDEN
+        )
 
     # ============================================================
     # 1. LISTE DES LIVRAISONS
@@ -3708,16 +3728,13 @@ class ClientDeliveryViewSet(viewsets.ViewSet):
     def list_deliveries(self, request):
         """Liste toutes les livraisons (admin)"""
         if not self._is_admin(request.user):
-            return Response(
-                {"error": "Permission non accordée"},
-                status=status.HTTP_403_FORBIDDEN
-            )
+            return self._forbidden()
 
         deliveries = ClientDelivery.objects.select_related(
             'client', 'created_by', 'validated_by'
         ).prefetch_related('lignes', 'lignes__product')
 
-        # Filtres
+        # ===== Filtres =====
         status_filter = request.query_params.get('status')
         if status_filter:
             deliveries = deliveries.filter(status=status_filter)
@@ -3725,6 +3742,13 @@ class ClientDeliveryViewSet(viewsets.ViewSet):
         client_id = request.query_params.get('client')
         if client_id:
             deliveries = deliveries.filter(client_id=client_id)
+
+        # 🆕 Filtrer par origine (client / admin)
+        from_client = request.query_params.get('from_client')
+        if from_client == 'true':
+            deliveries = deliveries.filter(created_by_client=True)
+        elif from_client == 'false':
+            deliveries = deliveries.filter(created_by_client=False)
 
         search = request.query_params.get('search')
         if search:
@@ -3737,17 +3761,31 @@ class ClientDeliveryViewSet(viewsets.ViewSet):
                 Q(tracking_number__icontains=search)
             )
 
+        date_from = request.query_params.get('date_from')
+        if date_from:
+            deliveries = deliveries.filter(request_date__date__gte=date_from)
+
+        date_to = request.query_params.get('date_to')
+        if date_to:
+            deliveries = deliveries.filter(request_date__date__lte=date_to)
+
         deliveries = deliveries.order_by('-created_at')
 
         serializer = ClientDeliverySerializer(deliveries, many=True)
 
-        # Statistiques
+        # ===== Statistiques =====
         stats = {
             'total': deliveries.count(),
             'pending': deliveries.filter(status='pending').count(),
+            'confirmed': deliveries.filter(status='confirmed').count(),
             'in_transit': deliveries.filter(status='in_transit').count(),
             'delivered': deliveries.filter(status='delivered').count(),
             'cancelled': deliveries.filter(status='cancelled').count(),
+            'rejected': deliveries.filter(status='rejected').count(),
+            # 🆕 Demandes client en attente
+            'pending_from_clients': deliveries.filter(
+                status='pending', created_by_client=True
+            ).count(),
         }
 
         return Response({
@@ -3763,10 +3801,7 @@ class ClientDeliveryViewSet(viewsets.ViewSet):
     def delivery_detail(self, request, pk=None):
         """Détail d'une livraison (admin)"""
         if not self._is_admin(request.user):
-            return Response(
-                {"error": "Permission non accordée"},
-                status=status.HTTP_403_FORBIDDEN
-            )
+            return self._forbidden()
 
         try:
             delivery = ClientDelivery.objects.select_related(
@@ -3782,37 +3817,16 @@ class ClientDeliveryViewSet(viewsets.ViewSet):
         return Response(serializer.data)
 
     # ============================================================
-    # 3. CRÉATION D'UNE LIVRAISON
+    # 3. CRÉATION D'UNE LIVRAISON (ADMIN)
     # ============================================================
     @action(detail=False, methods=['post'], url_path='create')
     def create_delivery(self, request):
         """
-        Crée une livraison (retrait de produits du stock client).
-        Body: {
-            "client_id": 1,
-            "recipient_name": "...",
-            "recipient_phone": "...",
-            "recipient_address": "...",
-            "recipient_email": "...",
-            "recipient_notes": "...",
-            "delivery_method": "...",
-            "carrier": "...",
-            "tracking_number": "...",
-            "vehicle_plate": "...",
-            "driver_name": "...",
-            "driver_phone": "...",
-            "notes": "...",
-            "client_notes": "...",
-            "lignes": [
-                {"product": 5, "quantity": 10, "unit_price": 500, "notes": ""}
-            ]
-        }
+        Crée une livraison (côté admin).
+        Le statut initial est 'pending' mais elle est marquée admin.
         """
         if not self._is_admin(request.user):
-            return Response(
-                {"error": "Permission non accordée"},
-                status=status.HTTP_403_FORBIDDEN
-            )
+            return self._forbidden()
 
         serializer = ClientDeliveryCreateSerializer(data=request.data)
         if not serializer.is_valid():
@@ -3823,12 +3837,8 @@ class ClientDeliveryViewSet(viewsets.ViewSet):
         try:
             with transaction.atomic():
                 client = Client.objects.get(id=data['client_id'])
+                client_stock, _ = ClientStock.objects.get_or_create(client=client)
 
-                # Récupérer ou créer le stock client
-                client_stock, _ = ClientStock.objects.get_or_create(
-                    client=client)
-
-                # Créer la livraison
                 delivery = ClientDelivery.objects.create(
                     client=client,
                     client_stock=client_stock,
@@ -3851,9 +3861,9 @@ class ClientDeliveryViewSet(viewsets.ViewSet):
                     # Statut
                     status='pending',
                     created_by=request.user,
+                    created_by_client=False,   # ⚠️ Admin
                 )
 
-                # Ajouter les lignes
                 for ligne_data in data['lignes']:
                     product_id = (
                         ligne_data['product'].id
@@ -3884,8 +3894,7 @@ class ClientDeliveryViewSet(viewsets.ViewSet):
                         client_stock_ligne=stock_ligne,
                         quantity=quantity,
                         unit_price=(
-                            ligne_data.get(
-                                'unit_price') or stock_ligne.unit_price
+                            ligne_data.get('unit_price') or stock_ligne.unit_price
                         ),
                         notes=ligne_data.get('notes', ''),
                     )
@@ -3893,7 +3902,7 @@ class ClientDeliveryViewSet(viewsets.ViewSet):
                 delivery.recalculate_totals()
 
                 logger.info(
-                    f"✅ Livraison {delivery.delivery_number} créée "
+                    f"✅ Livraison {delivery.delivery_number} créée par admin "
                     f"({client.name} → {delivery.recipient_name})"
                 )
 
@@ -3916,16 +3925,141 @@ class ClientDeliveryViewSet(viewsets.ViewSet):
             )
 
     # ============================================================
-    # 4. DÉMARRER LA LIVRAISON (pending → in_transit)
+    # 4. 🆕 VALIDER UNE DEMANDE CLIENT (pending → confirmed)
     # ============================================================
-    @action(detail=True, methods=['post'], url_path='start-delivery')
-    def start_delivery(self, request, pk=None):
-        """Démarre la livraison (ajoute les infos de transport)"""
+    @action(detail=True, methods=['post'], url_path='validate-request')
+    def validate_request(self, request, pk=None):
+        """
+        Valide une demande créée par un client.
+        Statut : pending → confirmed
+        Peut optionnellement ajouter les infos de transport.
+        """
         if not self._is_admin(request.user):
+            return self._forbidden()
+
+        try:
+            delivery = ClientDelivery.objects.select_related(
+                'client', 'client_stock'
+            ).prefetch_related(
+                'lignes', 'lignes__product', 'lignes__client_stock_ligne'
+            ).get(id=pk)
+        except ClientDelivery.DoesNotExist:
             return Response(
-                {"error": "Permission non accordée"},
-                status=status.HTTP_403_FORBIDDEN
+                {"error": "Livraison non trouvée"},
+                status=status.HTTP_404_NOT_FOUND
             )
+
+        if delivery.status != 'pending':
+            return Response(
+                {
+                    "error": (
+                        f"Impossible de valider : statut actuel "
+                        f"'{delivery.status}'. Attendu : 'pending'"
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        serializer = ClientDeliveryValidateSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        data = serializer.validated_data
+
+        try:
+            with transaction.atomic():
+                client_stock = delivery.client_stock
+
+                # 1. Vérifier le stock disponible
+                for ligne in delivery.lignes.all():
+                    stock_ligne = ligne.client_stock_ligne
+                    if not stock_ligne:
+                        stock_ligne = ClientStockLigne.objects.filter(
+                            stock=client_stock,
+                            product=ligne.product
+                        ).first()
+
+                    if not stock_ligne:
+                        return Response(
+                            {
+                                "error": (
+                                    f"Produit {ligne.product.name} "
+                                    f"non trouvé dans le stock client"
+                                )
+                            },
+                            status=status.HTTP_400_BAD_REQUEST
+                        )
+
+                    if stock_ligne.quantity < ligne.quantity:
+                        return Response(
+                            {
+                                "error": (
+                                    f"Stock insuffisant pour "
+                                    f"{ligne.product.name}. "
+                                    f"Disponible : {stock_ligne.quantity}, "
+                                    f"Demandé : {ligne.quantity}"
+                                )
+                            },
+                            status=status.HTTP_400_BAD_REQUEST
+                        )
+
+                # 2. Ajouter les infos de transport si fournies
+                for field in ['carrier', 'tracking_number', 'vehicle_plate',
+                              'driver_name', 'driver_phone', 'delivery_method']:
+                    if data.get(field):
+                        setattr(delivery, field, data[field])
+
+                # 3. Ajouter une note de validation
+                note_line = (
+                    f"[VALIDÉE le {timezone.now().strftime('%Y-%m-%d %H:%M')} "
+                    f"par {request.user.email}]"
+                )
+                if data.get('notes'):
+                    note_line += f"\n{data['notes']}"
+
+                delivery.notes = (
+                    f"{delivery.notes}\n{note_line}"
+                    if delivery.notes else note_line
+                )
+
+                # 4. Changer le statut
+                delivery.status = 'confirmed'
+                delivery.confirmed_date = timezone.now()
+                delivery.validated_by = request.user
+                delivery.save()
+
+                logger.info(
+                    f"✅ Demande {delivery.delivery_number} validée "
+                    f"par {request.user.email}"
+                )
+
+                return Response({
+                    'status': 'success',
+                    'message': (
+                        f'Demande {delivery.delivery_number} validée. '
+                        f'Vous pouvez maintenant la démarrer.'
+                    ),
+                    'delivery': ClientDeliverySerializer(delivery).data,
+                })
+
+        except Exception as e:
+            logger.exception("Erreur validation demande")
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+    # ============================================================
+    # 5. 🆕 REJETER UNE DEMANDE CLIENT (pending → rejected)
+    # ============================================================
+    @action(detail=True, methods=['post'], url_path='reject-request')
+    def reject_request(self, request, pk=None):
+        """
+        Rejette une demande créée par un client.
+        Statut : pending → rejected
+        """
+        if not self._is_admin(request.user):
+            return self._forbidden()
 
         try:
             delivery = ClientDelivery.objects.get(id=pk)
@@ -3939,26 +4073,86 @@ class ClientDeliveryViewSet(viewsets.ViewSet):
             return Response(
                 {
                     "error": (
-                        f"Impossible de démarrer : statut actuel "
-                        f"'{delivery.status}'"
+                        f"Impossible de rejeter : statut actuel "
+                        f"'{delivery.status}'. Attendu : 'pending'"
                     )
                 },
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # Mettre à jour les infos de transport
-        if request.data.get('carrier'):
-            delivery.carrier = request.data['carrier']
-        if request.data.get('tracking_number'):
-            delivery.tracking_number = request.data['tracking_number']
-        if request.data.get('vehicle_plate'):
-            delivery.vehicle_plate = request.data['vehicle_plate']
-        if request.data.get('driver_name'):
-            delivery.driver_name = request.data['driver_name']
-        if request.data.get('driver_phone'):
-            delivery.driver_phone = request.data['driver_phone']
-        if request.data.get('delivery_method'):
-            delivery.delivery_method = request.data['delivery_method']
+        serializer = ClientDeliveryRejectSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        reason = serializer.validated_data['reason']
+
+        delivery.status = 'rejected'
+        delivery.rejection_reason = reason
+        delivery.validated_by = request.user
+
+        note_line = (
+            f"[REJETÉE le {timezone.now().strftime('%Y-%m-%d %H:%M')} "
+            f"par {request.user.email}]\nRaison : {reason}"
+        )
+        delivery.notes = (
+            f"{delivery.notes}\n{note_line}"
+            if delivery.notes else note_line
+        )
+        delivery.save()
+
+        logger.info(
+            f"❌ Demande {delivery.delivery_number} rejetée "
+            f"par {request.user.email} - Raison : {reason}"
+        )
+
+        return Response({
+            'status': 'success',
+            'message': f'Demande {delivery.delivery_number} rejetée',
+            'delivery': ClientDeliverySerializer(delivery).data,
+        })
+
+    # ============================================================
+    # 6. DÉMARRER LA LIVRAISON (pending|confirmed → in_transit)
+    # ============================================================
+    @action(detail=True, methods=['post'], url_path='start-delivery')
+    def start_delivery(self, request, pk=None):
+        """
+        Démarre la livraison (ajoute les infos de transport).
+        Accepte les statuts 'pending' ET 'confirmed'.
+        """
+        if not self._is_admin(request.user):
+            return self._forbidden()
+
+        try:
+            delivery = ClientDelivery.objects.get(id=pk)
+        except ClientDelivery.DoesNotExist:
+            return Response(
+                {"error": "Livraison non trouvée"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        if delivery.status not in ['pending', 'confirmed']:
+            return Response(
+                {
+                    "error": (
+                        f"Impossible de démarrer : statut actuel "
+                        f"'{delivery.status}'. "
+                        f"Requis : 'pending' ou 'confirmed'"
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Mise à jour des infos de transport
+        for field in ['carrier', 'tracking_number', 'vehicle_plate',
+                      'driver_name', 'driver_phone', 'delivery_method']:
+            if request.data.get(field):
+                setattr(delivery, field, request.data[field])
+
+        # Si la livraison était 'pending', on la marque comme validée d'abord
+        if delivery.status == 'pending':
+            delivery.confirmed_date = timezone.now()
+            delivery.validated_by = request.user
 
         delivery.status = 'in_transit'
         delivery.shipped_date = timezone.now()
@@ -3973,19 +4167,16 @@ class ClientDeliveryViewSet(viewsets.ViewSet):
         })
 
     # ============================================================
-    # 5. CONFIRMER LA LIVRAISON (in_transit → delivered)
-    #    ✅ C'EST ICI QUE LE STOCK CLIENT EST DÉDUIT
+    # 7. CONFIRMER LA LIVRAISON (confirmed|in_transit → delivered)
     # ============================================================
     @action(detail=True, methods=['post'], url_path='confirm-delivery')
     def confirm_delivery(self, request, pk=None):
         """
         Confirme la livraison ET déduit le stock client.
+        Accepte 'confirmed' ET 'in_transit'.
         """
         if not self._is_admin(request.user):
-            return Response(
-                {"error": "Permission non accordée"},
-                status=status.HTTP_403_FORBIDDEN
-            )
+            return self._forbidden()
 
         try:
             delivery = ClientDelivery.objects.select_related(
@@ -3999,12 +4190,13 @@ class ClientDeliveryViewSet(viewsets.ViewSet):
                 status=status.HTTP_404_NOT_FOUND
             )
 
-        if delivery.status not in ['pending', 'in_transit']:
+        if delivery.status not in ['confirmed', 'in_transit']:
             return Response(
                 {
                     "error": (
-                        f"Impossible de confirmer : statut "
-                        f"'{delivery.status}'"
+                        f"Impossible de confirmer : statut actuel "
+                        f"'{delivery.status}'. "
+                        f"Requis : 'confirmed' ou 'in_transit'"
                     )
                 },
                 status=status.HTTP_400_BAD_REQUEST
@@ -4035,11 +4227,9 @@ class ClientDeliveryViewSet(viewsets.ViewSet):
                             f"Demandé : {ligne.quantity}"
                         )
 
-                    # Sauvegarder quantités avant/après
+                    # Sauvegarder avant/après
                     ligne.quantity_before = stock_ligne.quantity
-                    ligne.quantity_after = (
-                        stock_ligne.quantity - ligne.quantity
-                    )
+                    ligne.quantity_after = stock_ligne.quantity - ligne.quantity
                     ligne.save(update_fields=[
                         'quantity_before', 'quantity_after'
                     ])
@@ -4048,7 +4238,7 @@ class ClientDeliveryViewSet(viewsets.ViewSet):
                     stock_ligne.quantity -= ligne.quantity
                     stock_ligne.save()
 
-                    # Créer le mouvement de stock client
+                    # Créer le mouvement
                     ClientStockMovement.objects.create(
                         client_stock=client_stock,
                         product=ligne.product,
@@ -4071,7 +4261,7 @@ class ClientDeliveryViewSet(viewsets.ViewSet):
                         f"{ligne.quantity_before} → {ligne.quantity_after}"
                     )
 
-                # Mettre à jour le statut
+                # Marquer comme livré
                 delivery.status = 'delivered'
                 delivery.delivered_date = timezone.now()
                 delivery.validated_by = request.user
@@ -4104,16 +4294,13 @@ class ClientDeliveryViewSet(viewsets.ViewSet):
             )
 
     # ============================================================
-    # 6. ANNULER UNE LIVRAISON
+    # 8. ANNULER UNE LIVRAISON (admin)
     # ============================================================
     @action(detail=True, methods=['post'], url_path='cancel')
     def cancel_delivery(self, request, pk=None):
-        """Annule une livraison (seulement si non livrée)"""
+        """Annule une livraison (admin). Pas possible si 'delivered'."""
         if not self._is_admin(request.user):
-            return Response(
-                {"error": "Permission non accordée"},
-                status=status.HTTP_403_FORBIDDEN
-            )
+            return self._forbidden()
 
         try:
             delivery = ClientDelivery.objects.get(id=pk)
@@ -4129,17 +4316,25 @@ class ClientDeliveryViewSet(viewsets.ViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        if delivery.status == 'cancelled':
+        if delivery.status in ['cancelled', 'rejected']:
             return Response(
-                {"error": "Cette livraison est déjà annulée"},
+                {"error": f"Cette livraison est déjà '{delivery.status}'"},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+        reason = request.data.get('reason', '')
         delivery.status = 'cancelled'
-        delivery.notes = (
-            (delivery.notes or '') +
-            f"\n[ANNULÉ le {timezone.now().strftime('%Y-%m-%d %H:%M')} "
+
+        note_line = (
+            f"[ANNULÉE le {timezone.now().strftime('%Y-%m-%d %H:%M')} "
             f"par {request.user.email}]"
+        )
+        if reason:
+            note_line += f"\nRaison : {reason}"
+
+        delivery.notes = (
+            f"{delivery.notes}\n{note_line}"
+            if delivery.notes else note_line
         )
         delivery.save()
 

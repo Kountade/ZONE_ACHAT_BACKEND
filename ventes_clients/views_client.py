@@ -3,13 +3,15 @@ from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.pagination import PageNumberPagination
+from django.db import transaction
 from django.db.models import Sum
 from django.utils import timezone
+from decimal import Decimal
 
 from .models import (
     Client, Vente, Facture, Paiement,
     ClientWallet, WalletTransaction,
-    ClientStock, ClientStockMovement,
+    ClientStock, ClientStockLigne, ClientStockMovement,     # 🆕 ClientStockLigne
     ClientDelivery, ClientDeliveryLigne,
 )
 from .serializers import (
@@ -20,6 +22,8 @@ from .serializers import (
     ClientStockSerializer,
     ClientStockMovementSerializer,
     ClientDeliverySerializer,
+    ClientDeliveryRequestCreateSerializer,      # 🆕
+    ClientDeliveryRequestUpdateSerializer,      # 🆕
 )
 from users.permissions import IsClient
 
@@ -292,7 +296,6 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
 
         serializer = ClientStockMovementSerializer(movements, many=True)
 
-        # Stats
         total_deposits = stock.movements.filter(
             movement_type='deposit'
         ).aggregate(total=Sum('quantity'))['total'] or 0
@@ -313,7 +316,7 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
         })
 
     # ============================================================
-    # 🆕 MES LIVRAISONS (SUIVI) — SANS PAGINATION
+    # MES LIVRAISONS (SUIVI) — SANS PAGINATION
     # ============================================================
     @action(detail=False, methods=['get'], url_path='my-deliveries')
     def my_deliveries(self, request):
@@ -338,16 +341,16 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
         if status_filter:
             deliveries = deliveries.filter(status=status_filter)
 
-        # Stats globales
         stats = {
             'total': deliveries.count(),
             'pending': deliveries.filter(status='pending').count(),
+            'confirmed': deliveries.filter(status='confirmed').count(),      # 🆕
             'in_transit': deliveries.filter(status='in_transit').count(),
             'delivered': deliveries.filter(status='delivered').count(),
             'cancelled': deliveries.filter(status='cancelled').count(),
+            'rejected': deliveries.filter(status='rejected').count(),         # 🆕
         }
 
-        # ⚠️ PAS de pagination (comme my_stock)
         serializer = ClientDeliverySerializer(
             deliveries, many=True, context={'request': request}
         )
@@ -361,14 +364,11 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
         })
 
     # ============================================================
-    # 🆕 DÉTAIL D'UNE LIVRAISON
+    # DÉTAIL D'UNE LIVRAISON
     # ============================================================
     @action(detail=True, methods=['get'], url_path='my-delivery-detail')
     def my_delivery_detail(self, request, pk=None):
-        """
-        Détail d'une livraison du client connecté.
-        GET /client-space/{id}/my-delivery-detail/
-        """
+        """Détail d'une livraison du client connecté."""
         client = self._get_client(request)
         if not client:
             return self._no_client_response()
@@ -387,6 +387,310 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
             delivery, context={'request': request}
         )
         return Response(serializer.data)
+
+    # ============================================================
+    # 🆕 CRÉER UNE DEMANDE DE LIVRAISON (CLIENT)
+    # ============================================================
+    @action(detail=False, methods=['post'], url_path='my-deliveries/create')
+    def create_my_delivery(self, request):
+        """
+        Le client crée une demande de livraison.
+        Statut initial : 'pending' (à valider par l'admin).
+
+        POST /client-space/my-deliveries/create/
+        Body: {
+            "recipient_name": "...",
+            "recipient_phone": "...",
+            "recipient_address": "...",
+            "recipient_email": "...",
+            "recipient_notes": "...",
+            "client_notes": "...",
+            "lignes": [
+                {"product": 1, "quantity": 5, "notes": ""}
+            ]
+        }
+        """
+        client = self._get_client(request)
+        if not client:
+            return self._no_client_response()
+
+        serializer = ClientDeliveryRequestCreateSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        data = serializer.validated_data
+
+        try:
+            with transaction.atomic():
+                # Récupérer le stock du client
+                client_stock = ClientStock.objects.filter(client=client).first()
+
+                if not client_stock:
+                    return Response(
+                        {'error': 'Vous n\'avez aucun stock disponible. '
+                                  'Contactez l\'administrateur.'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+
+                # Créer la livraison
+                delivery = ClientDelivery.objects.create(
+                    client=client,
+                    client_stock=client_stock,
+                    # Destinataire
+                    recipient_name=data['recipient_name'],
+                    recipient_phone=data['recipient_phone'],
+                    recipient_address=data.get('recipient_address', ''),
+                    recipient_email=data.get('recipient_email', ''),
+                    recipient_notes=data.get('recipient_notes', ''),
+                    # Notes client
+                    client_notes=data.get('client_notes', ''),
+                    # Statut
+                    status='pending',
+                    created_by=request.user,
+                    created_by_client=True,   # ⚠️ Marqueur de demande client
+                )
+
+                # Ajouter les lignes
+                for ligne_data in data['lignes']:
+                    product_id = (
+                        ligne_data['product'].id
+                        if hasattr(ligne_data['product'], 'id')
+                        else ligne_data['product']
+                    )
+                    quantity = Decimal(str(ligne_data['quantity']))
+
+                    # Vérifier le produit dans le stock
+                    stock_ligne = ClientStockLigne.objects.filter(
+                        stock=client_stock,
+                        product_id=product_id
+                    ).first()
+
+                    if not stock_ligne:
+                        raise ValueError(
+                            f"Le produit {product_id} n'est pas dans votre stock."
+                        )
+
+                    if stock_ligne.quantity < quantity:
+                        raise ValueError(
+                            f"Stock insuffisant pour {stock_ligne.product.name}. "
+                            f"Disponible : {stock_ligne.quantity}, "
+                            f"Demandé : {quantity}"
+                        )
+
+                    ClientDeliveryLigne.objects.create(
+                        delivery=delivery,
+                        product_id=product_id,
+                        client_stock_ligne=stock_ligne,
+                        quantity=quantity,
+                        unit_price=stock_ligne.unit_price or 0,
+                        notes=ligne_data.get('notes', ''),
+                    )
+
+                delivery.recalculate_totals()
+
+                # Log
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.info(
+                    f"📝 Demande client créée : {delivery.delivery_number} "
+                    f"par {request.user.email} ({delivery.total_quantity} unités)"
+                )
+
+                return Response({
+                    'status': 'success',
+                    'message': (
+                        f'Votre demande {delivery.delivery_number} a été enregistrée. '
+                        f'Elle sera examinée par un administrateur.'
+                    ),
+                    'delivery': ClientDeliverySerializer(
+                        delivery, context={'request': request}
+                    ).data,
+                }, status=status.HTTP_201_CREATED)
+
+        except ValueError as e:
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.exception("Erreur création demande client")
+            return Response(
+                {'error': f'Erreur : {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+    # ============================================================
+    # 🆕 MODIFIER UNE DEMANDE (CLIENT)
+    # ============================================================
+    @action(detail=True, methods=['put', 'patch'], url_path='my-deliveries/update')
+    def update_my_delivery(self, request, pk=None):
+        """
+        Le client peut modifier sa demande TANT QUE le statut est 'pending'.
+        PUT/PATCH /client-space/{id}/my-deliveries/update/
+        """
+        client = self._get_client(request)
+        if not client:
+            return self._no_client_response()
+
+        try:
+            delivery = ClientDelivery.objects.get(id=pk, client=client)
+        except ClientDelivery.DoesNotExist:
+            return Response(
+                {'error': 'Demande non trouvée'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        if not delivery.can_be_edited_by_client:
+            return Response(
+                {
+                    'error': (
+                        f'Cette demande ne peut plus être modifiée '
+                        f'(statut actuel : {delivery.get_status_display()})'
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        serializer = ClientDeliveryRequestUpdateSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        data = serializer.validated_data
+
+        try:
+            with transaction.atomic():
+                # Mettre à jour les champs destinataire
+                for field in ['recipient_name', 'recipient_phone',
+                              'recipient_address', 'recipient_email',
+                              'recipient_notes', 'client_notes']:
+                    if field in data:
+                        setattr(delivery, field, data[field])
+
+                delivery.save()
+
+                # Mettre à jour les lignes si fournies
+                if 'lignes' in data:
+                    delivery.lignes.all().delete()
+
+                    client_stock = delivery.client_stock
+
+                    for ligne_data in data['lignes']:
+                        product_id = (
+                            ligne_data['product'].id
+                            if hasattr(ligne_data['product'], 'id')
+                            else ligne_data['product']
+                        )
+                        quantity = Decimal(str(ligne_data['quantity']))
+
+                        stock_ligne = ClientStockLigne.objects.filter(
+                            stock=client_stock,
+                            product_id=product_id
+                        ).first()
+
+                        if not stock_ligne:
+                            raise ValueError(
+                                f"Le produit {product_id} n'est pas dans votre stock."
+                            )
+
+                        if stock_ligne.quantity < quantity:
+                            raise ValueError(
+                                f"Stock insuffisant pour {stock_ligne.product.name}"
+                            )
+
+                        ClientDeliveryLigne.objects.create(
+                            delivery=delivery,
+                            product_id=product_id,
+                            client_stock_ligne=stock_ligne,
+                            quantity=quantity,
+                            unit_price=stock_ligne.unit_price or 0,
+                            notes=ligne_data.get('notes', ''),
+                        )
+
+                    delivery.recalculate_totals()
+
+                return Response({
+                    'status': 'success',
+                    'message': 'Demande mise à jour',
+                    'delivery': ClientDeliverySerializer(
+                        delivery, context={'request': request}
+                    ).data,
+                })
+
+        except ValueError as e:
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.exception("Erreur modification demande")
+            return Response(
+                {'error': f'Erreur : {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+    # ============================================================
+    # 🆕 ANNULER UNE DEMANDE (CLIENT)
+    # ============================================================
+    @action(detail=True, methods=['post'], url_path='my-deliveries/cancel')
+    def cancel_my_delivery(self, request, pk=None):
+        """
+        Le client annule sa demande (si 'pending' ou 'confirmed').
+        POST /client-space/{id}/my-deliveries/cancel/
+        """
+        client = self._get_client(request)
+        if not client:
+            return self._no_client_response()
+
+        try:
+            delivery = ClientDelivery.objects.get(id=pk, client=client)
+        except ClientDelivery.DoesNotExist:
+            return Response(
+                {'error': 'Demande non trouvée'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        if not delivery.can_be_cancelled_by_client:
+            return Response(
+                {
+                    'error': (
+                        f'Cette demande ne peut plus être annulée '
+                        f'(statut actuel : {delivery.get_status_display()})'
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        reason = request.data.get('reason', '')
+
+        delivery.status = 'cancelled'
+        note_line = (
+            f"[ANNULÉE par le client le "
+            f"{timezone.now().strftime('%Y-%m-%d %H:%M')}]"
+        )
+        if reason:
+            note_line += f"\nRaison : {reason}"
+
+        delivery.notes = (
+            f"{delivery.notes}\n{note_line}"
+            if delivery.notes else note_line
+        )
+        delivery.save()
+
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"❌ Demande client annulée : {delivery.delivery_number}")
+
+        return Response({
+            'status': 'success',
+            'message': 'Demande annulée',
+            'delivery': ClientDeliverySerializer(
+                delivery, context={'request': request}
+            ).data,
+        })
 
     # ============================================================
     # DASHBOARD CLIENT
@@ -437,8 +741,10 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
                 # Stats livraisons
                 'total_deliveries': deliveries_qs.count(),
                 'pending_deliveries': deliveries_qs.filter(status='pending').count(),
+                'confirmed_deliveries': deliveries_qs.filter(status='confirmed').count(),       # 🆕
                 'in_transit_deliveries': deliveries_qs.filter(status='in_transit').count(),
                 'delivered_deliveries': deliveries_qs.filter(status='delivered').count(),
+                'rejected_deliveries': deliveries_qs.filter(status='rejected').count(),         # 🆕
             },
             'recent_orders': VenteListSerializer(
                 recent_sales, many=True, context={'request': request}

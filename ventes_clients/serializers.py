@@ -1611,7 +1611,6 @@ class ClientDeliveryLigneCreateSerializer(serializers.ModelSerializer):
             )
         return value
 
-
 class ClientDeliverySerializer(serializers.ModelSerializer):
     client_name = serializers.CharField(source='client.name', read_only=True)
     client_code = serializers.CharField(source='client.code', read_only=True)
@@ -1622,9 +1621,21 @@ class ClientDeliverySerializer(serializers.ModelSerializer):
         source='get_status_display', read_only=True
     )
     lignes = ClientDeliveryLigneSerializer(many=True, read_only=True)
+
+    # 🆕 Propriétés calculées
     is_pending = serializers.ReadOnlyField()
+    is_confirmed = serializers.ReadOnlyField()
     is_in_transit = serializers.ReadOnlyField()
     is_delivered = serializers.ReadOnlyField()
+    is_cancelled = serializers.ReadOnlyField()
+    is_rejected = serializers.ReadOnlyField()
+
+    can_be_edited_by_client = serializers.ReadOnlyField()
+    can_be_cancelled_by_client = serializers.ReadOnlyField()
+    can_be_validated = serializers.ReadOnlyField()
+    can_be_rejected = serializers.ReadOnlyField()
+    can_be_started = serializers.ReadOnlyField()
+    can_be_confirmed = serializers.ReadOnlyField()
 
     class Meta:
         model = ClientDelivery
@@ -1633,14 +1644,16 @@ class ClientDeliverySerializer(serializers.ModelSerializer):
             # Client source
             'client', 'client_name', 'client_code', 'client_phone',
             'client_stock',
+            # 🆕 Qui a créé
+            'created_by_client',
             # Destinataire
             'recipient_name', 'recipient_phone', 'recipient_address',
             'recipient_email', 'recipient_notes',
-            # Statut
+            # Statut & dates
             'status', 'status_display',
-            'is_pending', 'is_in_transit', 'is_delivered',
-            # Dates
-            'request_date', 'shipped_date', 'delivered_date',
+            'request_date', 'confirmed_date', 'shipped_date', 'delivered_date',
+            # 🆕 Raison du rejet
+            'rejection_reason',
             # Transport
             'delivery_method', 'carrier', 'tracking_number',
             'vehicle_plate', 'driver_name', 'driver_phone',
@@ -1653,12 +1666,19 @@ class ClientDeliverySerializer(serializers.ModelSerializer):
             'validated_by', 'validated_by_name',
             'lignes',
             'created_at', 'updated_at',
+            # 🆕 Propriétés calculées
+            'is_pending', 'is_confirmed', 'is_in_transit', 'is_delivered',
+            'is_cancelled', 'is_rejected',
+            'can_be_edited_by_client', 'can_be_cancelled_by_client',
+            'can_be_validated', 'can_be_rejected',
+            'can_be_started', 'can_be_confirmed',
         ]
         read_only_fields = [
-            'id', 'delivery_number', 'request_date',
+            'id', 'delivery_number', 'request_date', 'confirmed_date',
             'shipped_date', 'delivered_date',
             'total_quantity', 'total_value',
             'created_at', 'updated_at',
+            'status', 'rejection_reason',
         ]
 
     def get_created_by_name(self, obj):
@@ -1670,7 +1690,6 @@ class ClientDeliverySerializer(serializers.ModelSerializer):
         if obj.validated_by:
             return obj.validated_by.get_full_name() or obj.validated_by.email
         return None
-
 
 class ClientDeliveryCreateSerializer(serializers.Serializer):
     """
@@ -1760,3 +1779,105 @@ class ClientDeliveryStatusUpdateSerializer(serializers.Serializer):
     driver_phone = serializers.CharField(required=False, allow_blank=True)
     delivery_method = serializers.CharField(required=False, allow_blank=True)
     notes = serializers.CharField(required=False, allow_blank=True)
+# ============================================================
+# 🆕 SERIALIZERS POUR LE CLIENT (CRÉATION / MODIFICATION)
+# ============================================================
+
+class ClientDeliveryLigneRequestSerializer(serializers.ModelSerializer):
+    """Ligne utilisée pour la création/modification par le client."""
+
+    class Meta:
+        model = ClientDeliveryLigne
+        fields = ['product', 'quantity', 'notes']
+
+    def validate_quantity(self, value):
+        if value is None or value <= 0:
+            raise serializers.ValidationError(
+                "La quantité doit être supérieure à 0"
+            )
+        return value
+
+
+class ClientDeliveryRequestCreateSerializer(serializers.Serializer):
+    """
+    Serializer pour que le client crée SA demande de livraison.
+    """
+    recipient_name = serializers.CharField(required=True, max_length=200)
+    recipient_phone = serializers.CharField(required=True, max_length=20)
+    recipient_address = serializers.CharField(
+        required=False, allow_blank=True, default=''
+    )
+    recipient_email = serializers.EmailField(
+        required=False, allow_blank=True, default=''
+    )
+    recipient_notes = serializers.CharField(
+        required=False, allow_blank=True, default=''
+    )
+    client_notes = serializers.CharField(
+        required=False, allow_blank=True, default=''
+    )
+
+    lignes = ClientDeliveryLigneRequestSerializer(many=True, required=True)
+
+    def validate_recipient_phone(self, value):
+        import re
+        if not re.match(r'^[0-9+\-\s()]+$', value):
+            raise serializers.ValidationError("Numéro de téléphone invalide")
+        return value
+
+    def validate_lignes(self, value):
+        if not value:
+            raise serializers.ValidationError("Au moins un produit est requis")
+
+        product_ids = [
+            ligne['product'].id if hasattr(ligne['product'], 'id')
+            else ligne['product']
+            for ligne in value
+        ]
+        if len(product_ids) != len(set(product_ids)):
+            raise serializers.ValidationError(
+                "Un produit ne peut apparaître qu'une seule fois."
+            )
+        return value
+
+
+class ClientDeliveryRequestUpdateSerializer(serializers.Serializer):
+    """
+    Serializer pour modifier une demande (champs optionnels).
+    """
+    recipient_name = serializers.CharField(required=False, max_length=200)
+    recipient_phone = serializers.CharField(required=False, max_length=20)
+    recipient_address = serializers.CharField(required=False, allow_blank=True)
+    recipient_email = serializers.EmailField(required=False, allow_blank=True)
+    recipient_notes = serializers.CharField(required=False, allow_blank=True)
+    client_notes = serializers.CharField(required=False, allow_blank=True)
+
+    lignes = ClientDeliveryLigneRequestSerializer(many=True, required=False)
+
+    def validate_recipient_phone(self, value):
+        if not value:
+            return value
+        import re
+        if not re.match(r'^[0-9+\-\s()]+$', value):
+            raise serializers.ValidationError("Numéro de téléphone invalide")
+        return value
+
+
+# ============================================================
+# 🆕 SERIALIZERS POUR L'ADMIN (VALIDATION / REJET)
+# ============================================================
+
+class ClientDeliveryValidateSerializer(serializers.Serializer):
+    """Serializer pour valider une demande client (admin)."""
+    carrier = serializers.CharField(required=False, allow_blank=True)
+    tracking_number = serializers.CharField(required=False, allow_blank=True)
+    vehicle_plate = serializers.CharField(required=False, allow_blank=True)
+    driver_name = serializers.CharField(required=False, allow_blank=True)
+    driver_phone = serializers.CharField(required=False, allow_blank=True)
+    delivery_method = serializers.CharField(required=False, allow_blank=True)
+    notes = serializers.CharField(required=False, allow_blank=True)
+
+
+class ClientDeliveryRejectSerializer(serializers.Serializer):
+    """Serializer pour rejeter une demande client (admin)."""
+    reason = serializers.CharField(required=True, max_length=500)

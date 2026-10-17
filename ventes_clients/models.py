@@ -3152,24 +3152,31 @@ class ClientStockMovement(models.Model):
     @property
     def type_display(self):
         return self.get_movement_type_display()
+# ============================================================
+# LIVRAISON CLIENT (LIVRAISON DES PRODUITS DU CLIENT À UN DESTINATAIRE)
+# ============================================================
 
 class ClientDelivery(models.Model):
     """
     Livraison des produits stockés chez le client vers un destinataire.
-    L'admin enregistre la livraison, le client suit l'évolution.
 
-    Workflow :
-    - pending      : livraison enregistrée par l'admin
-    - in_transit   : en cours d'acheminement
-    - delivered    : livré (le stock client est déduit)
-    - cancelled    : annulé
+    Workflow COMPLET :
+    1. Client crée une demande      → status = 'pending'     (created_by_client=True)
+    2. Admin valide la demande     → status = 'confirmed'
+    3. Admin démarre la livraison  → status = 'in_transit'
+    4. Admin confirme la livraison → status = 'delivered'  (stock client déduit)
+    OU
+    - Admin rejette la demande     → status = 'rejected'
+    - Client/Admin annule          → status = 'cancelled'
     """
 
     STATUS_CHOICES = (
-        ('pending', 'En attente'),
+        ('pending', 'En attente de validation'),       # Demande créée (client ou admin)
+        ('confirmed', 'Validée'),                       # 🆕 Admin a validé
         ('in_transit', 'En cours de livraison'),
         ('delivered', 'Livré'),
         ('cancelled', 'Annulé'),
+        ('rejected', 'Rejetée'),                        # 🆕 Admin a rejeté
     )
 
     # ============================================================
@@ -3182,7 +3189,7 @@ class ClientDelivery(models.Model):
     )
 
     # ============================================================
-    # ⭐ CLIENT SOURCE (celui qui a le stock)
+    # CLIENT SOURCE (celui qui a le stock)
     # ============================================================
     client = models.ForeignKey(
         Client,
@@ -3199,7 +3206,7 @@ class ClientDelivery(models.Model):
     )
 
     # ============================================================
-    # ⭐ DESTINATAIRE (la personne qui reçoit les produits)
+    # DESTINATAIRE (la personne qui reçoit les produits)
     # ============================================================
     recipient_name = models.CharField(
         max_length=200,
@@ -3236,6 +3243,11 @@ class ClientDelivery(models.Model):
         auto_now_add=True,
         verbose_name="Date de la demande"
     )
+    confirmed_date = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name="Date de validation"
+    )
     shipped_date = models.DateTimeField(
         null=True,
         blank=True,
@@ -3245,6 +3257,15 @@ class ClientDelivery(models.Model):
         null=True,
         blank=True,
         verbose_name="Date de livraison"
+    )
+
+    # ============================================================
+    # 🆕 QUI A CRÉÉ LA DEMANDE
+    # ============================================================
+    created_by_client = models.BooleanField(
+        default=False,
+        verbose_name="Créée par le client",
+        help_text="True si la demande a été créée par le client lui-même"
     )
 
     # ============================================================
@@ -3310,6 +3331,15 @@ class ClientDelivery(models.Model):
     )
 
     # ============================================================
+    # 🆕 RAISON DU REJET
+    # ============================================================
+    rejection_reason = models.TextField(
+        blank=True,
+        verbose_name="Raison du rejet",
+        help_text="Raison pour laquelle la demande a été rejetée (admin)"
+    )
+
+    # ============================================================
     # MÉTADONNÉES
     # ============================================================
     created_by = models.ForeignKey(
@@ -3340,6 +3370,7 @@ class ClientDelivery(models.Model):
             models.Index(fields=['client', '-created_at']),
             models.Index(fields=['status', '-created_at']),
             models.Index(fields=['delivery_number']),
+            models.Index(fields=['created_by_client']),   # 🆕
         ]
 
     def __str__(self):
@@ -3361,6 +3392,9 @@ class ClientDelivery(models.Model):
             self.delivery_number = f"LIV-{date.today().year}-{num:04d}"
         super().save(*args, **kwargs)
 
+    # ============================================================
+    # PROPRIÉTÉS
+    # ============================================================
     @property
     def status_display(self):
         return self.get_status_display()
@@ -3370,6 +3404,10 @@ class ClientDelivery(models.Model):
         return self.status == 'pending'
 
     @property
+    def is_confirmed(self):
+        return self.status == 'confirmed'
+
+    @property
     def is_in_transit(self):
         return self.status == 'in_transit'
 
@@ -3377,7 +3415,49 @@ class ClientDelivery(models.Model):
     def is_delivered(self):
         return self.status == 'delivered'
 
+    @property
+    def is_cancelled(self):
+        return self.status == 'cancelled'
+
+    @property
+    def is_rejected(self):
+        return self.status == 'rejected'
+
+    @property
+    def can_be_edited_by_client(self):
+        """Le client peut modifier sa demande seulement si elle est 'pending'."""
+        return self.created_by_client and self.status == 'pending'
+
+    @property
+    def can_be_cancelled_by_client(self):
+        """Le client peut annuler sa demande si elle n'est pas encore partie."""
+        return self.created_by_client and self.status in ['pending', 'confirmed']
+
+    @property
+    def can_be_validated(self):
+        """L'admin peut valider une demande 'pending'."""
+        return self.status == 'pending'
+
+    @property
+    def can_be_rejected(self):
+        """L'admin peut rejeter une demande 'pending'."""
+        return self.status == 'pending'
+
+    @property
+    def can_be_started(self):
+        """L'admin peut démarrer la livraison d'une demande 'confirmed'."""
+        return self.status == 'confirmed'
+
+    @property
+    def can_be_confirmed(self):
+        """L'admin peut confirmer une livraison 'in_transit' ou 'confirmed'."""
+        return self.status in ['confirmed', 'in_transit']
+
+    # ============================================================
+    # MÉTHODES
+    # ============================================================
     def recalculate_totals(self):
+        """Recalcule les totaux à partir des lignes."""
         total_qty = self.lignes.aggregate(
             total=models.Sum('quantity')
         )['total'] or Decimal('0')
@@ -3388,10 +3468,44 @@ class ClientDelivery(models.Model):
 
         self.total_quantity = total_qty
         self.total_value = total_val
-        self.save(update_fields=['total_quantity',
-                  'total_value', 'updated_at'])
+        self.save(update_fields=['total_quantity', 'total_value', 'updated_at'])
 
+    def mark_as_confirmed(self, user=None):
+        """Marque la demande comme validée."""
+        self.status = 'confirmed'
+        self.confirmed_date = timezone.now()
+        if user:
+            self.validated_by = user
+        self.save(update_fields=['status', 'confirmed_date', 'validated_by', 'updated_at'])
 
+    def mark_as_rejected(self, user=None, reason=''):
+        """Marque la demande comme rejetée."""
+        self.status = 'rejected'
+        self.rejection_reason = reason
+        if user:
+            self.validated_by = user
+        self.save(update_fields=['status', 'rejection_reason', 'validated_by', 'updated_at'])
+
+    def mark_as_in_transit(self, user=None):
+        """Marque la livraison comme expédiée."""
+        self.status = 'in_transit'
+        self.shipped_date = timezone.now()
+        self.save(update_fields=['status', 'shipped_date', 'updated_at'])
+
+    def mark_as_delivered(self, user=None):
+        """Marque la livraison comme livrée."""
+        self.status = 'delivered'
+        self.delivered_date = timezone.now()
+        if user:
+            self.validated_by = user
+        self.save(update_fields=['status', 'delivered_date', 'validated_by', 'updated_at'])
+
+    def mark_as_cancelled(self, reason=''):
+        """Marque la livraison comme annulée."""
+        self.status = 'cancelled'
+        if reason:
+            self.notes = (self.notes or '') + f"\n[ANNULÉE] {reason}"
+        self.save(update_fields=['status', 'notes', 'updated_at'])
 # ============================================================
 # LIGNE DE LIVRAISON CLIENT
 # ============================================================
