@@ -313,13 +313,15 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
         })
 
     # ============================================================
-    # 🆕 MES LIVRAISONS (SUIVI)
+    # 🆕 MES LIVRAISONS (SUIVI) — SANS PAGINATION
     # ============================================================
     @action(detail=False, methods=['get'], url_path='my-deliveries')
     def my_deliveries(self, request):
         """
         Suivi des livraisons de mes produits vers leurs destinataires.
         GET /client-space/my-deliveries/
+
+        ⚠️ SANS PAGINATION pour éviter le conflit avec le frontend.
         """
         client = self._get_client(request)
         if not client:
@@ -336,7 +338,7 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
         if status_filter:
             deliveries = deliveries.filter(status=status_filter)
 
-        # Stats globales (avant pagination)
+        # Stats globales
         stats = {
             'total': deliveries.count(),
             'pending': deliveries.filter(status='pending').count(),
@@ -345,15 +347,18 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
             'cancelled': deliveries.filter(status='cancelled').count(),
         }
 
-        return self._paginated_response(
-            deliveries,
-            ClientDeliverySerializer,
-            {
-                'client_id': client.id,
-                'client_name': client.name,
-                'stats': stats,
-            }
+        # ⚠️ PAS de pagination (comme my_stock)
+        serializer = ClientDeliverySerializer(
+            deliveries, many=True, context={'request': request}
         )
+
+        return Response({
+            'client_id': client.id,
+            'client_name': client.name,
+            'stats': stats,
+            'count': deliveries.count(),
+            'results': serializer.data,
+        })
 
     # ============================================================
     # 🆕 DÉTAIL D'UNE LIVRAISON
@@ -378,7 +383,9 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
                 status=status.HTTP_404_NOT_FOUND
             )
 
-        serializer = ClientDeliverySerializer(delivery)
+        serializer = ClientDeliverySerializer(
+            delivery, context={'request': request}
+        )
         return Response(serializer.data)
 
     # ============================================================
@@ -437,7 +444,7 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
                 recent_sales, many=True, context={'request': request}
             ).data,
             'recent_deliveries': ClientDeliverySerializer(
-                recent_deliveries, many=True
+                recent_deliveries, many=True, context={'request': request}
             ).data,
             'wallet': ClientWalletSerializer(wallet).data,
             'stock_summary': {
