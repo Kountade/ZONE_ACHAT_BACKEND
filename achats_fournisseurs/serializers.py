@@ -1,7 +1,11 @@
 # apps/achats_fournisseurs/serializers.py
+# ============================================================
+# SERIALIZERS COMPLET OPTIMISÉ - VERSION MISE À JOUR
+# ============================================================
+
 from rest_framework import serializers
 from django.db import transaction
-from django.db.models import Sum, F
+from django.db.models import Sum, F, Case, When, Value, DecimalField, ExpressionWrapper
 from datetime import date
 from decimal import Decimal
 
@@ -11,6 +15,168 @@ from .models import (
     PurchaseReturnLine, SupplierInvoice, FournisseurPaiement
 )
 from produits_stocks.models import Product, Lot, Stock, StockMovement
+
+
+# ============================================================
+# ✅ FONCTION UTILITAIRE : Calcul du % de réception
+# ============================================================
+def calculate_receipt_progress(obj):
+    """
+    ✅ Calcule le % de réception d'une commande.
+    - Basé sur le montant reçu / total (le plus fiable)
+    - Fallback sur les quantités si total = 0
+    """
+    try:
+        # Option 1 : Montant
+        if obj.total and float(obj.total) > 0:
+            received = float(obj.total_received_amount or 0)
+            total = float(obj.total)
+            return round((received / total) * 100, 2)
+
+        # Option 2 : Quantités (fallback)
+        lines = obj.lines.all()
+        total_ordered = sum(line.quantity for line in lines)
+        total_received = sum(line.quantity_received for line in lines)
+        if total_ordered > 0:
+            return round((total_received / total_ordered) * 100, 2)
+    except Exception:
+        pass
+    return 0
+
+
+def calculate_invoice_progress(obj):
+    """✅ Calcule le % de facturation."""
+    try:
+        if obj.total and float(obj.total) > 0:
+            invoiced = float(obj.total_invoiced_amount or 0)
+            total = float(obj.total)
+            return round((invoiced / total) * 100, 2)
+    except Exception:
+        pass
+    return 0
+
+
+def calculate_payment_progress(obj):
+    """✅ Calcule le % de paiement."""
+    try:
+        if obj.total_invoiced_amount and float(obj.total_invoiced_amount) > 0:
+            paid = float(obj.total_paid_amount or 0)
+            invoiced = float(obj.total_invoiced_amount)
+            return round((paid / invoiced) * 100, 2)
+    except Exception:
+        pass
+    return 0
+
+
+# ============================================================
+# ✅ SERIALIZERS LITE (pour éviter N+1)
+# ============================================================
+
+class SupplierLiteSerializer(serializers.ModelSerializer):
+    """Serializer ULTRA-LÉGER pour listes déroulantes."""
+    total_debt = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Supplier
+        fields = ['id', 'code', 'name', 'phone',
+                  'email', 'is_active', 'total_debt']
+
+    def get_total_debt(self, obj):
+        if hasattr(obj, 'total_debt_annotated'):
+            return obj.total_debt_annotated or 0
+        return obj.total_debt
+
+
+class PurchaseOrderLiteSerializer(serializers.ModelSerializer):
+    """
+    ✅ Serializer léger pour listes déroulantes (réceptions, factures).
+    ⚠️ CORRIGÉ : Ajoute le % de réception calculé AVANT sélection.
+    """
+    supplier_name = serializers.CharField(
+        source='supplier.name', read_only=True)
+    status_display = serializers.CharField(
+        source='get_status_display', read_only=True)
+
+    # ✅ NOUVEAU : Pourcentage de réception calculé
+    receipt_progress = serializers.SerializerMethodField()
+    # ✅ NOUVEAU : Autres progressions (utiles pour d'autres écrans)
+    invoice_progress = serializers.SerializerMethodField()
+    payment_progress = serializers.SerializerMethodField()
+    # ✅ NOUVEAU : Montants détaillés
+    total_received_amount = serializers.ReadOnlyField()
+    total_invoiced_amount = serializers.ReadOnlyField()
+    total_paid_amount = serializers.ReadOnlyField()
+
+    class Meta:
+        model = PurchaseOrder
+        fields = [
+            'id', 'po_number', 'supplier_id', 'supplier_name',
+            'order_date', 'expected_delivery_date',
+            'total', 'status', 'status_display',
+            'is_fully_received', 'is_fully_invoiced', 'is_fully_paid',
+            # ✅ Nouveaux champs
+            'receipt_progress', 'invoice_progress', 'payment_progress',
+            'total_received_amount', 'total_invoiced_amount', 'total_paid_amount',
+        ]
+        read_only_fields = ['id', 'order_date', 'po_number']
+
+    def get_receipt_progress(self, obj):
+        """✅ Calcule le % de réception - disponible AVANT sélection."""
+        return calculate_receipt_progress(obj)
+
+    def get_invoice_progress(self, obj):
+        return calculate_invoice_progress(obj)
+
+    def get_payment_progress(self, obj):
+        return calculate_payment_progress(obj)
+
+
+class ReceiptLiteSerializer(serializers.ModelSerializer):
+    """Serializer léger pour listes déroulantes (factures)."""
+    po_number = serializers.CharField(
+        source='purchase_order.po_number', read_only=True)
+    supplier_name = serializers.CharField(
+        source='purchase_order.supplier.name', read_only=True)
+    supplier_id = serializers.IntegerField(
+        source='purchase_order.supplier.id', read_only=True)
+    status_display = serializers.CharField(
+        source='get_status_display', read_only=True)
+
+    class Meta:
+        model = Receipt
+        fields = ['id', 'receipt_number', 'purchase_order', 'po_number',
+                  'supplier_id', 'supplier_name', 'receipt_date',
+                  'status', 'status_display', 'is_invoiced']
+        read_only_fields = ['id', 'receipt_date', 'receipt_number']
+
+
+class SupplierInvoiceLiteSerializer(serializers.ModelSerializer):
+    """Serializer léger pour les listes de factures."""
+    supplier_name = serializers.CharField(
+        source='supplier.name', read_only=True)
+    po_number = serializers.CharField(
+        source='purchase_order.po_number', read_only=True)
+    status_display = serializers.CharField(
+        source='get_status_display', read_only=True)
+    paiement_status_display = serializers.CharField(
+        source='get_paiement_status_display', read_only=True
+    )
+    remaining_amount = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SupplierInvoice
+        fields = ['id', 'invoice_number', 'supplier_id', 'supplier_name',
+                  'purchase_order', 'po_number', 'invoice_date', 'due_date',
+                  'total_amount', 'amount_paid', 'remaining_amount',
+                  'status', 'status_display',
+                  'paiement_status', 'paiement_status_display',
+                  'is_fully_paid']
+        read_only_fields = ['id', 'amount_paid']
+
+    def get_remaining_amount(self, obj):
+        if hasattr(obj, 'remaining_calc'):
+            return obj.remaining_calc or 0
+        return obj.total_amount - obj.amount_paid
 
 
 # ============================================================
@@ -55,9 +221,13 @@ class SupplierListSerializer(serializers.ModelSerializer):
         return f"{obj.total_purchases:,.0f} FCFA" if obj.total_purchases else "0 FCFA"
 
     def get_total_debt(self, obj):
+        if hasattr(obj, 'total_debt_annotated'):
+            return obj.total_debt_annotated or 0
         return obj.total_debt
 
     def get_overdue_debt(self, obj):
+        if hasattr(obj, 'overdue_debt_annotated'):
+            return obj.overdue_debt_annotated or 0
         return obj.overdue_debt
 
 
@@ -84,12 +254,16 @@ class SupplierDetailSerializer(serializers.ModelSerializer):
         return f"{obj.total_purchases:,.0f} FCFA" if obj.total_purchases else "0 FCFA"
 
     def get_total_debt(self, obj):
+        if hasattr(obj, 'total_debt_annotated'):
+            return obj.total_debt_annotated or 0
         total = obj.invoices.filter(
             paiement_status__in=['unpaid', 'partial', 'overdue']
         ).aggregate(total=Sum(F('total_amount') - F('amount_paid')))['total']
         return total or Decimal('0')
 
     def get_overdue_debt(self, obj):
+        if hasattr(obj, 'overdue_debt_annotated'):
+            return obj.overdue_debt_annotated or 0
         total = obj.invoices.filter(
             due_date__lt=date.today(),
             paiement_status__in=['unpaid', 'partial']
@@ -158,26 +332,36 @@ class PurchaseOrderListSerializer(serializers.ModelSerializer):
     status_display = serializers.CharField(
         source='get_status_display', read_only=True)
     has_qr_code = serializers.SerializerMethodField()
+    # ✅ CORRIGÉ : utiliser les mêmes utilitaires que Lite
     receipt_progress = serializers.SerializerMethodField()
     payment_progress = serializers.SerializerMethodField()
+    invoice_progress = serializers.SerializerMethodField()
+    # ✅ NOUVEAU : Montants
+    total_received_amount = serializers.ReadOnlyField()
+    total_invoiced_amount = serializers.ReadOnlyField()
+    total_paid_amount = serializers.ReadOnlyField()
 
     class Meta:
         model = PurchaseOrder
         fields = ['id', 'po_number', 'supplier', 'supplier_name', 'supplier_code',
                   'order_date', 'expected_delivery_date', 'actual_delivery_date',
                   'total', 'status', 'status_display', 'created_by', 'has_qr_code',
-                  'receipt_progress', 'payment_progress', 'is_fully_received',
-                  'is_fully_invoiced', 'is_fully_paid']
+                  'receipt_progress', 'invoice_progress', 'payment_progress',
+                  'is_fully_received', 'is_fully_invoiced', 'is_fully_paid',
+                  'total_received_amount', 'total_invoiced_amount', 'total_paid_amount']
         read_only_fields = ['id', 'order_date', 'po_number']
 
     def get_has_qr_code(self, obj):
         return bool(obj.qr_code)
 
     def get_receipt_progress(self, obj):
-        return obj.receipt_progress
+        return calculate_receipt_progress(obj)
+
+    def get_invoice_progress(self, obj):
+        return calculate_invoice_progress(obj)
 
     def get_payment_progress(self, obj):
-        return obj.payment_progress
+        return calculate_payment_progress(obj)
 
 
 class PurchaseOrderDetailSerializer(serializers.ModelSerializer):
@@ -189,6 +373,8 @@ class PurchaseOrderDetailSerializer(serializers.ModelSerializer):
         source='supplier.address', read_only=True)
     supplier_phone = serializers.CharField(
         source='supplier.phone', read_only=True)
+    supplier_email = serializers.CharField(
+        source='supplier.email', read_only=True)
     lines = PurchaseOrderLineSerializer(many=True, read_only=True)
     status_display = serializers.CharField(
         source='get_status_display', read_only=True)
@@ -207,8 +393,8 @@ class PurchaseOrderDetailSerializer(serializers.ModelSerializer):
     class Meta:
         model = PurchaseOrder
         fields = ['id', 'po_number', 'supplier_reference', 'supplier', 'supplier_name',
-                  'supplier_code', 'supplier_address', 'supplier_phone', 'order_date',
-                  'expected_delivery_date', 'actual_delivery_date', 'subtotal',
+                  'supplier_code', 'supplier_address', 'supplier_phone', 'supplier_email',
+                  'order_date', 'expected_delivery_date', 'actual_delivery_date', 'subtotal',
                   'discount_type', 'discount_value', 'discount_amount', 'tax_rate',
                   'tax_amount', 'shipping_cost', 'total', 'status', 'status_display',
                   'notes', 'internal_notes', 'shipping_address', 'tracking_number',
@@ -242,30 +428,22 @@ class PurchaseOrderDetailSerializer(serializers.ModelSerializer):
         return None
 
     def get_receipt_progress(self, obj):
-        if obj.total == 0:
-            return 0
-        return (obj.total_received_amount / obj.total) * 100
+        return calculate_receipt_progress(obj)
 
     def get_invoice_progress(self, obj):
-        if obj.total == 0:
-            return 0
-        total_invoiced = obj.invoices.aggregate(
-            total=Sum('total_amount'))['total'] or 0
-        return (total_invoiced / obj.total) * 100
+        return calculate_invoice_progress(obj)
 
     def get_payment_progress(self, obj):
-        if obj.total_invoiced_amount == 0:
-            return 0
-        return (obj.total_paid_amount / obj.total_invoiced_amount) * 100
+        return calculate_payment_progress(obj)
 
     def get_remaining_to_receive(self, obj):
-        return obj.total - obj.total_received_amount
+        return float(obj.total) - float(obj.total_received_amount or 0)
 
     def get_remaining_to_invoice(self, obj):
-        return obj.total - obj.total_invoiced_amount
+        return float(obj.total) - float(obj.total_invoiced_amount or 0)
 
     def get_remaining_to_pay(self, obj):
-        return obj.total_invoiced_amount - obj.total_paid_amount
+        return float(obj.total_invoiced_amount or 0) - float(obj.total_paid_amount or 0)
 
 
 class PurchaseOrderCreateSerializer(serializers.ModelSerializer):
@@ -301,12 +479,10 @@ class PurchaseOrderCreateSerializer(serializers.ModelSerializer):
         lines_data = validated_data.pop('lines')
         po_number = generate_number(PurchaseOrder, 'po_number', 'PO')
         purchase_order = PurchaseOrder.objects.create(
-            po_number=po_number, **validated_data
-        )
+            po_number=po_number, **validated_data)
         for line_data in lines_data:
             PurchaseOrderLine.objects.create(
-                purchase_order=purchase_order, **line_data
-            )
+                purchase_order=purchase_order, **line_data)
         purchase_order.calculate_totals()
         purchase_order.generate_qr_code()
         purchase_order.save()
@@ -381,7 +557,7 @@ class ReceiptListSerializer(serializers.ModelSerializer):
     po_number = serializers.CharField(
         source='purchase_order.po_number', read_only=True)
     purchase_order_id = serializers.IntegerField(
-        source='purchase_order.id', read_only=True)  # ✅ AJOUT
+        source='purchase_order.id', read_only=True)
     supplier_name = serializers.CharField(
         source='purchase_order.supplier.name', read_only=True
     )
@@ -395,7 +571,7 @@ class ReceiptListSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Receipt
-        fields = ['id', 'receipt_number', 'po_number', 'purchase_order_id',  # ✅ AJOUT
+        fields = ['id', 'receipt_number', 'po_number', 'purchase_order_id',
                   'supplier_name', 'warehouse', 'warehouse_name', 'receipt_date',
                   'expected_date', 'status', 'status_display', 'created_by',
                   'has_qr_code', 'total_received', 'is_invoiced', 'is_invoiced_display']
@@ -574,17 +750,13 @@ class ReceiptCreateSerializer(serializers.ModelSerializer):
                     lot.save()
                 else:
                     lot = Lot.objects.create(
-                        lot_number=lot_number,
-                        product=product,
-                        warehouse=warehouse,
+                        lot_number=lot_number, product=product, warehouse=warehouse,
                         initial_quantity=quantity_received,
                         current_quantity=quantity_received,
                         purchase_price=po_line.unit_price,
                         selling_price=product.selling_price,
-                        created_by=user,
-                        expiry_date=expiry_date,
-                        manufacturing_date=manufacturing_date,
-                        status='good'
+                        created_by=user, expiry_date=expiry_date,
+                        manufacturing_date=manufacturing_date, status='good'
                     )
             else:
                 auto_lot_number = (
@@ -592,54 +764,39 @@ class ReceiptCreateSerializer(serializers.ModelSerializer):
                     f"{ReceiptLine.objects.filter(product=product).count() + 1}"
                 )
                 lot = Lot.objects.create(
-                    lot_number=auto_lot_number,
-                    product=product,
-                    warehouse=warehouse,
+                    lot_number=auto_lot_number, product=product, warehouse=warehouse,
                     initial_quantity=quantity_received,
                     current_quantity=quantity_received,
                     purchase_price=po_line.unit_price,
                     selling_price=product.selling_price,
-                    created_by=user,
-                    expiry_date=expiry_date,
-                    manufacturing_date=manufacturing_date,
-                    status='good'
+                    created_by=user, expiry_date=expiry_date,
+                    manufacturing_date=manufacturing_date, status='good'
                 )
                 lot_number = auto_lot_number
 
             ReceiptLine.objects.create(
-                receipt=receipt,
-                po_line=po_line,
-                product=product,
+                receipt=receipt, po_line=po_line, product=product,
                 quantity_ordered=po_line.quantity,
                 quantity_received=quantity_received,
                 quantity_damaged=quantity_damaged,
-                lot=lot,
-                lot_number=lot_number,
-                expiry_date=expiry_date,
-                manufacturing_date=manufacturing_date,
-                quality_status=quality_status,
-                notes=notes
+                lot=lot, lot_number=lot_number,
+                expiry_date=expiry_date, manufacturing_date=manufacturing_date,
+                quality_status=quality_status, notes=notes
             )
 
             stock, _ = Stock.objects.get_or_create(
-                product=product,
-                warehouse=warehouse,
+                product=product, warehouse=warehouse,
                 defaults={'quantity': 0, 'reserved_quantity': 0}
             )
             stock.update_quantity()
 
             StockMovement.objects.create(
-                product=product,
-                lot=lot,
-                to_warehouse=warehouse,
-                movement_type='purchase_in',
-                quantity=quantity_received,
-                reference_type='purchase_order',
-                reference_id=purchase_order.id,
+                product=product, lot=lot, to_warehouse=warehouse,
+                movement_type='purchase_in', quantity=quantity_received,
+                reference_type='purchase_order', reference_id=purchase_order.id,
                 reference_number=purchase_order.po_number,
                 reason=f"Réception commande {purchase_order.po_number}",
-                created_by=user,
-                notes=f"Réception n°{receipt_number}"
+                created_by=user, notes=f"Réception n°{receipt_number}"
             )
 
             purchase_order.total_received_amount += quantity_received * po_line.unit_price
@@ -697,8 +854,7 @@ class PurchaseReturnLineSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source='product.name', read_only=True)
     product_code = serializers.CharField(source='product.code', read_only=True)
     lot_number = serializers.CharField(
-        source='receipt_line.lot_number', read_only=True
-    )
+        source='receipt_line.lot_number', read_only=True)
 
     class Meta:
         model = PurchaseReturnLine
@@ -708,7 +864,6 @@ class PurchaseReturnLineSerializer(serializers.ModelSerializer):
 
 
 class PurchaseReturnSerializer(serializers.ModelSerializer):
-    """✅ Serializer de LECTURE + mise à jour du statut (PATCH)"""
     po_number = serializers.CharField(
         source='purchase_order.po_number', read_only=True)
     supplier_name = serializers.CharField(
@@ -718,8 +873,7 @@ class PurchaseReturnSerializer(serializers.ModelSerializer):
         source='purchase_order.supplier.code', read_only=True
     )
     receipt_number = serializers.CharField(
-        source='receipt.receipt_number', read_only=True
-    )
+        source='receipt.receipt_number', read_only=True)
     lines = PurchaseReturnLineSerializer(many=True, read_only=True)
     status_display = serializers.CharField(
         source='get_status_display', read_only=True)
@@ -741,7 +895,6 @@ class PurchaseReturnSerializer(serializers.ModelSerializer):
                   'qr_code_url']
         read_only_fields = ['id', 'return_number', 'return_date', 'purchase_order',
                             'receipt', 'reason', 'qr_code', 'qr_code_data']
-        # ⚠️ 'status' et 'notes' restent modifiables
 
     def get_created_by_name(self, obj):
         if obj.created_by:
@@ -762,7 +915,6 @@ class PurchaseReturnSerializer(serializers.ModelSerializer):
         return sum(float(line.total or 0) for line in obj.lines.all())
 
     def validate_status(self, value):
-        """✅ Vérifier que la transition de statut est cohérente"""
         if not self.instance:
             return value
 
@@ -784,13 +936,9 @@ class PurchaseReturnSerializer(serializers.ModelSerializer):
         return value
 
 
-# apps/achats_fournisseurs/serializers.py
-
 class PurchaseReturnLineCreateSerializer(serializers.Serializer):
-    """✅ Serializer simple pour les lignes du retour"""
     receipt_line = serializers.IntegerField(required=True)
     quantity = serializers.IntegerField(required=True, min_value=1)
-    # ✅ product et unit_price sont OPTIONNELS (déduits du receipt_line)
     product = serializers.IntegerField(required=False)
     unit_price = serializers.DecimalField(
         max_digits=10, decimal_places=2, required=False
@@ -798,7 +946,6 @@ class PurchaseReturnLineCreateSerializer(serializers.Serializer):
 
 
 class PurchaseReturnCreateSerializer(serializers.ModelSerializer):
-    """✅ Serializer de CRÉATION avec gestion du stock"""
     lines = PurchaseReturnLineCreateSerializer(many=True, write_only=True)
 
     class Meta:
@@ -918,20 +1065,15 @@ class PurchaseReturnCreateSerializer(serializers.ModelSerializer):
                 unit_price=unit_price,
             )
 
-            # Mouvement de stock (sortie)
             if receipt_line.lot:
                 lot = receipt_line.lot
                 lot.current_quantity -= quantity
                 lot.save()
 
                 StockMovement.objects.create(
-                    product=product,
-                    lot=lot,
-                    from_warehouse=lot.warehouse,
-                    movement_type='return_out',
-                    quantity=quantity,
-                    reference_type='purchase_return',
-                    reference_id=purchase_return.id,
+                    product=product, lot=lot, from_warehouse=lot.warehouse,
+                    movement_type='return_out', quantity=quantity,
+                    reference_type='purchase_return', reference_id=purchase_return.id,
                     reference_number=return_number,
                     reason=f"Retour fournisseur - {purchase_return.get_reason_display()}",
                     created_by=user
@@ -941,10 +1083,11 @@ class PurchaseReturnCreateSerializer(serializers.ModelSerializer):
         purchase_return.save()
 
         return purchase_return
+
+
 # ============================================================
 # SUPPLIER INVOICE - SERIALIZERS
 # ============================================================
-
 
 class SupplierInvoiceListSerializer(serializers.ModelSerializer):
     supplier_name = serializers.CharField(
@@ -1301,8 +1444,6 @@ class FournisseurPaiementSerializer(serializers.ModelSerializer):
 
 
 class FournisseurPaiementCreateSerializer(serializers.ModelSerializer):
-    """✅ Serializer pour la création d'un paiement fournisseur"""
-
     class Meta:
         model = FournisseurPaiement
         fields = ['supplier_invoice', 'purchase_order', 'amount', 'method',

@@ -16,7 +16,7 @@ from .models import (
 class CaisseSerializer(serializers.ModelSerializer):
     est_sous_seuil_min = serializers.BooleanField(read_only=True)
     est_sur_seuil_max = serializers.BooleanField(read_only=True)
-    total_mouvements = serializers.IntegerField(read_only=True)
+    total_mouvements = serializers.SerializerMethodField()
     solde_actuel_formate = serializers.SerializerMethodField()
     solde_initial_formate = serializers.SerializerMethodField()
 
@@ -33,6 +33,12 @@ class CaisseSerializer(serializers.ModelSerializer):
         read_only_fields = ['solde_actuel',
                             'created_at', 'updated_at', 'created_by']
 
+    def get_total_mouvements(self, obj):
+        # Utilise l'annotation du queryset si disponible
+        if hasattr(obj, 'total_mouvements_annotated'):
+            return obj.total_mouvements_annotated
+        return obj.mouvements.count()
+
     def get_solde_actuel_formate(self, obj):
         return f"{obj.solde_actuel:,.0f} FCFA"
 
@@ -46,7 +52,7 @@ class CaisseSerializer(serializers.ModelSerializer):
                 warehouse=warehouse, is_default=True
             ).exclude(pk=self.instance.pk if self.instance else None).exists():
                 raise serializers.ValidationError(
-                    {"is_default": "Une caisse par défaut existe déjà pour cet entrepôt."}
+                    {"is_default": "Une caisse par defaut existe deja pour cet entrepot."}
                 )
         return data
 
@@ -58,17 +64,29 @@ class CompteBancaireSerializer(serializers.ModelSerializer):
     solde_actuel_formate = serializers.SerializerMethodField()
     solde_initial_formate = serializers.SerializerMethodField()
 
+    # ✅ AJOUTS POUR LE DETAIL
+    warehouse_name = serializers.CharField(
+        source='warehouse.name', read_only=True, allow_null=True)
+    warehouse_code = serializers.CharField(
+        source='warehouse.code', read_only=True, allow_null=True)
+    created_by_name = serializers.CharField(
+        source='created_by.full_name', read_only=True, allow_null=True)
+
     class Meta:
         model = CompteBancaire
         fields = [
-            'id', 'banque', 'code', 'nom', 'type_compte', 'warehouse',
+            'id', 'banque', 'code', 'nom', 'type_compte',
+            'warehouse', 'warehouse_name', 'warehouse_code',
             'numero_compte', 'iban', 'bic', 'devise',
-            'solde_initial', 'solde_initial_formate', 'solde_actuel', 'solde_actuel_formate',
+            'solde_initial', 'solde_initial_formate',
+            'solde_actuel', 'solde_actuel_formate',
             'is_active', 'is_default', 'date_ouverture', 'description',
-            'created_at', 'updated_at', 'created_by'
+            'created_at', 'updated_at',
+            'created_by', 'created_by_name',
         ]
-        read_only_fields = ['solde_actuel',
-                            'created_at', 'updated_at', 'created_by']
+        read_only_fields = [
+            'solde_actuel', 'created_at', 'updated_at', 'created_by'
+        ]
 
     def get_solde_actuel_formate(self, obj):
         return f"{obj.solde_actuel:,.0f} FCFA"
@@ -76,12 +94,12 @@ class CompteBancaireSerializer(serializers.ModelSerializer):
     def get_solde_initial_formate(self, obj):
         return f"{obj.solde_initial:,.0f} FCFA"
 
+# ----------------------------------------------
+# 3. MOUVEMENTS DE TRESORERIE
+# ----------------------------------------------
 
-# ----------------------------------------------
-# 3. MOUVEMENTS DE TRÉSORERIE - CORRIGÉ
-# ----------------------------------------------
+
 class MouvementTresorerieSerializer(serializers.ModelSerializer):
-    # Champs en lecture seule pour l'affichage
     est_encaissement = serializers.BooleanField(read_only=True)
     est_decaissement = serializers.BooleanField(read_only=True)
     est_transfert = serializers.BooleanField(read_only=True)
@@ -109,7 +127,6 @@ class MouvementTresorerieSerializer(serializers.ModelSerializer):
             'status', 'reference_externe', 'piece_justificative',
             'date_rapprochement', 'rapproche',
             'libelle', 'notes',
-            # ❌ SUPPRIMER CES CHAMPS : 'vente', 'purchase_order', 'facture_vente', 'paiement'
             'created_at', 'updated_at', 'created_by', 'created_by_name',
             'valide_par', 'valide_par_name', 'date_validation',
             'est_encaissement', 'est_decaissement', 'est_transfert'
@@ -123,22 +140,19 @@ class MouvementTresorerieSerializer(serializers.ModelSerializer):
         return f"{obj.montant:,.0f} FCFA"
 
     def validate(self, data):
-        # Un mouvement doit être lié soit à une caisse, soit à un compte bancaire
         if not data.get('caisse') and not data.get('compte_bancaire'):
             raise serializers.ValidationError(
-                "Vous devez spécifier une caisse ou un compte bancaire."
+                "Vous devez specifier une caisse ou un compte bancaire."
             )
 
-        # Vérifier que le montant est positif
         if data.get('montant', 0) <= 0:
             raise serializers.ValidationError(
-                {"montant": "Le montant doit être supérieur à 0."}
+                {"montant": "Le montant doit etre superieur a 0."}
             )
 
         return data
 
     def create(self, validated_data):
-        # La référence est générée automatiquement par le modèle
         if 'status' not in validated_data:
             validated_data['status'] = 'planifie'
 
@@ -150,7 +164,6 @@ class MouvementTresorerieSerializer(serializers.ModelSerializer):
         return mouvement
 
     def update(self, instance, validated_data):
-        # Si on passe le statut à 'effectué', on met à jour les soldes
         if validated_data.get('status') == 'effectue' and instance.status != 'effectue':
             instance.type_mouvement = validated_data.get(
                 'type_mouvement', instance.type_mouvement)
@@ -164,7 +177,7 @@ class MouvementTresorerieSerializer(serializers.ModelSerializer):
 
 
 # ----------------------------------------------
-# 4. MOUVEMENT TRÉSORERIE - CREATE
+# 4. MOUVEMENT TRESORERIE - CREATE
 # ----------------------------------------------
 class MouvementTresorerieCreateSerializer(serializers.ModelSerializer):
     class Meta:
@@ -180,12 +193,12 @@ class MouvementTresorerieCreateSerializer(serializers.ModelSerializer):
     def validate(self, data):
         if not data.get('caisse') and not data.get('compte_bancaire'):
             raise serializers.ValidationError(
-                "Vous devez spécifier une caisse ou un compte bancaire."
+                "Vous devez specifier une caisse ou un compte bancaire."
             )
 
         if data.get('montant', 0) <= 0:
             raise serializers.ValidationError(
-                {"montant": "Le montant doit être supérieur à 0."}
+                {"montant": "Le montant doit etre superieur a 0."}
             )
 
         return data
@@ -194,9 +207,6 @@ class MouvementTresorerieCreateSerializer(serializers.ModelSerializer):
 # ----------------------------------------------
 # 5. FRAIS
 # ----------------------------------------------
-# apps/tresorerie/serializers.py
-# Modifier FraisSerializer
-
 class FraisSerializer(serializers.ModelSerializer):
     montant_formate = serializers.SerializerMethodField()
     warehouse_nom = serializers.CharField(
@@ -205,8 +215,6 @@ class FraisSerializer(serializers.ModelSerializer):
         source='created_by.full_name', read_only=True, allow_null=True)
     valide_par_name = serializers.CharField(
         source='valide_par.full_name', read_only=True, allow_null=True)
-
-    # ✅ CORRECTION : Utiliser un SerializerMethodField au lieu d'un champ direct
     mouvement_reference = serializers.SerializerMethodField()
     supplier_name = serializers.SerializerMethodField()
 
@@ -216,8 +224,7 @@ class FraisSerializer(serializers.ModelSerializer):
             'id', 'reference', 'titre', 'warehouse', 'warehouse_nom', 'categorie',
             'montant', 'montant_formate', 'date_frais', 'date_paiement', 'beneficiaire',
             'piece_justificative', 'mode_paiement',
-            # ❌ SUPPRIMER 'mouvement' car il n'existe pas dans le modèle
-            'mouvement_reference',  # ✅ Utiliser ce champ à la place
+            'mouvement_reference',
             'supplier_id', 'supplier_name',
             'status', 'notes',
             'created_at', 'updated_at', 'created_by', 'created_by_name',
@@ -240,10 +247,8 @@ class FraisSerializer(serializers.ModelSerializer):
         return None
 
     def get_mouvement_reference(self, obj):
-        """Récupère la référence du mouvement associé via l'ID"""
         if obj.mouvement_id:
             try:
-                from tresorerie.models import MouvementTresorerie
                 mouvement = MouvementTresorerie.objects.get(
                     id=obj.mouvement_id)
                 return mouvement.reference
@@ -251,11 +256,10 @@ class FraisSerializer(serializers.ModelSerializer):
                 return None
         return None
 
+
 # ----------------------------------------------
 # 6. FRAIS - CREATE
 # ----------------------------------------------
-
-
 class FraisCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = Frais
@@ -268,12 +272,12 @@ class FraisCreateSerializer(serializers.ModelSerializer):
     def validate_montant(self, value):
         if value <= 0:
             raise serializers.ValidationError(
-                "Le montant doit être supérieur à 0.")
+                "Le montant doit etre superieur a 0.")
         return value
 
 
 # ----------------------------------------------
-# 7. PRÉVISIONS
+# 7. PREVISIONS
 # ----------------------------------------------
 class PrevisionTresorerieSerializer(serializers.ModelSerializer):
     montant_prevu_formate = serializers.SerializerMethodField()
@@ -353,7 +357,7 @@ class RapprochementBancaireSerializer(serializers.ModelSerializer):
 
 
 # ----------------------------------------------
-# 9. TRÉSORERIE JOURNALIÈRE
+# 9. TRESORERIE JOURNALIERE
 # ----------------------------------------------
 class TresorerieJournaliereSerializer(serializers.ModelSerializer):
     variation = serializers.DecimalField(
@@ -364,7 +368,6 @@ class TresorerieJournaliereSerializer(serializers.ModelSerializer):
     total_entrees_formate = serializers.SerializerMethodField()
     total_sorties_formate = serializers.SerializerMethodField()
 
-    # ✅ NOUVEAUX CHAMPS DÉTAILLÉS
     frais_details = serializers.SerializerMethodField()
     entrees_details = serializers.SerializerMethodField()
     sorties_details = serializers.SerializerMethodField()
@@ -381,7 +384,6 @@ class TresorerieJournaliereSerializer(serializers.ModelSerializer):
             'sorties_achats', 'sorties_frais', 'sorties_salaires', 'sorties_autres',
             'nb_operations', 'nb_entrees', 'nb_sorties',
             'variation', 'variation_formate',
-            # ✅ Détails
             'frais_details', 'entrees_details', 'sorties_details',
             'created_at', 'updated_at'
         ]
@@ -403,7 +405,6 @@ class TresorerieJournaliereSerializer(serializers.ModelSerializer):
         return f"{obj.total_sorties:,.0f} FCFA"
 
     def _serialize_mouvements(self, mouvements):
-        """Sérialise une liste de dictionnaires de mouvements"""
         result = []
         for m in mouvements:
             item = {}
@@ -426,19 +427,11 @@ class TresorerieJournaliereSerializer(serializers.ModelSerializer):
     def get_sorties_details(self, obj):
         return self._serialize_mouvements(obj.get_sorties_du_jour())
 
+
 # ----------------------------------------------
-# 10. DASHBOARD TRÉSORERIE
+# 10. DASHBOARD TRESORERIE
 # ----------------------------------------------
-# apps/tresorerie/serializers.py
-# Modifier la méthode to_representation de TresorerieDashboardSerializer
-
-# apps/tresorerie/serializers.py - Partie TresorerieDashboardSerializer COMPLETE
-
-
 class TresorerieDashboardSerializer(serializers.Serializer):
-    """
-    Sérialiseur pour les statistiques du tableau de bord de trésorerie
-    """
     total_soldes_caisses = serializers.DecimalField(
         max_digits=15, decimal_places=2, required=False, default=0
     )
@@ -463,7 +456,6 @@ class TresorerieDashboardSerializer(serializers.Serializer):
         child=serializers.DictField(), required=False, default=list
     )
 
-    # Champs formatés (en lecture seule)
     total_soldes_caisses_formate = serializers.SerializerMethodField()
     total_soldes_comptes_formate = serializers.SerializerMethodField()
     total_global_formate = serializers.SerializerMethodField()
@@ -486,9 +478,6 @@ class TresorerieDashboardSerializer(serializers.Serializer):
         return self._safe_format(obj.get('sortie_total_jour', 0))
 
     def _safe_format(self, value, default=0):
-        """
-        Formate une valeur en chaîne de caractères avec séparateurs de milliers
-        """
         try:
             if value is None:
                 return f"{default:,.0f} FCFA"
@@ -500,10 +489,6 @@ class TresorerieDashboardSerializer(serializers.Serializer):
             return f"{default:,.0f} FCFA"
 
     def to_representation(self, instance):
-        """
-        Convertit l'instance en dictionnaire avec des valeurs formatées
-        """
-        # S'assurer que toutes les clés existent
         default_data = {
             'total_soldes_caisses': 0,
             'total_soldes_comptes': 0,
@@ -516,7 +501,6 @@ class TresorerieDashboardSerializer(serializers.Serializer):
             'soldes_par_entrepot': [],
         }
 
-        # Mettre à jour avec les données de l'instance
         if isinstance(instance, dict):
             default_data.update(instance)
         elif hasattr(instance, '__dict__'):
@@ -524,7 +508,5 @@ class TresorerieDashboardSerializer(serializers.Serializer):
                 if hasattr(instance, key):
                     default_data[key] = getattr(instance, key)
 
-        # Appeler le parent pour avoir la représentation de base
         data = super().to_representation(default_data)
-
         return data

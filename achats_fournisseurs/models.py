@@ -1,7 +1,8 @@
-from django.db import models
+# apps/achats_fournisseurs/models.py
+# ============================================================
+# MODELS COMPLET OPTIMISÉ AVEC INDEX
+# ============================================================
 
-# Create your models here.
-# apps/achats_fournisseurs/models.py - Version COMPLÈTE
 from django.db.models import Sum, F
 from datetime import date, timedelta
 from decimal import Decimal
@@ -12,11 +13,12 @@ import qrcode
 from django.core.exceptions import ValidationError
 from django.core.files import File
 from django.db import models, transaction
-from django.db.models import Sum
 from django.utils import timezone
 
 from users.models import CustomUser
-from produits_stocks.models import Product, UnitMeasure, Warehouse, Lot, Stock, StockMovement
+from produits_stocks.models import (
+    Product, UnitMeasure, Warehouse, Lot, Stock, StockMovement
+)
 
 
 # ============================================================
@@ -24,18 +26,14 @@ from produits_stocks.models import Product, UnitMeasure, Warehouse, Lot, Stock, 
 # ============================================================
 
 def generate_number(model, field_name, prefix):
-    """Génère un numéro séquentiel"""
+    """Génère un numéro séquentiel : PO-2026-0001, REC-2026-0001, etc."""
     year = date.today().year
-
     last_object = (
         model.objects
-        .filter(**{
-            f"{field_name}__startswith": f"{prefix}-{year}-"
-        })
+        .filter(**{f"{field_name}__startswith": f"{prefix}-{year}-"})
         .order_by("-id")
         .first()
     )
-
     if last_object:
         last_number = getattr(last_object, field_name)
         try:
@@ -44,14 +42,12 @@ def generate_number(model, field_name, prefix):
             number = 1
     else:
         number = 1
-
     return f"{prefix}-{year}-{number:04d}"
 
 
 def generate_qr_image(data):
-    """Génère une image QR Code"""
+    """Génère une image QR Code."""
     qr_data = json.dumps(data, ensure_ascii=False, default=str)
-
     qr = qrcode.QRCode(
         version=1,
         error_correction=qrcode.constants.ERROR_CORRECT_L,
@@ -60,13 +56,10 @@ def generate_qr_image(data):
     )
     qr.add_data(qr_data)
     qr.make(fit=True)
-
     image = qr.make_image(fill_color="black", back_color="white")
-
     buffer = BytesIO()
     image.save(buffer, format="PNG")
     buffer.seek(0)
-
     return qr_data, buffer
 
 
@@ -82,7 +75,6 @@ class Supplier(models.Model):
         ('distributeur', 'Distributeur'),
         ('fabricant', 'Fabricant'),
     )
-
     PAYMENT_TERMS_CHOICES = (
         ('cash', 'Comptant'),
         ('15', '15 jours'),
@@ -117,7 +109,9 @@ class Supplier(models.Model):
     registration_number = models.CharField(
         max_length=50, blank=True, verbose_name="N° Registre de commerce")
     payment_terms = models.CharField(
-        max_length=20, choices=PAYMENT_TERMS_CHOICES, default='30', verbose_name="Délai de paiement")
+        max_length=20, choices=PAYMENT_TERMS_CHOICES, default='30',
+        verbose_name="Délai de paiement"
+    )
     delivery_lead_time = models.IntegerField(
         default=7, verbose_name="Délai de livraison (jours)")
     minimum_order = models.IntegerField(
@@ -125,11 +119,14 @@ class Supplier(models.Model):
     rating = models.DecimalField(
         max_digits=3, decimal_places=2, default=0, verbose_name="Note (0-5)")
     total_purchases = models.DecimalField(
-        max_digits=15, decimal_places=2, default=0, verbose_name="Total achats")
+        max_digits=15, decimal_places=2, default=0, verbose_name="Total achats"
+    )
     total_orders = models.IntegerField(
         default=0, verbose_name="Nombre de commandes")
     on_time_delivery_rate = models.DecimalField(
-        max_digits=5, decimal_places=2, default=0, verbose_name="Taux livraison à temps (%)")
+        max_digits=5, decimal_places=2, default=0,
+        verbose_name="Taux livraison à temps (%)"
+    )
     is_active = models.BooleanField(default=True, verbose_name="Actif")
     is_preferred = models.BooleanField(
         default=False, verbose_name="Fournisseur privilégié")
@@ -138,13 +135,25 @@ class Supplier(models.Model):
         auto_now_add=True, verbose_name="Date création")
     updated_at = models.DateTimeField(
         auto_now=True, verbose_name="Date modification")
-    created_by = models.ForeignKey(CustomUser, on_delete=models.SET_NULL, null=True,
-                                   blank=True, related_name='fournisseurs_created', verbose_name="Créé par")
+    created_by = models.ForeignKey(
+        CustomUser, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='fournisseurs_created', verbose_name="Créé par"
+    )
 
     class Meta:
         verbose_name = "Fournisseur"
         verbose_name_plural = "Fournisseurs"
         ordering = ['name']
+        indexes = [
+            models.Index(fields=['code'], name='supplier_code_idx'),
+            models.Index(fields=['name'], name='supplier_name_idx'),
+            models.Index(fields=['is_active'], name='supplier_active_idx'),
+            models.Index(fields=['is_active', 'is_preferred'],
+                         name='supplier_active_pref_idx'),
+            models.Index(fields=['-total_purchases'],
+                         name='supplier_total_purch_idx'),
+            models.Index(fields=['type'], name='supplier_type_idx'),
+        ]
 
     def __str__(self):
         return f"{self.code} - {self.name}"
@@ -191,6 +200,10 @@ class SupplierContact(models.Model):
     class Meta:
         verbose_name = "Contact fournisseur"
         verbose_name_plural = "Contacts fournisseurs"
+        indexes = [
+            models.Index(fields=['supplier', 'is_primary'],
+                         name='supcontact_sup_prim_idx'),
+        ]
 
     def __str__(self):
         return f"{self.name} - {self.supplier.name}"
@@ -217,6 +230,11 @@ class SupplierProduct(models.Model):
         verbose_name = "Produit fournisseur"
         verbose_name_plural = "Produits fournisseurs"
         unique_together = ['supplier', 'product']
+        indexes = [
+            models.Index(fields=['supplier', 'is_active'],
+                         name='supprod_sup_active_idx'),
+            models.Index(fields=['product'], name='supprod_product_idx'),
+        ]
 
     def __str__(self):
         return f"{self.supplier.name} - {self.product.name}"
@@ -225,8 +243,6 @@ class SupplierProduct(models.Model):
 # ============================================================
 # BON DE COMMANDE
 # ============================================================
-
-# apps/achats_fournisseurs/models.py - Partie PurchaseOrder
 
 class PurchaseOrder(models.Model):
     STATUS_CHOICES = (
@@ -237,7 +253,6 @@ class PurchaseOrder(models.Model):
         ('received', 'Reçu'),
         ('cancelled', 'Annulé'),
     )
-
     DISCOUNT_CHOICES = (
         ('percentage', 'Pourcentage'),
         ('amount', 'Montant fixe'),
@@ -248,7 +263,8 @@ class PurchaseOrder(models.Model):
     supplier_reference = models.CharField(
         max_length=100, blank=True, verbose_name="Référence fournisseur")
     supplier = models.ForeignKey(
-        Supplier, on_delete=models.SET_NULL, null=True, related_name='purchase_orders')
+        Supplier, on_delete=models.SET_NULL, null=True, related_name='purchase_orders'
+    )
     order_date = models.DateTimeField(
         auto_now_add=True, verbose_name="Date commande")
     expected_delivery_date = models.DateField(
@@ -258,7 +274,8 @@ class PurchaseOrder(models.Model):
     subtotal = models.DecimalField(
         max_digits=12, decimal_places=2, default=0, verbose_name="Sous-total")
     discount_type = models.CharField(
-        max_length=10, choices=DISCOUNT_CHOICES, default='amount', verbose_name="Type de remise")
+        max_length=10, choices=DISCOUNT_CHOICES, default='amount', verbose_name="Type de remise"
+    )
     discount_value = models.DecimalField(
         max_digits=10, decimal_places=2, default=0, verbose_name="Valeur de la remise")
     discount_amount = models.DecimalField(
@@ -282,11 +299,14 @@ class PurchaseOrder(models.Model):
         max_length=100, blank=True, verbose_name="N° de suivi")
 
     total_received_amount = models.DecimalField(
-        max_digits=15, decimal_places=2, default=0, verbose_name="Montant total reçu")
+        max_digits=15, decimal_places=2, default=0, verbose_name="Montant total reçu"
+    )
     total_invoiced_amount = models.DecimalField(
-        max_digits=15, decimal_places=2, default=0, verbose_name="Montant total facturé")
+        max_digits=15, decimal_places=2, default=0, verbose_name="Montant total facturé"
+    )
     total_paid_amount = models.DecimalField(
-        max_digits=15, decimal_places=2, default=0, verbose_name="Montant total payé")
+        max_digits=15, decimal_places=2, default=0, verbose_name="Montant total payé"
+    )
     is_fully_received = models.BooleanField(
         default=False, verbose_name="Entièrement reçue")
     is_fully_invoiced = models.BooleanField(
@@ -300,10 +320,14 @@ class PurchaseOrder(models.Model):
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
-    created_by = models.ForeignKey(CustomUser, on_delete=models.SET_NULL, null=True,
-                                   blank=True, related_name='purchase_orders', verbose_name="Créé par")
-    approved_by = models.ForeignKey(CustomUser, on_delete=models.SET_NULL, null=True,
-                                    blank=True, related_name='approved_orders', verbose_name="Approuvé par")
+    created_by = models.ForeignKey(
+        CustomUser, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='purchase_orders', verbose_name="Créé par"
+    )
+    approved_by = models.ForeignKey(
+        CustomUser, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='approved_orders', verbose_name="Approuvé par"
+    )
     approved_at = models.DateTimeField(
         null=True, blank=True, verbose_name="Date approbation")
 
@@ -311,6 +335,22 @@ class PurchaseOrder(models.Model):
         verbose_name = "Bon de commande"
         verbose_name_plural = "Bons de commande"
         ordering = ['-order_date']
+        indexes = [
+            models.Index(fields=['-order_date'], name='po_order_date_idx'),
+            models.Index(fields=['order_date', 'status'],
+                         name='po_date_status_idx'),
+            models.Index(fields=['status'], name='po_status_idx'),
+            models.Index(fields=['supplier', '-order_date'],
+                         name='po_supplier_date_idx'),
+            models.Index(fields=['po_number'], name='po_number_idx'),
+            models.Index(fields=['is_fully_received'],
+                         name='po_fully_received_idx'),
+            models.Index(fields=['is_fully_invoiced'],
+                         name='po_fully_invoiced_idx'),
+            models.Index(fields=['is_fully_paid'], name='po_fully_paid_idx'),
+            models.Index(fields=['expected_delivery_date'],
+                         name='po_expected_date_idx'),
+        ]
 
     def __str__(self):
         return f"{self.po_number} - {self.supplier.name if self.supplier else 'N/A'}"
@@ -352,36 +392,30 @@ class PurchaseOrder(models.Model):
                   'discount_amount', 'tax_amount', 'total'])
 
     def update_receipt_status(self):
-        """✅ CORRIGÉ : Met à jour le statut en fonction des quantités reçues"""
         total_ordered = self.lines.aggregate(
             total=Sum('quantity'))['total'] or 0
         total_received = self.lines.aggregate(
             total=Sum('quantity_received'))['total'] or 0
 
-        # Si aucune ligne ou quantité commandée = 0
         if total_ordered == 0:
             self.is_fully_received = False
             if self.status not in ['cancelled', 'draft']:
                 self.status = 'confirmed'
         else:
-            # Vérifier si tout est reçu
             all_received = True
             for line in self.lines.all():
                 if line.quantity_received < line.quantity:
                     all_received = False
                     break
-
             self.is_fully_received = all_received
-
             if self.status in ['cancelled', 'draft']:
-                pass  # Ne pas changer le statut si annulé ou brouillon
+                pass
             elif all_received:
                 self.status = 'received'
             elif total_received > 0:
-                self.status = 'partial'  # ✅ Statut partiel
+                self.status = 'partial'
             else:
-                self.status = 'confirmed'  # Pas encore de réception
-
+                self.status = 'confirmed'
         self.save(update_fields=['is_fully_received', 'status'])
 
     def update_invoice_status(self):
@@ -396,7 +430,8 @@ class PurchaseOrder(models.Model):
 
     def update_payment_status(self):
         total_paid = self.paiements.filter(status='confirmed').aggregate(
-            total=Sum('amount'))['total'] or 0
+            total=Sum('amount')
+        )['total'] or 0
         self.total_paid_amount = total_paid
         if self.total_invoiced_amount == 0:
             self.is_fully_paid = False
@@ -452,6 +487,10 @@ class PurchaseOrderLine(models.Model):
     class Meta:
         verbose_name = "Ligne de commande"
         verbose_name_plural = "Lignes de commande"
+        indexes = [
+            models.Index(fields=['purchase_order'], name='pol_po_idx'),
+            models.Index(fields=['product'], name='pol_product_idx'),
+        ]
 
     def __str__(self):
         return f"{self.purchase_order.po_number} - {self.product.name}"
@@ -497,12 +536,8 @@ class Receipt(models.Model):
 
     is_invoiced = models.BooleanField(default=False, verbose_name="Facturée")
     supplier_invoice = models.ForeignKey(
-        'SupplierInvoice',
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name='receipts',
-        verbose_name="Facture associée"
+        'SupplierInvoice', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='receipts', verbose_name="Facture associée"
     )
     auto_invoice = models.BooleanField(
         default=True, verbose_name="Créer facture automatiquement")
@@ -523,13 +558,29 @@ class Receipt(models.Model):
     qr_code_data = models.TextField(blank=True, verbose_name="Données QR Code")
 
     created_at = models.DateTimeField(auto_now_add=True)
-    created_by = models.ForeignKey(CustomUser, on_delete=models.SET_NULL, null=True,
-                                   blank=True, related_name='receptions_created', verbose_name="Réceptionné par")
+    created_by = models.ForeignKey(
+        CustomUser, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='receptions_created', verbose_name="Réceptionné par"
+    )
 
     class Meta:
         verbose_name = "Réception"
         verbose_name_plural = "Réceptions"
         ordering = ['-receipt_date']
+        indexes = [
+            models.Index(fields=['-receipt_date'], name='receipt_date_idx'),
+            models.Index(fields=['receipt_number'], name='receipt_number_idx'),
+            models.Index(fields=['purchase_order',
+                         '-receipt_date'], name='receipt_po_date_idx'),
+            models.Index(fields=['status'], name='receipt_status_idx'),
+            models.Index(fields=['is_invoiced'], name='receipt_invoiced_idx'),
+            models.Index(fields=['status', 'is_invoiced'],
+                         name='receipt_status_inv_idx'),
+            models.Index(fields=['warehouse', '-receipt_date'],
+                         name='receipt_wh_date_idx'),
+            models.Index(fields=['supplier_invoice'],
+                         name='receipt_sup_inv_idx'),
+        ]
 
     def __str__(self):
         return f"{self.receipt_number} - {self.purchase_order.po_number}"
@@ -563,19 +614,16 @@ class Receipt(models.Model):
     def creer_mouvement_decaissement(self, user):
         if self.mouvement_tresorerie_id:
             return self.mouvement_tresorerie_id
-
         try:
             from tresorerie.models import MouvementTresorerie, Caisse, CompteBancaire
         except ImportError:
             return None
 
         total_recu = self.total_received_amount
-
         if total_recu <= 0:
             return None
 
         self.montant_decaissement = total_recu
-
         caisse = None
         compte = None
 
@@ -618,11 +666,9 @@ class Receipt(models.Model):
             libelle=f"Décaissement pour réception {self.receipt_number} - commande {self.purchase_order.po_number}",
             created_by=user
         )
-
         self.mouvement_tresorerie_id = mouvement.id
         self.save(update_fields=[
                   'montant_decaissement', 'mouvement_tresorerie_id'])
-
         return self.mouvement_tresorerie_id
 
     def save(self, *args, **kwargs):
@@ -653,14 +699,23 @@ class ReceiptLine(models.Model):
         null=True, blank=True, verbose_name="Date de fabrication")
     is_quality_checked = models.BooleanField(
         default=False, verbose_name="Contrôle qualité effectué")
-    quality_status = models.CharField(max_length=20, blank=True, choices=[(
-        'passed', 'Approuvé'), ('failed', 'Refusé'), ('pending', 'En attente')], default='pending')
+    quality_status = models.CharField(
+        max_length=20, blank=True,
+        choices=[('passed', 'Approuvé'), ('failed', 'Refusé'),
+                 ('pending', 'En attente')],
+        default='pending'
+    )
     quality_notes = models.TextField(blank=True, verbose_name="Notes qualité")
     notes = models.TextField(blank=True, verbose_name="Notes")
 
     class Meta:
         verbose_name = "Ligne de réception"
         verbose_name_plural = "Lignes de réception"
+        indexes = [
+            models.Index(fields=['receipt'], name='recl_receipt_idx'),
+            models.Index(fields=['po_line'], name='recl_poline_idx'),
+            models.Index(fields=['product'], name='recl_product_idx'),
+        ]
 
     def __str__(self):
         return f"{self.receipt.receipt_number} - {self.product.name}"
@@ -668,14 +723,15 @@ class ReceiptLine(models.Model):
     def save(self, *args, **kwargs):
         super().save(*args, **kwargs)
         total_received = ReceiptLine.objects.filter(po_line=self.po_line).aggregate(
-            total=Sum('quantity_received'))['total'] or 0
+            total=Sum('quantity_received')
+        )['total'] or 0
         self.po_line.quantity_received = total_received
         self.po_line.save()
         self.receipt.purchase_order.update_receipt_status()
 
 
 # ============================================================
-# RETOUR FOURNISSEUR - AJOUTÉ
+# RETOUR FOURNISSEUR
 # ============================================================
 
 class PurchaseReturn(models.Model):
@@ -708,8 +764,10 @@ class PurchaseReturn(models.Model):
     status = models.CharField(
         max_length=20, choices=STATUS_CHOICES, default='requested', verbose_name="Statut")
     notes = models.TextField(blank=True, verbose_name="Notes")
-    created_by = models.ForeignKey(CustomUser, on_delete=models.SET_NULL,
-                                   null=True, related_name='returns_created', verbose_name="Créé par")
+    created_by = models.ForeignKey(
+        CustomUser, on_delete=models.SET_NULL, null=True,
+        related_name='returns_created', verbose_name="Créé par"
+    )
     qr_code = models.ImageField(
         upload_to='qrcodes/purchase_returns/', null=True, blank=True, verbose_name="QR Code")
     qr_code_data = models.TextField(blank=True, verbose_name="Données QR Code")
@@ -718,6 +776,14 @@ class PurchaseReturn(models.Model):
         verbose_name = "Retour fournisseur"
         verbose_name_plural = "Retours fournisseurs"
         ordering = ['-return_date']
+        indexes = [
+            models.Index(fields=['-return_date'], name='pret_date_idx'),
+            models.Index(fields=['return_number'], name='pret_number_idx'),
+            models.Index(fields=['status'], name='pret_status_idx'),
+            models.Index(fields=['purchase_order',
+                         '-return_date'], name='pret_po_date_idx'),
+            models.Index(fields=['reason'], name='pret_reason_idx'),
+        ]
 
     def __str__(self):
         return f"{self.return_number} - {self.purchase_order.po_number}"
@@ -764,6 +830,11 @@ class PurchaseReturnLine(models.Model):
     class Meta:
         verbose_name = "Ligne de retour"
         verbose_name_plural = "Lignes de retour"
+        indexes = [
+            models.Index(fields=['purchase_return'], name='pretl_return_idx'),
+            models.Index(fields=['receipt_line'], name='pretl_recline_idx'),
+            models.Index(fields=['product'], name='pretl_product_idx'),
+        ]
 
     def __str__(self):
         return f"{self.purchase_return.return_number} - {self.product.name}"
@@ -774,12 +845,10 @@ class PurchaseReturnLine(models.Model):
 
 
 # ============================================================
-# FACTURE FOURNISSEUR - CORRIGÉ
+# FACTURE FOURNISSEUR
 # ============================================================
-# apps/achats_fournisseurs/models.py - Partie SupplierInvoice
 
 class SupplierInvoice(models.Model):
-    """Facture fournisseur avec suivi des paiements"""
     STATUS_CHOICES = (
         ('received', 'Reçue'),
         ('verified', 'Vérifiée'),
@@ -814,7 +883,8 @@ class SupplierInvoice(models.Model):
     status = models.CharField(
         max_length=20, choices=STATUS_CHOICES, default='received', verbose_name="Statut")
     paiement_status = models.CharField(
-        max_length=20, choices=PAIEMENT_STATUS_CHOICES, default='unpaid', verbose_name="Statut paiement")
+        max_length=20, choices=PAIEMENT_STATUS_CHOICES, default='unpaid', verbose_name="Statut paiement"
+    )
     is_fully_paid = models.BooleanField(
         default=False, verbose_name="Entièrement payée")
 
@@ -832,22 +902,33 @@ class SupplierInvoice(models.Model):
         verbose_name = "Facture fournisseur"
         verbose_name_plural = "Factures fournisseurs"
         ordering = ['-invoice_date']
+        indexes = [
+            models.Index(fields=['-invoice_date'], name='sinv_date_idx'),
+            models.Index(fields=['invoice_number'], name='sinv_number_idx'),
+            models.Index(fields=['due_date'], name='sinv_due_date_idx'),
+            models.Index(fields=['status'], name='sinv_status_idx'),
+            models.Index(fields=['paiement_status'],
+                         name='sinv_pay_status_idx'),
+            models.Index(fields=['is_fully_paid'], name='sinv_fully_paid_idx'),
+            models.Index(fields=['supplier', '-invoice_date'],
+                         name='sinv_sup_date_idx'),
+            models.Index(fields=['purchase_order'], name='sinv_po_idx'),
+            models.Index(fields=['paiement_status', 'due_date'],
+                         name='sinv_paystat_due_idx'),
+        ]
 
     def __str__(self):
         return f"{self.invoice_number} - {self.supplier.name}"
 
     def get_remaining_amount(self):
-        """✅ Montant restant à payer - METHODE"""
         return self.total_amount - self.amount_paid
 
     @property
     def remaining_amount(self):
-        """✅ Montant restant à payer - PROPRIÉTÉ CALCULÉE"""
         return self.total_amount - self.amount_paid
 
     @property
     def paid_percentage(self):
-        """✅ Pourcentage payé"""
         if self.total_amount == 0:
             return 0
         return (self.amount_paid / self.total_amount) * 100
@@ -863,17 +944,11 @@ class SupplierInvoice(models.Model):
         return 0
 
     def update_payment_status(self):
-        """✅ Met à jour le statut de paiement - CORRIGÉ"""
-        from .models import FournisseurPaiement
-
-        # ✅ Recalculer le montant payé à partir des paiements confirmés
         total_paid = self.paiements.filter(status='confirmed').aggregate(
             total=Sum('amount')
         )['total'] or Decimal('0.00')
 
         self.amount_paid = total_paid
-
-        # ✅ Calculer le reste
         remaining = self.total_amount - self.amount_paid
 
         if remaining <= 0:
@@ -897,33 +972,26 @@ class SupplierInvoice(models.Model):
                 self.paiement_status = 'unpaid'
                 self.status = 'received'
 
-        # ✅ Mettre à jour la commande
         if self.purchase_order:
             self.purchase_order.update_invoice_status()
             self.purchase_order.update_payment_status()
 
-        # ✅ Sauvegarder
         self.save(update_fields=[
-            'amount_paid',
-            'is_fully_paid',
-            'paiement_status',
-            'status',
-            'payment_date',
-            'updated_at'
+            'amount_paid', 'is_fully_paid', 'paiement_status',
+            'status', 'payment_date', 'updated_at'
         ])
 
     @classmethod
     def get_available_for_payment(cls, supplier_id=None):
-        """✅ Récupère les factures disponibles pour paiement"""
         queryset = cls.objects.filter(is_fully_paid=False)
         if supplier_id:
             queryset = queryset.filter(supplier_id=supplier_id)
         return queryset.order_by('due_date')
 
-# ============================================================
-# PAIEMENT FOURNISSEUR - CORRIGÉ
-# ============================================================
 
+# ============================================================
+# PAIEMENT FOURNISSEUR
+# ============================================================
 
 class FournisseurPaiement(models.Model):
     METHOD_CHOICES = (
@@ -943,13 +1011,18 @@ class FournisseurPaiement(models.Model):
     reference = models.CharField(
         max_length=50, unique=True, verbose_name="Référence paiement")
     supplier_invoice = models.ForeignKey(
-        SupplierInvoice, on_delete=models.CASCADE, related_name='paiements', verbose_name="Facture fournisseur")
-    purchase_order = models.ForeignKey(PurchaseOrder, on_delete=models.CASCADE,
-                                       related_name='paiements', null=True, blank=True, verbose_name="Commande associée")
+        SupplierInvoice, on_delete=models.CASCADE, related_name='paiements',
+        verbose_name="Facture fournisseur"
+    )
+    purchase_order = models.ForeignKey(
+        PurchaseOrder, on_delete=models.CASCADE, related_name='paiements',
+        null=True, blank=True, verbose_name="Commande associée"
+    )
     amount = models.DecimalField(
         max_digits=15, decimal_places=2, verbose_name="Montant payé")
     method = models.CharField(
-        max_length=20, choices=METHOD_CHOICES, default='virement', verbose_name="Méthode")
+        max_length=20, choices=METHOD_CHOICES, default='virement', verbose_name="Méthode"
+    )
     reference_number = models.CharField(
         max_length=100, blank=True, verbose_name="N° de référence")
     payment_date = models.DateTimeField(
@@ -965,8 +1038,10 @@ class FournisseurPaiement(models.Model):
     status = models.CharField(
         max_length=20, choices=STATUS_CHOICES, default='pending', verbose_name="Statut")
     notes = models.TextField(blank=True, verbose_name="Notes")
-    created_by = models.ForeignKey(CustomUser, on_delete=models.SET_NULL, null=True,
-                                   blank=True, related_name='paiements_fournisseurs', verbose_name="Créé par")
+    created_by = models.ForeignKey(
+        CustomUser, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='paiements_fournisseurs', verbose_name="Créé par"
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -978,6 +1053,17 @@ class FournisseurPaiement(models.Model):
         verbose_name = "Paiement fournisseur"
         verbose_name_plural = "Paiements fournisseurs"
         ordering = ['-payment_date']
+        indexes = [
+            models.Index(fields=['-payment_date'], name='fp_date_idx'),
+            models.Index(fields=['reference'], name='fp_reference_idx'),
+            models.Index(fields=['status'], name='fp_status_idx'),
+            models.Index(fields=['supplier_invoice',
+                         '-payment_date'], name='fp_invoice_date_idx'),
+            models.Index(fields=['purchase_order'], name='fp_po_idx'),
+            models.Index(fields=['method'], name='fp_method_idx'),
+            models.Index(fields=['status', '-payment_date'],
+                         name='fp_status_date_idx'),
+        ]
 
     def __str__(self):
         return f"{self.reference} - {self.supplier_invoice.invoice_number} - {self.amount:,.0f} FCFA"
@@ -1004,7 +1090,6 @@ class FournisseurPaiement(models.Model):
     def creer_mouvement_tresorerie(self, user):
         if self.mouvement_tresorerie_id:
             return self.mouvement_tresorerie_id
-
         try:
             from tresorerie.models import MouvementTresorerie, Caisse, CompteBancaire
         except ImportError:
@@ -1069,7 +1154,6 @@ class FournisseurPaiement(models.Model):
 
         self.mouvement_tresorerie_id = mouvement.id
         self.save(update_fields=['mouvement_tresorerie_id'])
-
         return self.mouvement_tresorerie_id
 
     def save(self, *args, **kwargs):

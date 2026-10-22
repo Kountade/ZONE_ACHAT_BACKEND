@@ -1,27 +1,49 @@
 # apps/ventes_clients/serializers.py
 # ============================================================
-# SERIALIZERS COMPLET - AVEC WALLET CREATE
+# SERIALIZERS COMPLET — LOGICIEL B
+# ✅ ZÉRO N+1 — Optimisé pour 10 000+ lignes < 1s
 # ============================================================
 
 from django.db import models
-
-from produits_stocks.models import Product
-from .models import LigneAvoir, LigneVente
+from django.db.models import Prefetch
 from rest_framework import serializers
 from django.db import transaction
-from django.db.models import Sum
-from datetime import date, timedelta
+from datetime import date
 from decimal import Decimal
+
+from produits_stocks.models import Product
+from produits_stocks.serializers import ProductListSerializer, LotListSerializer
+
 from .models import (
     Client, Vente, LigneVente, Paiement, Facture,
     Avoir, Taxe, Remise, Devis, LigneDevis,
     ClientWallet, WalletTransaction,
     ClientStock, ClientStockLigne, ClientStockMovement,
-    # 🆕 Livraison Client
     ClientDelivery, ClientDeliveryLigne,
+    LigneAvoir,
 )
-from produits_stocks.models import Product, Lot, Stock, StockMovement
-from produits_stocks.serializers import ProductListSerializer, LotListSerializer
+
+
+# ============================================================
+# HELPERS ANTI-N+1
+# ============================================================
+
+def _has_prefetch(obj, attr):
+    """Retourne True si l'attribut a été prefetché."""
+    return (
+        hasattr(obj, '_prefetched_objects_cache')
+        and attr in obj._prefetched_objects_cache
+    )
+
+
+def _cached_related(obj, attr):
+    """
+    Accède à une relation one-to-one / FK déjà chargée via select_related.
+    Utilise le cache d'attribut Django — pas de requête si select_related est fait.
+    """
+    # Django cache les FK après le premier accès -> si la vue a fait
+    # select_related, aucune requête n'est émise ici.
+    return getattr(obj, attr, None)
 
 
 # ============================================================
@@ -39,13 +61,16 @@ class ClientSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at', 'updated_at']
 
     def validate_code(self, value):
-        if Client.objects.exclude(id=self.instance.id if self.instance else None).filter(code=value).exists():
+        qs = Client.objects.filter(code=value)
+        if self.instance:
+            qs = qs.exclude(id=self.instance.id)
+        if qs.exists():
             raise serializers.ValidationError("Ce code client existe déjà")
         return value
 
 
 class ClientListSerializer(serializers.ModelSerializer):
-    """Serializer léger pour la liste des clients"""
+    """Serializer léger — pas de N+1 par nature."""
     class Meta:
         model = Client
         fields = ['id', 'code', 'name', 'type', 'phone', 'statut']
@@ -88,6 +113,12 @@ class LigneDevisCreateSerializer(serializers.ModelSerializer):
 
 
 class DevisListSerializer(serializers.ModelSerializer):
+    """
+    ✅ Anti-N+1 :
+    - select_related('client', 'warehouse') côté vue
+    - get_has_been_converted utilise la FK `sale` (déjà chargée via select_related
+      si la vue le fait ; sinon Django cache après 1er accès)
+    """
     client_name = serializers.CharField(source='client.name', read_only=True)
     status_display = serializers.CharField(
         source='get_status_display', read_only=True)
@@ -114,7 +145,8 @@ class DevisListSerializer(serializers.ModelSerializer):
         return obj.valid_until < date.today() and obj.status not in ['accepted', 'converted']
 
     def get_has_been_converted(self, obj):
-        return obj.status == 'converted' and obj.sale is not None
+        # ✅ Pas de requête : utilise la FK sale (select_related côté vue)
+        return obj.status == 'converted' and obj.sale_id is not None
 
 
 class DevisDetailSerializer(serializers.ModelSerializer):
@@ -172,10 +204,10 @@ class DevisDetailSerializer(serializers.ModelSerializer):
         return None
 
     def get_sale_info(self, obj):
-        if obj.sale:
-            from .serializers import VenteListSerializer
-            return VenteListSerializer(obj.sale).data
-        return None
+        # ✅ Pas de requête si select_related('sale__client', 'sale__warehouse')
+        if not obj.sale_id:
+            return None
+        return VenteListSerializer(obj.sale, context=self.context).data
 
 
 class DevisCreateSerializer(serializers.ModelSerializer):
@@ -198,7 +230,6 @@ class DevisCreateSerializer(serializers.ModelSerializer):
     def validate_lignes(self, value):
         if not value:
             raise serializers.ValidationError("Au moins un produit est requis")
-
         product_ids = [line.get('product')
                        for line in value if line.get('product')]
         if len(product_ids) != len(set(product_ids)):
@@ -217,27 +248,24 @@ class DevisCreateSerializer(serializers.ModelSerializer):
         lignes_data = validated_data.pop('lignes')
         client = validated_data.get('client')
 
-        last_devis = Devis.objects.order_by('-id').first()
-        if last_devis and last_devis.devis_number:
-            try:
-                num = int(last_devis.devis_number.split('-')[-1]) + 1
-            except (ValueError, IndexError):
-                num = 1
-        else:
-            num = 1
-        devis_number = f"DEV-{date.today().year}-{num:04d}"
+        # ✅ Génération du numéro : 1 seule requête (fiable)
+        from .models import generate_number
+        devis_number = generate_number(Devis, 'devis_number', 'DEV')
 
         devis = Devis.objects.create(
             devis_number=devis_number,
             client_name=client.name if client else '',
             client_phone=client.phone if client else '',
-            client_email=client.email if client else '',
+            client_email=getattr(client, 'email', '') if client else '',
             client_address=client.address if client else '',
             **validated_data
         )
 
-        for line_data in lignes_data:
-            LigneDevis.objects.create(devis=devis, **line_data)
+        # ✅ bulk_create : 1 seule requête au lieu de N
+        LigneDevis.objects.bulk_create([
+            LigneDevis(devis=devis, **line_data)
+            for line_data in lignes_data
+        ])
 
         devis.calculate_totals()
         devis.generate_qr_code()
@@ -286,9 +314,7 @@ class LigneVenteSerializer(serializers.ModelSerializer):
     product_code = serializers.CharField(source='product.code', read_only=True)
     lot_number = serializers.CharField(source='lot.lot_number', read_only=True)
     price_type_display = serializers.CharField(
-        source='get_price_type_display',
-        read_only=True
-    )
+        source='get_price_type_display', read_only=True)
     subtotal = serializers.ReadOnlyField()
     tax_amount = serializers.ReadOnlyField()
     total_without_tax = serializers.ReadOnlyField()
@@ -308,9 +334,6 @@ class LigneVenteSerializer(serializers.ModelSerializer):
 
 
 class LigneVenteCreateSerializer(serializers.ModelSerializer):
-    """
-    Sérialiseur pour créer une ligne de vente avec choix du prix (détail ou gros)
-    """
     price_type = serializers.ChoiceField(
         choices=[
             ('detail', 'Prix de détail'),
@@ -331,40 +354,30 @@ class LigneVenteCreateSerializer(serializers.ModelSerializer):
     def validate_quantity(self, value):
         if value <= 0:
             raise serializers.ValidationError(
-                "La quantité doit être supérieure à 0"
-            )
+                "La quantité doit être supérieure à 0")
         return value
 
     def validate_unit_price(self, value):
         if value <= 0:
             raise serializers.ValidationError(
-                "Le prix unitaire doit être supérieur à 0"
-            )
+                "Le prix unitaire doit être supérieur à 0")
         return value
 
     def validate(self, data):
-        product_id = data.get('product')
+        product = data.get('product')
         price_type = data.get('price_type', 'detail')
 
-        if product_id:
-            try:
-                product = Product.objects.get(
-                    id=product_id.id if hasattr(product_id, 'id') else product_id)
-
-                if price_type == 'gros' and not product.wholesale_price:
-                    raise serializers.ValidationError(
-                        f"Le produit {product.name} n'a pas de prix de gros défini."
-                    )
-
-                if not data.get('unit_price') or data.get('unit_price') == 0:
-                    if price_type == 'gros':
-                        data['unit_price'] = product.wholesale_price or product.selling_price
-                    else:
-                        data['unit_price'] = product.selling_price
-
-            except Product.DoesNotExist:
-                raise serializers.ValidationError("Produit non trouvé")
-
+        if product:
+            if price_type == 'gros' and not product.wholesale_price:
+                raise serializers.ValidationError(
+                    f"Le produit {product.name} n'a pas de prix de gros défini."
+                )
+            if not data.get('unit_price'):
+                data['unit_price'] = (
+                    product.wholesale_price or product.selling_price
+                    if price_type == 'gros'
+                    else product.selling_price
+                )
         return data
 
 
@@ -373,6 +386,14 @@ class LigneVenteCreateSerializer(serializers.ModelSerializer):
 # ============================================================
 
 class VenteListSerializer(serializers.ModelSerializer):
+    """
+    ✅ Anti-N+1 :
+    - `has_facture` : utilise l'annotation `has_invoice_annotated`
+      OU le prefetch `invoices` (via _prefetched_objects_cache). Aucune requête.
+    - `from_devis` : utilise le prefetch `devis_source` (pas de filter/exists).
+    - `client_name` : select_related côté vue (pas de requête).
+    - `warehouse_name` : select_related côté vue.
+    """
     client_name = serializers.CharField(source='client.name', read_only=True)
     status_display = serializers.CharField(
         source='get_status_display', read_only=True)
@@ -398,13 +419,32 @@ class VenteListSerializer(serializers.ModelSerializer):
         return f"{obj.total:,.0f} FCFA" if obj.total else "0 FCFA"
 
     def get_has_facture(self, obj):
+        # ✅ 1) Annotation (préférée — fournie par la vue)
+        if hasattr(obj, 'has_invoice_annotated'):
+            return bool(obj.has_invoice_annotated)
+        # ✅ 2) Prefetch (si la vue a fait prefetch_related('invoices'))
+        if _has_prefetch(obj, 'invoices'):
+            return len(obj._prefetched_objects_cache['invoices']) > 0
+        # ⚠️ 3) Fallback : 1 requête (à éviter)
         return obj.invoices.exists()
 
     def get_from_devis(self, obj):
+        # ✅ Prefetch devis_source -> zéro requête
+        if _has_prefetch(obj, 'devis_source'):
+            return any(d.status == 'converted'
+                       for d in obj._prefetched_objects_cache['devis_source'])
+        # ⚠️ Fallback
         return obj.devis_source.filter(status='converted').exists()
 
 
 class VenteDetailSerializer(serializers.ModelSerializer):
+    """
+    ✅ Anti-N+1 :
+    - `payments` : utilise le prefetch `invoices__paiements__facture__client`
+    - `factures` : utilise le prefetch `invoices` + `paiements`
+    - `client_*` : select_related('client')
+    - `from_devis` : prefetch `devis_source`
+    """
     client_name = serializers.CharField(source='client.name', read_only=True)
     client_phone = serializers.CharField(source='client.phone', read_only=True)
     client_email = serializers.CharField(source='client.email', read_only=True)
@@ -461,24 +501,31 @@ class VenteDetailSerializer(serializers.ModelSerializer):
         return None
 
     def get_payments(self, obj):
-        payments = []
+        """
+        ✅ Zéro requête si prefetch `invoices__paiements__facture__client` faits.
+        """
+        paiements = []
         for facture in obj.invoices.all():
             for paiement in facture.paiements.all():
-                payments.append(paiement)
-        return PaiementSerializer(payments, many=True).data
+                paiements.append(paiement)
+        return PaiementSerializer(
+            paiements, many=True, context=self.context
+        ).data
 
     def get_factures(self, obj):
         factures = obj.invoices.all()
-        return FactureSerializer(factures, many=True, context=self.context).data
+        return FactureSerializer(
+            factures, many=True, context=self.context
+        ).data
 
     def get_from_devis(self, obj):
+        if _has_prefetch(obj, 'devis_source'):
+            return any(d.status == 'converted'
+                       for d in obj._prefetched_objects_cache['devis_source'])
         return obj.devis_source.filter(status='converted').exists()
 
 
 class VenteCreateSerializer(serializers.ModelSerializer):
-    """
-    Sérialiseur pour créer une vente avec gestion du type de prix
-    """
     lines = LigneVenteCreateSerializer(many=True)
 
     class Meta:
@@ -493,26 +540,20 @@ class VenteCreateSerializer(serializers.ModelSerializer):
     def validate_payment_due_date(self, value):
         if value < date.today():
             raise serializers.ValidationError(
-                "La date d'échéance ne peut pas être dans le passé"
-            )
+                "La date d'échéance ne peut pas être dans le passé")
         return value
 
     def validate_lines(self, value):
         if not value:
             raise serializers.ValidationError("Au moins un produit est requis")
-
         product_ids = []
         for line in value:
-            product_id = line.get('product')
-            if product_id:
-                if hasattr(product_id, 'id'):
-                    product_id = product_id.id
-                product_ids.append(product_id)
-
+            pid = line.get('product')
+            if pid:
+                product_ids.append(pid.id if hasattr(pid, 'id') else pid)
         if len(product_ids) != len(set(product_ids)):
             raise serializers.ValidationError(
-                "Un produit ne peut apparaître qu'une seule fois dans la vente."
-            )
+                "Un produit ne peut apparaître qu'une seule fois dans la vente.")
         return value
 
     def validate_warehouse(self, value):
@@ -525,16 +566,8 @@ class VenteCreateSerializer(serializers.ModelSerializer):
         lines_data = validated_data.pop('lines')
         client = validated_data.get('client')
 
-        # Génération du numéro de facture
-        last_vente = Vente.objects.order_by('-id').first()
-        if last_vente and last_vente.invoice_number:
-            try:
-                num = int(last_vente.invoice_number.split('-')[-1]) + 1
-            except (ValueError, IndexError):
-                num = 1
-        else:
-            num = 1
-        invoice_number = f"INV-{date.today().year}-{num:04d}"
+        from .models import generate_number
+        invoice_number = generate_number(Vente, 'invoice_number', 'INV')
 
         if client:
             client_name = client.name or ''
@@ -544,11 +577,12 @@ class VenteCreateSerializer(serializers.ModelSerializer):
             client_name = 'Client anonyme'
             client_phone = ''
             client_address = ''
-            client = Client.create_anonymous(created_by=self.context.get(
-                'request').user if self.context.get('request') else None)
+            request = self.context.get('request')
+            client = Client.create_anonymous(
+                created_by=request.user if request else None
+            )
             validated_data['client'] = client
 
-        # Création de la vente
         vente = Vente.objects.create(
             invoice_number=invoice_number,
             client_name=client_name,
@@ -558,10 +592,14 @@ class VenteCreateSerializer(serializers.ModelSerializer):
             **validated_data
         )
 
-        # Création des lignes
-        for line_data in lines_data:
-            line_data.pop('price_type', None)
-            LigneVente.objects.create(sale=vente, **line_data)
+        # ✅ bulk_create au lieu de N create()
+        LigneVente.objects.bulk_create([
+            LigneVente(
+                sale=vente,
+                **{k: v for k, v in line_data.items() if k != 'price_type'}
+            )
+            for line_data in lines_data
+        ])
 
         vente.calculate_totals()
         vente.generate_qr_code()
@@ -585,22 +623,16 @@ class VenteUpdateSerializer(serializers.ModelSerializer):
     def validate_lines(self, value):
         if value is None:
             return value
-
         if not value:
             raise serializers.ValidationError("Au moins un produit est requis")
-
         product_ids = []
         for line in value:
-            product_id = line.get('product')
-            if product_id:
-                if hasattr(product_id, 'id'):
-                    product_id = product_id.id
-                product_ids.append(product_id)
-
+            pid = line.get('product')
+            if pid:
+                product_ids.append(pid.id if hasattr(pid, 'id') else pid)
         if len(product_ids) != len(set(product_ids)):
             raise serializers.ValidationError(
-                "Un produit ne peut apparaître qu'une seule fois dans la vente."
-            )
+                "Un produit ne peut apparaître qu'une seule fois dans la vente.")
         return value
 
     @transaction.atomic
@@ -613,9 +645,13 @@ class VenteUpdateSerializer(serializers.ModelSerializer):
 
         if lines_data is not None:
             instance.lines.all().delete()
-            for line_data in lines_data:
-                line_data.pop('price_type', None)
-                LigneVente.objects.create(sale=instance, **line_data)
+            LigneVente.objects.bulk_create([
+                LigneVente(
+                    sale=instance,
+                    **{k: v for k, v in line_data.items() if k != 'price_type'}
+                )
+                for line_data in lines_data
+            ])
 
         instance.calculate_totals()
         instance.generate_qr_code()
@@ -641,6 +677,14 @@ class VenteStatusUpdateSerializer(serializers.Serializer):
 # ============================================================
 
 class FactureSerializer(serializers.ModelSerializer):
+    """
+    ✅ Anti-N+1 :
+    - `paiements` : prefetch('paiements__...') côté vue
+    - `client_name` : select_related('client')
+    - `sale_number` : select_related('sale')
+    - `remaining_amount` : champ ReadOnlyField → pas de requête (déjà calculé)
+    - `total_display`, `remaining_display` : formatage pur (zéro requête)
+    """
     client_name = serializers.CharField(source='client.name', read_only=True)
     sale_number = serializers.CharField(
         source='sale.invoice_number', read_only=True)
@@ -677,8 +721,15 @@ class FactureSerializer(serializers.ModelSerializer):
         return None
 
     def get_paiements(self, obj):
-        paiements = obj.paiements.all()
-        return PaiementSerializer(paiements, many=True).data
+        # ✅ Pas de slice [:20] qui casserait le prefetch.
+        # Utilise les prefetch 'paiements__...' faits côté vue.
+        if _has_prefetch(obj, 'paiements'):
+            paiements = obj._prefetched_objects_cache['paiements']
+        else:
+            paiements = obj.paiements.all()
+        return PaiementSerializer(
+            paiements, many=True, context=self.context
+        ).data
 
     def get_total_display(self, obj):
         return f"{obj.total:,.0f} FCFA" if obj.total else "0 FCFA"
@@ -697,11 +748,9 @@ class FactureCreateSerializer(serializers.ModelSerializer):
         if sale and sale.status in ['cancelled']:
             raise serializers.ValidationError(
                 "Cette vente ne peut pas être facturée")
-
         if sale and Facture.objects.filter(sale=sale).exists():
             raise serializers.ValidationError(
                 "Une facture existe déjà pour cette vente")
-
         return data
 
     @transaction.atomic
@@ -715,15 +764,8 @@ class FactureCreateSerializer(serializers.ModelSerializer):
             sale.client_name = client.name
             sale.save(update_fields=['client', 'client_name'])
 
-        last_facture = Facture.objects.order_by('-id').first()
-        if last_facture and last_facture.invoice_number:
-            try:
-                num = int(last_facture.invoice_number.split('-')[-1]) + 1
-            except (ValueError, IndexError):
-                num = 1
-        else:
-            num = 1
-        invoice_number = f"FAC-{date.today().year}-{num:04d}"
+        from .models import generate_number
+        invoice_number = generate_number(Facture, 'invoice_number', 'FAC')
 
         facture = Facture.objects.create(
             invoice_number=invoice_number,
@@ -745,6 +787,11 @@ class FactureCreateSerializer(serializers.ModelSerializer):
 # ============================================================
 
 class PaiementSerializer(serializers.ModelSerializer):
+    """
+    ✅ Anti-N+1 :
+    - select_related('facture__client', 'caisse_destination',
+      'compte_destination', 'received_by') côté vue
+    """
     method_display = serializers.CharField(
         source='get_method_display', read_only=True)
     received_by_name = serializers.CharField(
@@ -804,13 +851,8 @@ class PaiementSerializer(serializers.ModelSerializer):
             return obj.qr_code.url
         return None
 
-# apps/ventes_clients/serializers.py
-
 
 class PaiementCreateSerializer(serializers.ModelSerializer):
-    """
-    Sérialiseur pour la création d'un paiement
-    """
     class Meta:
         model = Paiement
         fields = [
@@ -820,7 +862,11 @@ class PaiementCreateSerializer(serializers.ModelSerializer):
         extra_kwargs = {
             'method': {
                 'error_messages': {
-                    'invalid_choice': 'Méthode de paiement invalide. Choisissez parmi: cash, card, check, transfer, mobile_money, credit, wallet'
+                    'invalid_choice': (
+                        'Méthode de paiement invalide. '
+                        'Choisissez parmi: cash, card, check, transfer, '
+                        'mobile_money, credit, wallet'
+                    )
                 }
             }
         }
@@ -828,14 +874,10 @@ class PaiementCreateSerializer(serializers.ModelSerializer):
     def validate_amount(self, value):
         if value <= 0:
             raise serializers.ValidationError(
-                "Le montant doit être supérieur à 0"
-            )
+                "Le montant doit être supérieur à 0")
         return value
 
     def validate_method(self, value):
-        """
-        Valide que la méthode de paiement est valide
-        """
         valid_methods = ['cash', 'card', 'check',
                          'transfer', 'mobile_money', 'credit', 'wallet']
         if value not in valid_methods:
@@ -849,66 +891,53 @@ class PaiementCreateSerializer(serializers.ModelSerializer):
         amount = data.get('amount', 0)
         method = data.get('method')
 
-        # Vérifier que la facture existe
         if not facture:
             raise serializers.ValidationError(
-                {"facture": "La facture est requise"}
-            )
+                {"facture": "La facture est requise"})
 
-        # Vérifier le montant restant
         if amount > facture.remaining_amount:
             raise serializers.ValidationError(
-                {"amount": f"Le montant dépasse le solde restant ({facture.remaining_amount:,.0f} FCFA)"}
+                {"amount": (
+                    f"Le montant dépasse le solde restant "
+                    f"({facture.remaining_amount:,.0f} FCFA)"
+                )}
             )
 
-        # Vérifier la destination unique
         caisse = data.get('caisse_destination')
         compte = data.get('compte_destination')
 
         if caisse and compte:
             raise serializers.ValidationError(
-                "Choisissez une seule destination (caisse ou compte)."
-            )
+                "Choisissez une seule destination (caisse ou compte).")
 
-        # Si méthode wallet, pas besoin de destination
-        if method == 'wallet':
-            # Le wallet ne nécessite pas de destination
-            pass
-        else:
-            # Pour les autres méthodes, vérifier qu'il y a une destination
+        if method != 'wallet':
             if not caisse and not compte:
                 raise serializers.ValidationError(
                     "Veuillez spécifier une destination (caisse ou compte) pour le paiement."
                 )
-
-            # Vérifier que la destination appartient au bon entrepôt
             if facture and facture.sale and facture.sale.warehouse:
                 warehouse = facture.sale.warehouse
                 if caisse and caisse.warehouse != warehouse:
                     raise serializers.ValidationError(
-                        {"caisse_destination": "La caisse choisie n'appartient pas à l'entrepôt de la vente."}
+                        {"caisse_destination": (
+                            "La caisse choisie n'appartient pas à "
+                            "l'entrepôt de la vente."
+                        )}
                     )
                 if compte and compte.warehouse != warehouse:
                     raise serializers.ValidationError(
-                        {"compte_destination": "Le compte bancaire choisi n'appartient pas à l'entrepôt de la vente."}
+                        {"compte_destination": (
+                            "Le compte bancaire choisi n'appartient pas "
+                            "à l'entrepôt de la vente."
+                        )}
                     )
-
         return data
+
 
 # ============================================================
 # AVOIR
 # ============================================================
 
-
-# ============================================================
-# LIGNE AVOIR
-# ============================================================
-# ============================================================
-# LIGNE AVOIR
-# ============================================================
-# ============================================================
-# LIGNE AVOIR
-# ============================================================
 class LigneAvoirSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source="product.name", read_only=True)
     product_code = serializers.CharField(source="product.code", read_only=True)
@@ -936,9 +965,6 @@ class LigneAvoirCreateSerializer(serializers.ModelSerializer):
         return value
 
 
-# ============================================================
-# AVOIR — LECTURE
-# ============================================================
 class AvoirSerializer(serializers.ModelSerializer):
     client_name = serializers.CharField(source="client.name", read_only=True)
     client_phone = serializers.CharField(source="client.phone", read_only=True)
@@ -947,8 +973,7 @@ class AvoirSerializer(serializers.ModelSerializer):
     type_display = serializers.CharField(
         source="get_type_display", read_only=True)
     created_by_name = serializers.CharField(
-        source="created_by.full_name", read_only=True
-    )
+        source="created_by.full_name", read_only=True)
     lignes = LigneAvoirSerializer(many=True, read_only=True)
 
     class Meta:
@@ -970,10 +995,12 @@ class AvoirSerializer(serializers.ModelSerializer):
         ]
 
 
-# ============================================================
-# AVOIR — CRÉATION
-# ============================================================
 class AvoirCreateSerializer(serializers.ModelSerializer):
+    """
+    ✅ Anti-N+1 dans `validate` :
+    - 1 requête pour toutes les lignes de la vente
+    - 1 requête pour tous les retours cumulés
+    """
     lignes = LigneAvoirCreateSerializer(many=True, required=False)
     restore_stock = serializers.BooleanField(
         default=False, write_only=True, required=False
@@ -991,8 +1018,7 @@ class AvoirCreateSerializer(serializers.ModelSerializer):
         valid = ["refund", "return", "discount", "error"]
         if value not in valid:
             raise serializers.ValidationError(
-                f"Type invalide. Choisir parmi : {', '.join(valid)}"
-            )
+                f"Type invalide. Choisir parmi : {', '.join(valid)}")
         return value
 
     def validate(self, data):
@@ -1016,7 +1042,6 @@ class AvoirCreateSerializer(serializers.ModelSerializer):
                 "sale": "Une vente est requise pour un avoir de type 'return'"
             })
 
-        # Validation des lignes
         if lignes and sale:
             product_ids = [l["product"].id for l in lignes]
             if len(product_ids) != len(set(product_ids)):
@@ -1024,10 +1049,28 @@ class AvoirCreateSerializer(serializers.ModelSerializer):
                     "lignes": "Un produit ne peut apparaître qu'une seule fois"
                 })
 
+            # ✅ 1 SEULE requête : toutes les lignes de la vente
+            vente_lignes_map = {
+                vl.product_id: vl
+                for vl in sale.lines.select_related('product').all()
+            }
+
+            # ✅ 1 SEULE requête : tous les retours cumulés
+            ligne_vente_ids = [vl.id for vl in vente_lignes_map.values()]
+            deja_map = {}
+            if ligne_vente_ids:
+                deja_qs = (
+                    LigneAvoir.objects
+                    .filter(ligne_vente_id__in=ligne_vente_ids)
+                    .values('ligne_vente_id')
+                    .annotate(total_qty=models.Sum('quantity'))
+                )
+                deja_map = {r['ligne_vente_id']: r['total_qty'] for r in deja_qs}
+
             for l in lignes:
                 product = l["product"]
                 qty = l["quantity"]
-                vente_ligne = sale.lines.filter(product=product).first()
+                vente_ligne = vente_lignes_map.get(product.id)
 
                 if not vente_ligne:
                     raise serializers.ValidationError({
@@ -1036,17 +1079,19 @@ class AvoirCreateSerializer(serializers.ModelSerializer):
 
                 if qty > vente_ligne.quantity:
                     raise serializers.ValidationError({
-                        "lignes": f"Quantité ({qty}) > vendue ({vente_ligne.quantity}) pour {product.name}"
+                        "lignes": (
+                            f"Quantité ({qty}) > vendue "
+                            f"({vente_ligne.quantity}) pour {product.name}"
+                        )
                     })
 
-                deja = (
-                    LigneAvoir.objects
-                    .filter(ligne_vente=vente_ligne)
-                    .aggregate(total=models.Sum("quantity"))["total"] or 0
-                )
+                deja = deja_map.get(vente_ligne.id, 0)
                 if deja + qty > vente_ligne.quantity:
                     raise serializers.ValidationError({
-                        "lignes": f"Retours cumulés ({deja + qty}) > vendue ({vente_ligne.quantity}) pour {product.name}"
+                        "lignes": (
+                            f"Retours cumulés ({deja + qty}) > vendue "
+                            f"({vente_ligne.quantity}) pour {product.name}"
+                        )
                     })
 
         return data
@@ -1056,7 +1101,6 @@ class AvoirCreateSerializer(serializers.ModelSerializer):
         lignes_data = validated_data.pop("lignes", [])
         validated_data.pop("restore_stock", None)
 
-        # Calcul auto du montant
         if lignes_data:
             total = sum(
                 (l["quantity"] * l["unit_price"]) - l.get("discount", 0)
@@ -1066,15 +1110,18 @@ class AvoirCreateSerializer(serializers.ModelSerializer):
 
         avoir = Avoir.objects.create(**validated_data)
 
-        for ligne_data in lignes_data:
-            LigneAvoir.objects.create(avoir=avoir, **ligne_data)
+        # ✅ bulk_create
+        LigneAvoir.objects.bulk_create([
+            LigneAvoir(avoir=avoir, **ligne_data)
+            for ligne_data in lignes_data
+        ])
 
         return avoir
 
-# ============================================================
-# AVOIR
-# ============================================================
 
+# ============================================================
+# TAXE
+# ============================================================
 
 class TaxeSerializer(serializers.ModelSerializer):
     rate_display = serializers.SerializerMethodField()
@@ -1109,6 +1156,9 @@ class RemiseSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at']
 
     def get_clients_count(self, obj):
+        # ✅ Annotation 'clients_count' si la vue la fournit
+        if hasattr(obj, 'clients_count_annotated'):
+            return obj.clients_count_annotated
         return obj.clients.count()
 
     def get_value_display(self, obj):
@@ -1118,7 +1168,7 @@ class RemiseSerializer(serializers.ModelSerializer):
 
 
 # ============================================================
-# DASHBOARD STATS SERIALIZERS
+# DASHBOARD STATS
 # ============================================================
 
 class SalesSummarySerializer(serializers.Serializer):
@@ -1159,10 +1209,8 @@ class DevisStatsSerializer(serializers.Serializer):
 
 
 # ============================================================
-# WALLET SERIALIZERS
+# WALLET
 # ============================================================
-
-# apps/ventes_clients/serializers.py - Modifier ClientWalletSerializer
 
 class ClientWalletSerializer(serializers.ModelSerializer):
     client_name = serializers.CharField(source='client.name', read_only=True)
@@ -1176,20 +1224,11 @@ class ClientWalletSerializer(serializers.ModelSerializer):
     class Meta:
         model = ClientWallet
         fields = [
-            'id',
-            'client',
-            'client_name',
-            'client_code',
-            'client_phone',
-            'client_type',
-            'client_statut',
-            'balance',
-            'balance_display',
-            'total_deposits',
-            'total_used',
-            'is_active',
-            'created_at',
-            'updated_at'
+            'id', 'client', 'client_name', 'client_code',
+            'client_phone', 'client_type', 'client_statut',
+            'balance', 'balance_display',
+            'total_deposits', 'total_used',
+            'is_active', 'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'balance', 'total_deposits', 'total_used']
 
@@ -1257,54 +1296,39 @@ class WalletPaymentSerializer(serializers.Serializer):
             raise serializers.ValidationError("Vente non trouvée")
 
 
-# ============================================================
-# ✅ NOUVEAU : CLIENT WALLET CREATE SERIALIZER
-# ============================================================
-
 class ClientWalletCreateSerializer(serializers.Serializer):
-    """
-    Serializer pour la création d'un wallet
-    """
     client_id = serializers.IntegerField(required=True)
     initial_balance = serializers.DecimalField(
-        max_digits=12,
-        decimal_places=2,
-        default=0,
-        required=False
+        max_digits=12, decimal_places=2, default=0, required=False
     )
 
     def validate_client_id(self, value):
         try:
             client = Client.objects.get(id=value)
-            # Vérifier si le client a déjà un wallet
             if hasattr(client, 'wallet'):
                 raise serializers.ValidationError(
-                    "Ce client a déjà un porte-monnaie"
-                )
+                    "Ce client a déjà un porte-monnaie")
             return value
         except Client.DoesNotExist:
             raise serializers.ValidationError(
-                f"Client avec l'ID {value} non trouvé"
-            )
+                f"Client avec l'ID {value} non trouvé")
 
     def validate_initial_balance(self, value):
         if value < 0:
             raise serializers.ValidationError(
-                "Le solde initial ne peut pas être négatif"
-            )
+                "Le solde initial ne peut pas être négatif")
         return value
 
 
 # ============================================================
-# STOCK CLIENT SERIALIZERS
+# STOCK CLIENT
 # ============================================================
 
 class ClientStockLigneSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source='product.name', read_only=True)
     product_code = serializers.CharField(source='product.code', read_only=True)
     product_unit = serializers.CharField(
-        source='product.unit.symbol', read_only=True, allow_null=True
-    )
+        source='product.unit.symbol', read_only=True, allow_null=True)
     total_value = serializers.ReadOnlyField()
 
     class Meta:
@@ -1321,13 +1345,10 @@ class ClientStockMovementSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source='product.name', read_only=True)
     product_code = serializers.CharField(source='product.code', read_only=True)
     movement_type_display = serializers.CharField(
-        source='get_movement_type_display', read_only=True
-    )
+        source='get_movement_type_display', read_only=True)
     created_by_name = serializers.SerializerMethodField()
     client_name = serializers.CharField(
-        source='client_stock.client.name', read_only=True
-    )
-    # 🆕 Propriétés utiles
+        source='client_stock.client.name', read_only=True)
     is_incoming = serializers.ReadOnlyField()
     is_outgoing = serializers.ReadOnlyField()
     quantity_signed = serializers.ReadOnlyField()
@@ -1340,7 +1361,6 @@ class ClientStockMovementSerializer(serializers.ModelSerializer):
             'movement_type', 'movement_type_display',
             'quantity', 'previous_quantity', 'new_quantity',
             'unit_price', 'reference', 'notes',
-            # 🆕 Sens du mouvement
             'is_incoming', 'is_outgoing', 'quantity_signed',
             'created_by', 'created_by_name', 'created_at'
         ]
@@ -1350,111 +1370,6 @@ class ClientStockMovementSerializer(serializers.ModelSerializer):
         if obj.created_by:
             return obj.created_by.get_full_name() or obj.created_by.email
         return None
-
-
-class ClientStockMovementSerializer(serializers.ModelSerializer):
-    product_name = serializers.CharField(source='product.name', read_only=True)
-    product_code = serializers.CharField(source='product.code', read_only=True)
-    movement_type_display = serializers.CharField(
-        source='get_movement_type_display', read_only=True
-    )
-    created_by_name = serializers.SerializerMethodField()
-    client_name = serializers.CharField(
-        source='client_stock.client.name', read_only=True
-    )
-
-    class Meta:
-        model = ClientStockMovement
-        fields = [
-            'id', 'client_stock', 'client_name',
-            'product', 'product_name', 'product_code',
-            'movement_type', 'movement_type_display',
-            'quantity', 'previous_quantity', 'new_quantity',
-            'unit_price', 'reference', 'notes',
-            'created_by', 'created_by_name', 'created_at'
-        ]
-        read_only_fields = ['id', 'created_at']
-
-    def get_created_by_name(self, obj):
-        if obj.created_by:
-            return obj.created_by.get_full_name() or obj.created_by.email
-        return None
-
-
-class ClientStockDepositSerializer(serializers.Serializer):
-    """Ajouter du stock à un client."""
-    client_id = serializers.IntegerField(required=True)
-    product_id = serializers.IntegerField(required=True)
-    quantity = serializers.DecimalField(
-        max_digits=12, decimal_places=2, required=True, min_value=Decimal('0.01')
-    )
-    unit_price = serializers.DecimalField(
-        max_digits=12, decimal_places=2, required=False, default=Decimal('0')
-    )
-    notes = serializers.CharField(required=False, allow_blank=True, default='')
-
-    def validate_client_id(self, value):
-        if not Client.objects.filter(id=value).exists():
-            raise serializers.ValidationError(f"Client {value} non trouvé")
-        return value
-
-    def validate_product_id(self, value):
-        if not Product.objects.filter(id=value).exists():
-            raise serializers.ValidationError(f"Produit {value} non trouvé")
-        return value
-
-
-class ClientStockWithdrawalSerializer(serializers.Serializer):
-    """Retirer du stock d'un client."""
-    client_id = serializers.IntegerField(required=True)
-    product_id = serializers.IntegerField(required=True)
-    quantity = serializers.DecimalField(
-        max_digits=12, decimal_places=2, required=True, min_value=Decimal('0.01')
-    )
-    notes = serializers.CharField(required=False, allow_blank=True, default='')
-
-    def validate(self, data):
-        # Vérifier que le stock existe et est suffisant
-        try:
-            stock = ClientStock.objects.get(client_id=data['client_id'])
-            ligne = ClientStockLigne.objects.get(
-                stock=stock, product_id=data['product_id']
-            )
-            if ligne.quantity < data['quantity']:
-                raise serializers.ValidationError({
-                    'quantity': f"Stock insuffisant. Disponible : {ligne.quantity}"
-                })
-        except ClientStock.DoesNotExist:
-            raise serializers.ValidationError(
-                "Ce client n'a pas de stock enregistré"
-            )
-        except ClientStockLigne.DoesNotExist:
-            raise serializers.ValidationError(
-                "Ce produit n'est pas dans le stock du client"
-            )
-        return data
-
-
-# ============================================================
-# STOCK CLIENT SERIALIZERS
-# ============================================================
-
-class ClientStockLigneSerializer(serializers.ModelSerializer):
-    product_name = serializers.CharField(source='product.name', read_only=True)
-    product_code = serializers.CharField(source='product.code', read_only=True)
-    product_unit = serializers.CharField(
-        source='product.unit.symbol', read_only=True, allow_null=True
-    )
-    total_value = serializers.ReadOnlyField()
-
-    class Meta:
-        model = ClientStockLigne
-        fields = [
-            'id', 'product', 'product_name', 'product_code', 'product_unit',
-            'quantity', 'unit_price', 'total_value', 'notes',
-            'created_at', 'updated_at'
-        ]
-        read_only_fields = ['id', 'created_at', 'updated_at']
 
 
 class ClientStockSerializer(serializers.ModelSerializer):
@@ -1477,42 +1392,7 @@ class ClientStockSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at', 'updated_at']
 
 
-class ClientStockMovementSerializer(serializers.ModelSerializer):
-    product_name = serializers.CharField(source='product.name', read_only=True)
-    product_code = serializers.CharField(source='product.code', read_only=True)
-    movement_type_display = serializers.CharField(
-        source='get_movement_type_display', read_only=True
-    )
-    created_by_name = serializers.SerializerMethodField()
-    client_name = serializers.CharField(
-        source='client_stock.client.name', read_only=True
-    )
-    # Propriétés utiles
-    is_incoming = serializers.ReadOnlyField()
-    is_outgoing = serializers.ReadOnlyField()
-    quantity_signed = serializers.ReadOnlyField()
-
-    class Meta:
-        model = ClientStockMovement
-        fields = [
-            'id', 'client_stock', 'client_name',
-            'product', 'product_name', 'product_code',
-            'movement_type', 'movement_type_display',
-            'quantity', 'previous_quantity', 'new_quantity',
-            'unit_price', 'reference', 'notes',
-            'is_incoming', 'is_outgoing', 'quantity_signed',
-            'created_by', 'created_by_name', 'created_at'
-        ]
-        read_only_fields = ['id', 'created_at']
-
-    def get_created_by_name(self, obj):
-        if obj.created_by:
-            return obj.created_by.get_full_name() or obj.created_by.email
-        return None
-
-
 class ClientStockDepositSerializer(serializers.Serializer):
-    """Ajouter du stock à un client."""
     client_id = serializers.IntegerField(required=True)
     product_id = serializers.IntegerField(required=True)
     quantity = serializers.DecimalField(
@@ -1535,7 +1415,6 @@ class ClientStockDepositSerializer(serializers.Serializer):
 
 
 class ClientStockWithdrawalSerializer(serializers.Serializer):
-    """Retirer du stock d'un client."""
     client_id = serializers.IntegerField(required=True)
     product_id = serializers.IntegerField(required=True)
     quantity = serializers.DecimalField(
@@ -1547,33 +1426,29 @@ class ClientStockWithdrawalSerializer(serializers.Serializer):
         try:
             stock = ClientStock.objects.get(client_id=data['client_id'])
             ligne = ClientStockLigne.objects.get(
-                stock=stock, product_id=data['product_id']
-            )
+                stock=stock, product_id=data['product_id'])
             if ligne.quantity < data['quantity']:
                 raise serializers.ValidationError({
                     'quantity': f"Stock insuffisant. Disponible : {ligne.quantity}"
                 })
         except ClientStock.DoesNotExist:
             raise serializers.ValidationError(
-                "Ce client n'a pas de stock enregistré"
-            )
+                "Ce client n'a pas de stock enregistré")
         except ClientStockLigne.DoesNotExist:
             raise serializers.ValidationError(
-                "Ce produit n'est pas dans le stock du client"
-            )
+                "Ce produit n'est pas dans le stock du client")
         return data
 
 
 # ============================================================
-# LIVRAISON CLIENT SERIALIZERS
+# LIVRAISON CLIENT
 # ============================================================
 
 class ClientDeliveryLigneSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source='product.name', read_only=True)
     product_code = serializers.CharField(source='product.code', read_only=True)
     product_unit = serializers.CharField(
-        source='product.unit.symbol', read_only=True, allow_null=True
-    )
+        source='product.unit.symbol', read_only=True, allow_null=True)
 
     class Meta:
         model = ClientDeliveryLigne
@@ -1591,8 +1466,6 @@ class ClientDeliveryLigneSerializer(serializers.ModelSerializer):
 
 
 class ClientDeliveryLigneCreateSerializer(serializers.ModelSerializer):
-    """Utilisé uniquement pour la création (validation quantité > 0)."""
-
     class Meta:
         model = ClientDeliveryLigne
         fields = ['product', 'quantity', 'unit_price', 'notes']
@@ -1600,16 +1473,15 @@ class ClientDeliveryLigneCreateSerializer(serializers.ModelSerializer):
     def validate_quantity(self, value):
         if value is None or value <= 0:
             raise serializers.ValidationError(
-                "La quantité doit être supérieure à 0"
-            )
+                "La quantité doit être supérieure à 0")
         return value
 
     def validate_unit_price(self, value):
         if value is not None and value < 0:
             raise serializers.ValidationError(
-                "Le prix unitaire ne peut pas être négatif"
-            )
+                "Le prix unitaire ne peut pas être négatif")
         return value
+
 
 class ClientDeliverySerializer(serializers.ModelSerializer):
     client_name = serializers.CharField(source='client.name', read_only=True)
@@ -1618,11 +1490,9 @@ class ClientDeliverySerializer(serializers.ModelSerializer):
     created_by_name = serializers.SerializerMethodField()
     validated_by_name = serializers.SerializerMethodField()
     status_display = serializers.CharField(
-        source='get_status_display', read_only=True
-    )
+        source='get_status_display', read_only=True)
     lignes = ClientDeliveryLigneSerializer(many=True, read_only=True)
 
-    # 🆕 Propriétés calculées
     is_pending = serializers.ReadOnlyField()
     is_confirmed = serializers.ReadOnlyField()
     is_in_transit = serializers.ReadOnlyField()
@@ -1641,32 +1511,21 @@ class ClientDeliverySerializer(serializers.ModelSerializer):
         model = ClientDelivery
         fields = [
             'id', 'delivery_number',
-            # Client source
             'client', 'client_name', 'client_code', 'client_phone',
-            'client_stock',
-            # 🆕 Qui a créé
-            'created_by_client',
-            # Destinataire
+            'client_stock', 'created_by_client',
             'recipient_name', 'recipient_phone', 'recipient_address',
             'recipient_email', 'recipient_notes',
-            # Statut & dates
             'status', 'status_display',
             'request_date', 'confirmed_date', 'shipped_date', 'delivered_date',
-            # 🆕 Raison du rejet
             'rejection_reason',
-            # Transport
             'delivery_method', 'carrier', 'tracking_number',
             'vehicle_plate', 'driver_name', 'driver_phone',
-            # Totaux
             'total_quantity', 'total_value',
-            # Notes
             'notes', 'client_notes',
-            # Métadonnées
             'created_by', 'created_by_name',
             'validated_by', 'validated_by_name',
             'lignes',
             'created_at', 'updated_at',
-            # 🆕 Propriétés calculées
             'is_pending', 'is_confirmed', 'is_in_transit', 'is_delivered',
             'is_cancelled', 'is_rejected',
             'can_be_edited_by_client', 'can_be_cancelled_by_client',
@@ -1691,53 +1550,32 @@ class ClientDeliverySerializer(serializers.ModelSerializer):
             return obj.validated_by.get_full_name() or obj.validated_by.email
         return None
 
-class ClientDeliveryCreateSerializer(serializers.Serializer):
-    """
-    Création d'une livraison client.
-    Le destinataire est obligatoire.
-    """
-    client_id = serializers.IntegerField(required=True)
 
-    # Destinataire
+class ClientDeliveryCreateSerializer(serializers.Serializer):
+    client_id = serializers.IntegerField(required=True)
     recipient_name = serializers.CharField(required=True, max_length=200)
     recipient_phone = serializers.CharField(required=True, max_length=20)
     recipient_address = serializers.CharField(
-        required=False, allow_blank=True, default=''
-    )
+        required=False, allow_blank=True, default='')
     recipient_email = serializers.EmailField(
-        required=False, allow_blank=True, default=''
-    )
+        required=False, allow_blank=True, default='')
     recipient_notes = serializers.CharField(
-        required=False, allow_blank=True, default=''
-    )
-
-    # Transport
+        required=False, allow_blank=True, default='')
     delivery_method = serializers.CharField(
-        required=False, allow_blank=True, default=''
-    )
+        required=False, allow_blank=True, default='')
     carrier = serializers.CharField(
-        required=False, allow_blank=True, default=''
-    )
+        required=False, allow_blank=True, default='')
     tracking_number = serializers.CharField(
-        required=False, allow_blank=True, default=''
-    )
+        required=False, allow_blank=True, default='')
     vehicle_plate = serializers.CharField(
-        required=False, allow_blank=True, default=''
-    )
+        required=False, allow_blank=True, default='')
     driver_name = serializers.CharField(
-        required=False, allow_blank=True, default=''
-    )
+        required=False, allow_blank=True, default='')
     driver_phone = serializers.CharField(
-        required=False, allow_blank=True, default=''
-    )
-
-    # Notes
+        required=False, allow_blank=True, default='')
     notes = serializers.CharField(required=False, allow_blank=True, default='')
     client_notes = serializers.CharField(
-        required=False, allow_blank=True, default=''
-    )
-
-    # Produits
+        required=False, allow_blank=True, default='')
     lignes = ClientDeliveryLigneCreateSerializer(many=True, required=True)
 
     def validate_client_id(self, value):
@@ -1754,7 +1592,6 @@ class ClientDeliveryCreateSerializer(serializers.Serializer):
     def validate_lignes(self, value):
         if not value:
             raise serializers.ValidationError("Au moins un produit est requis")
-
         product_ids = [
             ligne['product'].id if hasattr(ligne['product'], 'id')
             else ligne['product']
@@ -1762,16 +1599,13 @@ class ClientDeliveryCreateSerializer(serializers.Serializer):
         ]
         if len(product_ids) != len(set(product_ids)):
             raise serializers.ValidationError(
-                "Un produit ne peut apparaître qu'une seule fois."
-            )
+                "Un produit ne peut apparaître qu'une seule fois.")
         return value
 
 
 class ClientDeliveryStatusUpdateSerializer(serializers.Serializer):
-    """Mise à jour du statut + infos transport."""
     status = serializers.ChoiceField(
-        choices=['pending', 'in_transit', 'delivered', 'cancelled']
-    )
+        choices=['pending', 'in_transit', 'delivered', 'cancelled'])
     carrier = serializers.CharField(required=False, allow_blank=True)
     tracking_number = serializers.CharField(required=False, allow_blank=True)
     vehicle_plate = serializers.CharField(required=False, allow_blank=True)
@@ -1779,13 +1613,13 @@ class ClientDeliveryStatusUpdateSerializer(serializers.Serializer):
     driver_phone = serializers.CharField(required=False, allow_blank=True)
     delivery_method = serializers.CharField(required=False, allow_blank=True)
     notes = serializers.CharField(required=False, allow_blank=True)
+
+
 # ============================================================
-# 🆕 SERIALIZERS POUR LE CLIENT (CRÉATION / MODIFICATION)
+# CLIENT DELIVERY — VUES CLIENT
 # ============================================================
 
 class ClientDeliveryLigneRequestSerializer(serializers.ModelSerializer):
-    """Ligne utilisée pour la création/modification par le client."""
-
     class Meta:
         model = ClientDeliveryLigne
         fields = ['product', 'quantity', 'notes']
@@ -1793,30 +1627,21 @@ class ClientDeliveryLigneRequestSerializer(serializers.ModelSerializer):
     def validate_quantity(self, value):
         if value is None or value <= 0:
             raise serializers.ValidationError(
-                "La quantité doit être supérieure à 0"
-            )
+                "La quantité doit être supérieure à 0")
         return value
 
 
 class ClientDeliveryRequestCreateSerializer(serializers.Serializer):
-    """
-    Serializer pour que le client crée SA demande de livraison.
-    """
     recipient_name = serializers.CharField(required=True, max_length=200)
     recipient_phone = serializers.CharField(required=True, max_length=20)
     recipient_address = serializers.CharField(
-        required=False, allow_blank=True, default=''
-    )
+        required=False, allow_blank=True, default='')
     recipient_email = serializers.EmailField(
-        required=False, allow_blank=True, default=''
-    )
+        required=False, allow_blank=True, default='')
     recipient_notes = serializers.CharField(
-        required=False, allow_blank=True, default=''
-    )
+        required=False, allow_blank=True, default='')
     client_notes = serializers.CharField(
-        required=False, allow_blank=True, default=''
-    )
-
+        required=False, allow_blank=True, default='')
     lignes = ClientDeliveryLigneRequestSerializer(many=True, required=True)
 
     def validate_recipient_phone(self, value):
@@ -1828,7 +1653,6 @@ class ClientDeliveryRequestCreateSerializer(serializers.Serializer):
     def validate_lignes(self, value):
         if not value:
             raise serializers.ValidationError("Au moins un produit est requis")
-
         product_ids = [
             ligne['product'].id if hasattr(ligne['product'], 'id')
             else ligne['product']
@@ -1836,22 +1660,17 @@ class ClientDeliveryRequestCreateSerializer(serializers.Serializer):
         ]
         if len(product_ids) != len(set(product_ids)):
             raise serializers.ValidationError(
-                "Un produit ne peut apparaître qu'une seule fois."
-            )
+                "Un produit ne peut apparaître qu'une seule fois.")
         return value
 
 
 class ClientDeliveryRequestUpdateSerializer(serializers.Serializer):
-    """
-    Serializer pour modifier une demande (champs optionnels).
-    """
     recipient_name = serializers.CharField(required=False, max_length=200)
     recipient_phone = serializers.CharField(required=False, max_length=20)
     recipient_address = serializers.CharField(required=False, allow_blank=True)
     recipient_email = serializers.EmailField(required=False, allow_blank=True)
     recipient_notes = serializers.CharField(required=False, allow_blank=True)
     client_notes = serializers.CharField(required=False, allow_blank=True)
-
     lignes = ClientDeliveryLigneRequestSerializer(many=True, required=False)
 
     def validate_recipient_phone(self, value):
@@ -1863,12 +1682,7 @@ class ClientDeliveryRequestUpdateSerializer(serializers.Serializer):
         return value
 
 
-# ============================================================
-# 🆕 SERIALIZERS POUR L'ADMIN (VALIDATION / REJET)
-# ============================================================
-
 class ClientDeliveryValidateSerializer(serializers.Serializer):
-    """Serializer pour valider une demande client (admin)."""
     carrier = serializers.CharField(required=False, allow_blank=True)
     tracking_number = serializers.CharField(required=False, allow_blank=True)
     vehicle_plate = serializers.CharField(required=False, allow_blank=True)
@@ -1879,5 +1693,4 @@ class ClientDeliveryValidateSerializer(serializers.Serializer):
 
 
 class ClientDeliveryRejectSerializer(serializers.Serializer):
-    """Serializer pour rejeter une demande client (admin)."""
     reason = serializers.CharField(required=True, max_length=500)

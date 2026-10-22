@@ -1,13 +1,16 @@
-from django.shortcuts import render
+import logging
+import datetime as dt                          # ✅ LIGNE À AJOUTER
+from datetime import date, timedelta
+from decimal import Decimal
 
-# Create your views here.
-# apps/finances/views.py
 from rest_framework import viewsets, status, permissions
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from django.db.models import Q, Sum, Count, Avg
+
+from django.db.models import (
+    Q, Sum, Count, Avg, F, ExpressionWrapper, DecimalField
+)
 from django.utils import timezone
-from datetime import date, timedelta
 from django.shortcuts import get_object_or_404
 
 from .models import (
@@ -38,7 +41,8 @@ from .serializers import (
     RapportFinancierSerializer,
     RapportFinancierCreateSerializer,
     ConfigurationFinanciereSerializer,
-    DashboardFinancierSerializer
+    DashboardFinancierSerializer,
+    EcritureComptableLiteSerializer
 )
 from users.permissions import IsAdmin, IsGestionnaire, IsComptable
 
@@ -220,6 +224,8 @@ class EcritureComptableViewSet(viewsets.ModelViewSet):
 # DÉPENSE VIEWSET
 # ============================================================
 
+# apps/finances/views.py - PARTIE DepenseViewSet
+
 class DepenseViewSet(viewsets.ModelViewSet):
     """ViewSet pour la gestion des dépenses"""
     queryset = Depense.objects.all()
@@ -291,23 +297,44 @@ class DepenseViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'])
     def payer(self, request, pk=None):
-        """Marque une dépense comme payée"""
+        """
+        ✅ Marque la dépense payée et déclenche :
+        - Le mouvement de trésorerie (décaissement)
+        - L'écriture comptable automatique
+        """
         depense = self.get_object()
 
-        if depense.statut != 'approuve':
+        if depense.statut == 'paye':
             return Response(
-                {"error": "Seules les dépenses approuvées peuvent être payées"},
+                {"error": "Cette dépense est déjà payée"},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        depense.payer(request.user)
+        if depense.statut not in ['en_attente', 'approuve']:
+            return Response(
+                {"error": f"Impossible de payer une dépense au statut '{depense.get_statut_display()}'"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
-        return Response({
-            'status': depense.statut,
-            'message': 'Dépense marquée comme payée',
-            'reference': depense.reference,
-            'date_paiement': depense.date_paiement
-        })
+        try:
+            result = depense.payer(request.user)
+
+            depense.refresh_from_db()
+
+            return Response({
+                'status': depense.statut,
+                'message': 'Dépense payée — Mouvement et écriture comptable créés',
+                'reference': depense.reference,
+                'date_paiement': depense.date_paiement,
+                'mouvement_id': depense.tresorerie_id,
+                'ecriture_id': depense.ecriture_id,
+                'errors': result.get('errors', []),
+            })
+        except Exception as e:
+            return Response(
+                {"error": f"Erreur lors du paiement : {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
     @action(detail=True, methods=['post'])
     def rejeter(self, request, pk=None):
@@ -321,7 +348,7 @@ class DepenseViewSet(viewsets.ModelViewSet):
             )
 
         depense.statut = 'rejete'
-        depense.save()
+        depense.save(update_fields=['statut', 'updated_at'])
 
         return Response({
             'status': depense.statut,
@@ -329,10 +356,44 @@ class DepenseViewSet(viewsets.ModelViewSet):
             'reference': depense.reference
         })
 
+    @action(detail=True, methods=['post'])
+    def synchroniser(self, request, pk=None):
+        """
+        ✅ Force la synchronisation : crée le mouvement de trésorerie
+        et l'écriture comptable si absents.
+        """
+        depense = self.get_object()
+
+        if depense.statut != 'paye':
+            return Response(
+                {"error": "La dépense doit être payée pour être synchronisée"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            result = depense.creer_mouvement_et_ecriture(request.user)
+            depense.refresh_from_db()
+
+            return Response({
+                'message': 'Synchronisation effectuée',
+                'mouvement_id': depense.tresorerie_id,
+                'ecriture_id': depense.ecriture_id,
+                'errors': result.get('errors', []),
+            })
+        except Exception as e:
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
 # ============================================================
 # BUDGET VIEWSET
 # ============================================================
+
+# ============================================================
+# BUDGET VIEWSET
+# ============================================================
+
 
 class BudgetViewSet(viewsets.ModelViewSet):
     """ViewSet pour la gestion des budgets"""
@@ -340,7 +401,9 @@ class BudgetViewSet(viewsets.ModelViewSet):
     permission_classes = [permissions.IsAuthenticated, IsComptable]
 
     def get_serializer_class(self):
-        if self.action in ['create']:
+        if self.action == 'create':
+            return BudgetCreateSerializer
+        elif self.action in ['update', 'partial_update']:
             return BudgetCreateSerializer
         return BudgetSerializer
 
@@ -378,7 +441,7 @@ class BudgetViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'])
     def update_utilise(self, request, pk=None):
-        """Met à jour le montant utilisé du budget"""
+        """Met à jour le montant utilisé du budget (recalcul depuis les lignes)"""
         budget = self.get_object()
         budget.update_utilise()
 
@@ -388,7 +451,70 @@ class BudgetViewSet(viewsets.ModelViewSet):
             'montant_total': budget.montant_total,
             'montant_utilise': budget.montant_utilise,
             'montant_restant': budget.montant_restant,
-            'pourcentage_utilise': (budget.montant_utilise / budget.montant_total * 100) if budget.montant_total > 0 else 0
+            'pourcentage_utilise': (
+                budget.montant_utilise / budget.montant_total * 100
+            ) if budget.montant_total > 0 else 0
+        })
+
+    @action(detail=True, methods=['get'])
+    def alertes(self, request, pk=None):
+        """Récupère les lignes du budget en alerte (>80%)"""
+        budget = self.get_object()
+        alertes = []
+
+        for ligne in budget.lignes.all():
+            if ligne.montant_prevu > 0:
+                pourcentage = (ligne.montant_utilise /
+                               ligne.montant_prevu) * 100
+                if pourcentage >= 80:
+                    alertes.append({
+                        'ligne_id': ligne.id,
+                        'categorie': ligne.categorie.nom,
+                        'categorie_depense': ligne.categorie.categorie_depense,
+                        'montant_prevu': float(ligne.montant_prevu),
+                        'montant_utilise': float(ligne.montant_utilise),
+                        'montant_restant': float(ligne.montant_restant),
+                        'pourcentage': round(pourcentage, 2),
+                    })
+
+        return Response({
+            'budget_id': budget.id,
+            'budget_nom': budget.nom,
+            'nb_alertes': len(alertes),
+            'alertes': alertes
+        })
+
+    @action(detail=False, methods=['get'])
+    def actifs(self, request):
+        """Liste des budgets actuellement en cours"""
+        today = timezone.now().date()
+        budgets = Budget.objects.filter(
+            statut='en_cours',
+            date_debut__lte=today,
+            date_fin__gte=today
+        )
+        serializer = BudgetSerializer(budgets, many=True)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['post'])
+    def cloturer(self, request, pk=None):
+        """Clôture un budget (le passe en 'termine')"""
+        budget = self.get_object()
+
+        if budget.statut == 'termine':
+            return Response(
+                {"error": "Ce budget est déjà clôturé"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        budget.statut = 'termine'
+        budget.save(update_fields=['statut', 'updated_at'])
+
+        return Response({
+            'status': budget.statut,
+            'message': f'Budget "{budget.nom}" clôturé avec succès',
+            'montant_utilise': budget.montant_utilise,
+            'montant_restant': budget.montant_restant,
         })
 
 
@@ -398,10 +524,34 @@ class BudgetCategorieViewSet(viewsets.ModelViewSet):
     permission_classes = [permissions.IsAuthenticated, IsComptable]
     serializer_class = BudgetCategorieSerializer
 
+    def get_queryset(self):
+        queryset = super().get_queryset()
+
+        search = self.request.query_params.get('search')
+        if search:
+            queryset = queryset.filter(
+                Q(nom__icontains=search) | Q(code__icontains=search)
+            )
+
+        is_active = self.request.query_params.get('is_active')
+        if is_active == 'true':
+            queryset = queryset.filter(is_active=True)
+        elif is_active == 'false':
+            queryset = queryset.filter(is_active=False)
+
+        return queryset
+
+    @action(detail=False, methods=['get'])
+    def non_liees(self, request):
+        """Liste les catégories de budget non liées à une catégorie de dépense"""
+        categories = self.get_queryset().filter(categorie_depense__isnull=True)
+        serializer = self.get_serializer(categories, many=True)
+        return Response(serializer.data)
 
 # ============================================================
 # RAPPORT FINANCIER VIEWSET
 # ============================================================
+
 
 class RapportFinancierViewSet(viewsets.ModelViewSet):
     """ViewSet pour la gestion des rapports financiers"""
@@ -459,6 +609,324 @@ class ConfigurationFinanciereViewSet(viewsets.ModelViewSet):
 # ============================================================
 # DASHBOARD FINANCIER VIEWSET
 # ============================================================
+
+
+# ============================================================
+# JOURNAL COMPTABLE VIEWSET
+# ============================================================
+class JournalComptableViewSet(viewsets.ViewSet):
+    """
+    Journal comptable : liste chronologique de toutes les écritures.
+    ✅ CORRIGÉ : pas de @action sur list()
+    """
+    permission_classes = [permissions.IsAuthenticated, IsComptable]
+
+    def list(self, request):
+        """Liste paginée des écritures comptables."""
+        queryset = (
+            EcritureComptable.objects
+            .select_related('compte_debit', 'compte_credit', 'created_by')
+            .order_by('date_ecriture', 'id')
+        )
+
+        # Filtres
+        date_from = request.query_params.get('date_from')
+        if date_from:
+            try:
+                date_start = dt.datetime.strptime(date_from, '%Y-%m-%d')
+                queryset = queryset.filter(
+                    date_ecriture__gte=date_start.date())
+            except ValueError:
+                pass
+
+        date_to = request.query_params.get('date_to')
+        if date_to:
+            try:
+                date_end = dt.datetime.strptime(date_to, '%Y-%m-%d')
+                queryset = queryset.filter(date_ecriture__lte=date_end.date())
+            except ValueError:
+                pass
+
+        compte = request.query_params.get('compte')
+        if compte:
+            queryset = queryset.filter(
+                Q(compte_debit_id=compte) | Q(compte_credit_id=compte)
+            )
+
+        type_filter = request.query_params.get('type')
+        if type_filter:
+            queryset = queryset.filter(type=type_filter)
+
+        statut = request.query_params.get('statut')
+        if statut:
+            queryset = queryset.filter(statut=statut)
+
+        # Totaux (calculés avant pagination)
+        totals = queryset.aggregate(
+            total_debit=Sum('montant'),
+            total_credit=Sum('montant'),
+        )
+        total_count = queryset.count()
+
+        # Pagination manuelle
+        try:
+            page = max(1, int(request.query_params.get('page', 1)))
+        except (TypeError, ValueError):
+            page = 1
+
+        try:
+            page_size = min(
+                int(request.query_params.get('page_size', 50)), 200
+            )
+        except (TypeError, ValueError):
+            page_size = 50
+
+        start = (page - 1) * page_size
+        end = start + page_size
+        page_qs = queryset[start:end]
+
+        serializer = EcritureComptableLiteSerializer(page_qs, many=True)
+
+        return Response({
+            'count': total_count,
+            'page': page,
+            'page_size': page_size,
+            'total_pages': (total_count + page_size - 1) // page_size,
+            'total_debit': float(totals['total_debit'] or 0),
+            'total_credit': float(totals['total_credit'] or 0),
+            'results': serializer.data,
+        })
+
+
+# ============================================================
+# GRAND LIVRE VIEWSET
+# ============================================================
+class GrandLivreViewSet(viewsets.ViewSet):
+    """
+    Grand livre : détail des mouvements par compte comptable.
+    ✅ CORRIGÉ : pas de @action sur list()
+    """
+    permission_classes = [permissions.IsAuthenticated, IsComptable]
+
+    def list(self, request):
+        """Retourne le grand livre groupé par compte."""
+        compte_id = request.query_params.get('compte')
+        date_from = request.query_params.get('date_from')
+        date_to = request.query_params.get('date_to')
+
+        comptes_qs = CompteComptable.objects.filter(is_active=True)
+
+        if compte_id:
+            comptes_qs = comptes_qs.filter(id=compte_id)
+
+        # Pré-calcul des bornes de date
+        date_start = None
+        date_end = None
+
+        if date_from:
+            try:
+                date_start = dt.datetime.strptime(
+                    date_from, '%Y-%m-%d'
+                ).date()
+            except ValueError:
+                pass
+
+        if date_to:
+            try:
+                date_end = dt.datetime.strptime(date_to, '%Y-%m-%d').date()
+            except ValueError:
+                pass
+
+        result = []
+
+        for compte in comptes_qs.order_by('numero'):
+            # Base : écritures validées
+            base_qs = EcritureComptable.objects.filter(statut='valide')
+
+            if date_start:
+                base_qs = base_qs.filter(date_ecriture__gte=date_start)
+            if date_end:
+                base_qs = base_qs.filter(date_ecriture__lte=date_end)
+
+            # Débits
+            ecritures_debit = list(
+                base_qs.filter(compte_debit=compte)
+                .values('id', 'numero', 'date_ecriture', 'description',
+                        'montant', 'reference')
+            )
+
+            # Crédits
+            ecritures_credit = list(
+                base_qs.filter(compte_credit=compte)
+                .values('id', 'numero', 'date_ecriture', 'description',
+                        'montant', 'reference')
+            )
+
+            mouvements = []
+
+            for e in ecritures_debit:
+                mouvements.append({
+                    'id': e['id'],
+                    'numero': e['numero'],
+                    'date': e['date_ecriture'],
+                    'description': e['description'],
+                    'debit': float(e['montant']),
+                    'credit': 0,
+                    'reference': e.get('reference', ''),
+                })
+
+            for e in ecritures_credit:
+                mouvements.append({
+                    'id': e['id'],
+                    'numero': e['numero'],
+                    'date': e['date_ecriture'],
+                    'description': e['description'],
+                    'debit': 0,
+                    'credit': float(e['montant']),
+                    'reference': e.get('reference', ''),
+                })
+
+            # Tri chronologique
+            mouvements.sort(key=lambda x: (x['date'], x['id']))
+
+            if not mouvements:
+                continue
+
+            # Solde progressif
+            solde = float(compte.solde_initial or 0)
+            for m in mouvements:
+                solde += m['debit'] - m['credit']
+                m['solde'] = solde
+
+            total_debit = sum(m['debit'] for m in mouvements)
+            total_credit = sum(m['credit'] for m in mouvements)
+
+            result.append({
+                'compte_id': compte.id,
+                'numero': compte.numero,
+                'nom': compte.nom,
+                'solde_initial': float(compte.solde_initial or 0),
+                'total_debit': total_debit,
+                'total_credit': total_credit,
+                'solde_final': solde,
+                'mouvements': mouvements,
+            })
+
+        return Response({
+            'count': len(result),
+            'results': result,
+        })
+
+
+# ============================================================
+# BALANCE GÉNÉRALE VIEWSET
+# ============================================================
+class BalanceGeneraleViewSet(viewsets.ViewSet):
+    """
+    Balance générale : synthèse de tous les comptes.
+    ✅ CORRIGÉ : pas de @action sur list()
+    """
+    permission_classes = [permissions.IsAuthenticated, IsComptable]
+
+    def list(self, request):
+        """Retourne la balance générale avec équilibre."""
+        date_from = request.query_params.get('date_from')
+        date_to = request.query_params.get('date_to')
+
+        # Pré-calcul des bornes
+        date_start = None
+        date_end = None
+
+        if date_from:
+            try:
+                date_start = dt.datetime.strptime(
+                    date_from, '%Y-%m-%d'
+                ).date()
+            except ValueError:
+                pass
+
+        if date_to:
+            try:
+                date_end = dt.datetime.strptime(date_to, '%Y-%m-%d').date()
+            except ValueError:
+                pass
+
+        # Base commune
+        base_qs = EcritureComptable.objects.filter(statut='valide')
+        if date_start:
+            base_qs = base_qs.filter(date_ecriture__gte=date_start)
+        if date_end:
+            base_qs = base_qs.filter(date_ecriture__lte=date_end)
+
+        # Agrégations par compte (2 requêtes au total)
+        debits = (
+            base_qs
+            .values('compte_debit_id')
+            .annotate(total=Sum('montant'))
+        )
+        credits = (
+            base_qs
+            .values('compte_credit_id')
+            .annotate(total=Sum('montant'))
+        )
+
+        debit_map = {row['compte_debit_id']: float(
+            row['total'] or 0) for row in debits}
+        credit_map = {row['compte_credit_id']: float(
+            row['total'] or 0) for row in credits}
+
+        comptes = CompteComptable.objects.filter(
+            is_active=True).order_by('numero')
+
+        result = []
+        total_debit_general = 0.0
+        total_credit_general = 0.0
+        total_solde_debiteur = 0.0
+        total_solde_crediteur = 0.0
+
+        for compte in comptes:
+            total_debit = debit_map.get(compte.id, 0.0)
+            total_credit = credit_map.get(compte.id, 0.0)
+
+            if total_debit == 0 and total_credit == 0:
+                continue
+
+            solde = total_debit - total_credit
+            solde_debiteur = max(solde, 0)
+            solde_crediteur = max(-solde, 0)
+
+            total_debit_general += total_debit
+            total_credit_general += total_credit
+            total_solde_debiteur += solde_debiteur
+            total_solde_crediteur += solde_crediteur
+
+            result.append({
+                'compte_id': compte.id,
+                'numero': compte.numero,
+                'nom': compte.nom,
+                'type': compte.type,
+                'classe': compte.classe,
+                'total_debit': total_debit,
+                'total_credit': total_credit,
+                'solde': solde,
+                'solde_debiteur': solde_debiteur,
+                'solde_crediteur': solde_crediteur,
+            })
+
+        return Response({
+            'count': len(result),
+            'totaux': {
+                'total_debit': total_debit_general,
+                'total_credit': total_credit_general,
+                'total_solde_debiteur': total_solde_debiteur,
+                'total_solde_crediteur': total_solde_crediteur,
+                'equilibre': abs(
+                    total_debit_general - total_credit_general
+                ) < 0.01,
+            },
+            'results': result,
+        })
+
 
 class DashboardFinancierViewSet(viewsets.ViewSet):
     """ViewSet pour le dashboard financier"""

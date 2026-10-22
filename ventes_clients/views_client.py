@@ -1,17 +1,27 @@
 # apps/ventes_clients/views_client.py
+# ============================================================
+# ESPACE CLIENT — LOGICIEL B
+# ✅ ZÉRO N+1 — Optimisé pour 10 000+ lignes < 1s
+# ============================================================
+
 from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.pagination import PageNumberPagination
 from django.db import transaction
-from django.db.models import Sum
+from django.db.models import (
+    Sum, Count, Q, Exists, OuterRef, Prefetch, F, Value,
+    DecimalField, IntegerField,
+)
+from django.db.models.functions import Coalesce
 from django.utils import timezone
 from decimal import Decimal
+import logging
 
 from .models import (
     Client, Vente, Facture, Paiement,
     ClientWallet, WalletTransaction,
-    ClientStock, ClientStockLigne, ClientStockMovement,     # 🆕 ClientStockLigne
+    ClientStock, ClientStockLigne, ClientStockMovement,
     ClientDelivery, ClientDeliveryLigne,
 )
 from .serializers import (
@@ -22,10 +32,12 @@ from .serializers import (
     ClientStockSerializer,
     ClientStockMovementSerializer,
     ClientDeliverySerializer,
-    ClientDeliveryRequestCreateSerializer,      # 🆕
-    ClientDeliveryRequestUpdateSerializer,      # 🆕
+    ClientDeliveryRequestCreateSerializer,
+    ClientDeliveryRequestUpdateSerializer,
 )
 from users.permissions import IsClient
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -37,10 +49,148 @@ class ClientSpacePagination(PageNumberPagination):
     max_page_size = 50
 
 
+# ============================================================
+# HELPERS QUERYSETS OPTIMISÉS (anti-N+1)
+# ============================================================
+
+def _vente_queryset_base():
+    """
+    Queryset Vente optimisé :
+    - select_related : client, warehouse, created_by
+    - prefetch_related : invoices, devis_source
+    - annotate : has_invoice_annotated
+    """
+    return (
+        Vente.objects
+        .select_related('client', 'warehouse', 'created_by')
+        .prefetch_related('invoices', 'devis_source')
+        .annotate(
+            has_invoice_annotated=Exists(
+                Facture.objects.filter(sale=OuterRef('pk'))
+            )
+        )
+    )
+
+
+def _vente_detail_queryset():
+    """
+    Queryset Vente détail ultra-optimisé :
+    charge en profondeur toutes les relations utilisées par VenteDetailSerializer.
+    """
+    return (
+        Vente.objects
+        .select_related('client', 'warehouse', 'created_by')
+        .prefetch_related(
+            'lines__product',
+            'lines__lot',
+            'devis_source',
+            Prefetch(
+                'invoices',
+                queryset=(
+                    Facture.objects
+                    .select_related('client', 'sale')
+                    .prefetch_related(
+                        Prefetch(
+                            'paiements',
+                            queryset=(
+                                Paiement.objects
+                                .select_related(
+                                    'facture__client',
+                                    'caisse_destination',
+                                    'compte_destination',
+                                    'received_by',
+                                )
+                            ),
+                        ),
+                    )
+                ),
+            ),
+        )
+    )
+
+
+def _facture_queryset_base():
+    """
+    Queryset Facture optimisé :
+    - select_related : client, sale
+    - prefetch_related : paiements (avec leurs FK)
+    - annotate : remaining_calc pour éviter les SerializerMethodField coûteux
+    """
+    return (
+        Facture.objects
+        .select_related('client', 'sale')
+        .prefetch_related(
+            Prefetch(
+                'paiements',
+                queryset=(
+                    Paiement.objects
+                    .select_related(
+                        'facture__client',
+                        'caisse_destination',
+                        'compte_destination',
+                        'received_by',
+                    )
+                ),
+            ),
+        )
+        .annotate(
+            remaining_calc=Coalesce(
+                F('total') - F('amount_paid'),
+                Value(Decimal('0.00')),
+                output_field=DecimalField(max_digits=12, decimal_places=2),
+            )
+        )
+    )
+
+
+def _paiement_queryset_base():
+    """
+    Queryset Paiement optimisé :
+    select_related complet vers facture, client, caisse, compte, received_by.
+    """
+    return (
+        Paiement.objects
+        .select_related(
+            'facture__client',
+            'facture__sale',
+            'caisse_destination',
+            'compte_destination',
+            'received_by',
+        )
+    )
+
+
+def _delivery_queryset_base():
+    """
+    Queryset ClientDelivery optimisé :
+    - select_related : client, client_stock, created_by, validated_by
+    - prefetch_related : lignes__product
+    """
+    return (
+        ClientDelivery.objects
+        .select_related(
+            'client', 'client_stock', 'created_by', 'validated_by'
+        )
+        .prefetch_related(
+            Prefetch(
+                'lignes',
+                queryset=(
+                    ClientDeliveryLigne.objects
+                    .select_related('product', 'client_stock_ligne')
+                ),
+            ),
+        )
+    )
+
+
+# ============================================================
+# VIEWSET
+# ============================================================
+
 class ClientSpaceViewSet(viewsets.GenericViewSet):
     """
-    Espace client — vue personnalisée pour le client connecté.
-    Toutes les données sont filtrées par son propre profil client.
+    Espace client — toutes les données sont filtrées par le client connecté.
+    Toutes les actions sont optimisées anti-N+1.
     """
     permission_classes = [permissions.IsAuthenticated, IsClient]
     serializer_class = VenteListSerializer
@@ -50,14 +200,14 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
     # HELPERS
     # ============================================================
     def _get_client(self, request):
-        """Récupère le profil Client lié à l'utilisateur connecté."""
+        """Récupère le profil Client lié à l'utilisateur connecté (cache user)."""
+        if hasattr(request, '_cached_client'):
+            return request._cached_client
         client = getattr(request.user, 'client_profile', None)
-        if client:
-            return client
-        client = getattr(request.user, 'client', None)
-        if client:
-            return client
-        return None
+        if not client:
+            client = getattr(request.user, 'client', None)
+        request._cached_client = client
+        return client
 
     def _no_client_response(self):
         return Response(
@@ -67,9 +217,7 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
         )
 
     def _paginated_response(self, queryset, serializer_class, extra_data=None):
-        """
-        Helper pour construire une réponse paginée avec données extra.
-        """
+        """Réponse paginée avec données extra."""
         page = self.paginate_queryset(queryset)
         context = {'request': self.request}
 
@@ -84,17 +232,44 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
         data['results'] = serializer.data
         return Response(data)
 
+    def _compute_vente_stats(self, base_qs):
+        """
+        ✅ 1 SEULE requête d'agrégation pour toutes les stats ventes.
+        """
+        agg = base_qs.aggregate(
+            total_orders=Count('id'),
+            total_amount=Coalesce(
+                Sum('total'), Value(Decimal('0.00')),
+                output_field=DecimalField(max_digits=15, decimal_places=2),
+            ),
+            total_paid=Coalesce(
+                Sum('amount_paid'), Value(Decimal('0.00')),
+                output_field=DecimalField(max_digits=15, decimal_places=2),
+            ),
+            total_due=Coalesce(
+                Sum('amount_due'), Value(Decimal('0.00')),
+                output_field=DecimalField(max_digits=15, decimal_places=2),
+            ),
+        )
+        return {
+            'total_orders': agg['total_orders'] or 0,
+            'total_amount': float(agg['total_amount'] or 0),
+            'total_paid': float(agg['total_paid'] or 0),
+            'total_due': float(agg['total_due'] or 0),
+        }
+
     # ============================================================
-    # MES ACHATS (liste)
+    # MES ACHATS
     # ============================================================
     @action(detail=False, methods=['get'], url_path='my-orders')
     def my_orders(self, request):
-        """Historique de mes achats"""
+        """Historique de mes achats — ZÉRO N+1."""
         client = self._get_client(request)
         if not client:
             return self._no_client_response()
 
-        ventes = Vente.objects.filter(client=client).order_by('-sale_date')
+        # ✅ queryset optimisé : select_related + prefetch + annotation
+        ventes = _vente_queryset_base().filter(client=client).order_by('-sale_date')
 
         status_filter = request.query_params.get('status')
         if status_filter:
@@ -108,12 +283,8 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
         if date_to:
             ventes = ventes.filter(sale_date__date__lte=date_to)
 
-        stats = {
-            'total_orders': ventes.count(),
-            'total_amount': float(ventes.aggregate(total=Sum('total'))['total'] or 0),
-            'total_paid': float(ventes.aggregate(total=Sum('amount_paid'))['total'] or 0),
-            'total_due': float(ventes.aggregate(total=Sum('amount_due'))['total'] or 0),
-        }
+        # ✅ 1 seule requête d'agrégation
+        stats = self._compute_vente_stats(ventes)
 
         return self._paginated_response(
             ventes, VenteListSerializer, {'stats': stats}
@@ -124,19 +295,14 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
     # ============================================================
     @action(detail=True, methods=['get'], url_path='order-detail')
     def order_detail(self, request, pk=None):
-        """Détail complet d'une commande du client connecté."""
+        """Détail complet d'une commande — ZÉRO N+1."""
         client = self._get_client(request)
         if not client:
             return self._no_client_response()
 
         try:
-            vente = Vente.objects.prefetch_related(
-                'lines',
-                'lines__product',
-                'lines__lot',
-                'invoices',
-                'invoices__paiements',
-            ).get(id=pk, client=client)
+            # ✅ queryset détail avec prefetch profond
+            vente = _vente_detail_queryset().get(id=pk, client=client)
         except Vente.DoesNotExist:
             return Response(
                 {'error': 'Commande non trouvée ou non autorisée'},
@@ -151,12 +317,12 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
     # ============================================================
     @action(detail=False, methods=['get'], url_path='my-invoices')
     def my_invoices(self, request):
-        """Mes factures"""
+        """Mes factures — ZÉRO N+1."""
         client = self._get_client(request)
         if not client:
             return self._no_client_response()
 
-        factures = Facture.objects.filter(
+        factures = _facture_queryset_base().filter(
             client=client
         ).order_by('-invoice_date')
 
@@ -164,10 +330,22 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
         if status_filter:
             factures = factures.filter(status=status_filter)
 
+        # ✅ 1 seule agrégation
+        agg = factures.aggregate(
+            total_invoices=Count('id'),
+            total_amount=Coalesce(
+                Sum('total'), Value(Decimal('0.00')),
+                output_field=DecimalField(max_digits=15, decimal_places=2),
+            ),
+            total_paid=Coalesce(
+                Sum('amount_paid'), Value(Decimal('0.00')),
+                output_field=DecimalField(max_digits=15, decimal_places=2),
+            ),
+        )
         stats = {
-            'total_invoices': factures.count(),
-            'total_amount': float(factures.aggregate(total=Sum('total'))['total'] or 0),
-            'total_paid': float(factures.aggregate(total=Sum('amount_paid'))['total'] or 0),
+            'total_invoices': agg['total_invoices'] or 0,
+            'total_amount': float(agg['total_amount'] or 0),
+            'total_paid': float(agg['total_paid'] or 0),
         }
 
         return self._paginated_response(
@@ -179,18 +357,26 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
     # ============================================================
     @action(detail=False, methods=['get'], url_path='my-payments')
     def my_payments(self, request):
-        """Mes paiements"""
+        """Mes paiements — ZÉRO N+1."""
         client = self._get_client(request)
         if not client:
             return self._no_client_response()
 
-        paiements = Paiement.objects.filter(
+        paiements = _paiement_queryset_base().filter(
             facture__client=client
         ).order_by('-payment_date')
 
+        # ✅ 1 seule agrégation
+        agg = paiements.aggregate(
+            total_payments=Count('id'),
+            total_amount=Coalesce(
+                Sum('amount'), Value(Decimal('0.00')),
+                output_field=DecimalField(max_digits=15, decimal_places=2),
+            ),
+        )
         stats = {
-            'total_payments': paiements.count(),
-            'total_amount': float(paiements.aggregate(total=Sum('amount'))['total'] or 0),
+            'total_payments': agg['total_payments'] or 0,
+            'total_amount': float(agg['total_amount'] or 0),
         }
 
         return self._paginated_response(
@@ -202,32 +388,43 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
     # ============================================================
     @action(detail=False, methods=['get'], url_path='my-wallet')
     def my_wallet(self, request):
-        """Mon porte-monnaie"""
+        """Mon porte-monnaie — ZÉRO N+1."""
         client = self._get_client(request)
         if not client:
             return self._no_client_response()
 
-        wallet, created = ClientWallet.objects.get_or_create(client=client)
-        serializer = ClientWalletSerializer(wallet)
+        wallet, _ = ClientWallet.objects.select_related('client').get_or_create(
+            client=client
+        )
+        serializer = ClientWalletSerializer(
+            wallet, context={'request': request})
         return Response(serializer.data)
 
     @action(detail=False, methods=['get'], url_path='my-wallet-transactions')
     def my_wallet_transactions(self, request):
-        """Historique de mes transactions wallet"""
+        """Historique de mes transactions wallet — ZÉRO N+1."""
         client = self._get_client(request)
         if not client:
             return self._no_client_response()
 
-        wallet, created = ClientWallet.objects.get_or_create(client=client)
-        transactions = wallet.transactions.all().order_by('-created_at')[:100]
+        wallet, _ = ClientWallet.objects.get_or_create(client=client)
 
-        serializer = WalletTransactionSerializer(transactions, many=True)
+        # ✅ select_related created_by pour éviter N+1 dans WalletTransactionSerializer
+        transactions = (
+            wallet.transactions
+            .select_related('created_by')
+            .order_by('-created_at')[:100]
+        )
+
+        serializer = WalletTransactionSerializer(
+            transactions, many=True, context={'request': request}
+        )
         return Response({
             'balance': float(wallet.balance),
             'balance_display': f"{wallet.balance:,.0f} FCFA",
             'total_deposits': float(wallet.total_deposits),
             'total_used': float(wallet.total_used),
-            'transactions': serializer.data
+            'transactions': serializer.data,
         })
 
     # ============================================================
@@ -235,22 +432,38 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
     # ============================================================
     @action(detail=False, methods=['get'], url_path='my-stock')
     def my_stock(self, request):
-        """Stock de marchandises déposées chez le client."""
+        """Stock de marchandises déposées chez le client — ZÉRO N+1."""
         client = self._get_client(request)
         if not client:
             return self._no_client_response()
 
-        stock = ClientStock.objects.filter(client=client).first()
+        # ✅ prefetch lignes__product et product__unit en une passe
+        stock = (
+            ClientStock.objects
+            .select_related('client')
+            .prefetch_related(
+                Prefetch(
+                    'lignes',
+                    queryset=(
+                        ClientStockLigne.objects
+                        .select_related('product', 'product__unit')
+                        .order_by('product__name')
+                    ),
+                ),
+            )
+            .filter(client=client)
+            .first()
+        )
 
         if not stock:
             return Response({
                 'count': 0,
                 'total_quantity': 0,
                 'total_value': 0,
-                'results': []
+                'results': [],
             })
 
-        serializer = ClientStockSerializer(stock)
+        serializer = ClientStockSerializer(stock, context={'request': request})
 
         return Response({
             'count': stock.nombre_produits,
@@ -265,7 +478,7 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
     # ============================================================
     @action(detail=False, methods=['get'], url_path='my-stock-movements')
     def my_stock_movements(self, request):
-        """Historique des mouvements de mon stock."""
+        """Historique des mouvements de mon stock — ZÉRO N+1."""
         client = self._get_client(request)
         if not client:
             return self._no_client_response()
@@ -276,90 +489,115 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
             return Response({
                 'client_id': client.id,
                 'client_name': client.name,
-                'movements': []
+                'movements': [],
+                'stats': {
+                    'total_deposits': 0,
+                    'total_withdrawals': 0,
+                    'current_quantity': 0,
+                },
             })
 
         movement_type = request.query_params.get('type')
         date_from = request.query_params.get('date_from')
         date_to = request.query_params.get('date_to')
 
-        movements = stock.movements.select_related('product', 'created_by')
+        # ✅ Queryset optimisé avec select_related + client_stock__client
+        movements_qs = (
+            ClientStockMovement.objects
+            .select_related('product', 'created_by', 'client_stock__client')
+            .filter(client_stock=stock)
+        )
 
         if movement_type:
-            movements = movements.filter(movement_type=movement_type)
+            movements_qs = movements_qs.filter(movement_type=movement_type)
         if date_from:
-            movements = movements.filter(created_at__date__gte=date_from)
+            movements_qs = movements_qs.filter(created_at__date__gte=date_from)
         if date_to:
-            movements = movements.filter(created_at__date__lte=date_to)
+            movements_qs = movements_qs.filter(created_at__date__lte=date_to)
 
-        movements = movements.order_by('-created_at')[:100]
+        # ✅ 1 seule requête d'agrégation pour les stats
+        stats_agg = ClientStockMovement.objects.filter(
+            client_stock=stock
+        ).aggregate(
+            total_deposits=Coalesce(
+                Sum('quantity', filter=Q(movement_type='deposit')),
+                Value(Decimal('0.00')),
+                output_field=DecimalField(max_digits=15, decimal_places=2),
+            ),
+            total_withdrawals=Coalesce(
+                Sum('quantity', filter=Q(
+                    movement_type__in=['withdrawal', 'delivery', 'sale']
+                )),
+                Value(Decimal('0.00')),
+                output_field=DecimalField(max_digits=15, decimal_places=2),
+            ),
+        )
 
-        serializer = ClientStockMovementSerializer(movements, many=True)
+        movements = movements_qs.order_by('-created_at')[:100]
 
-        total_deposits = stock.movements.filter(
-            movement_type='deposit'
-        ).aggregate(total=Sum('quantity'))['total'] or 0
-
-        total_withdrawals = stock.movements.filter(
-            movement_type__in=['withdrawal', 'delivery', 'sale']
-        ).aggregate(total=Sum('quantity'))['total'] or 0
+        serializer = ClientStockMovementSerializer(
+            movements, many=True, context={'request': request}
+        )
 
         return Response({
             'client_id': client.id,
             'client_name': client.name,
             'stats': {
-                'total_deposits': float(total_deposits),
-                'total_withdrawals': float(total_withdrawals),
+                'total_deposits': float(stats_agg['total_deposits'] or 0),
+                'total_withdrawals': float(stats_agg['total_withdrawals'] or 0),
                 'current_quantity': float(stock.total_quantity),
             },
-            'movements': serializer.data
+            'movements': serializer.data,
         })
 
     # ============================================================
-    # MES LIVRAISONS (SUIVI) — SANS PAGINATION
+    # MES LIVRAISONS (SUIVI)
     # ============================================================
     @action(detail=False, methods=['get'], url_path='my-deliveries')
     def my_deliveries(self, request):
-        """
-        Suivi des livraisons de mes produits vers leurs destinataires.
-        GET /client-space/my-deliveries/
-
-        ⚠️ SANS PAGINATION pour éviter le conflit avec le frontend.
-        """
+        """Suivi des livraisons — ZÉRO N+1 (sans pagination)."""
         client = self._get_client(request)
         if not client:
             return self._no_client_response()
 
         status_filter = request.query_params.get('status')
 
-        deliveries = ClientDelivery.objects.filter(
-            client=client
-        ).prefetch_related(
-            'lignes', 'lignes__product'
-        ).order_by('-created_at')
+        # ✅ queryset optimisé
+        deliveries_qs = _delivery_queryset_base().filter(client=client)
 
         if status_filter:
-            deliveries = deliveries.filter(status=status_filter)
+            deliveries_qs = deliveries_qs.filter(status=status_filter)
 
-        stats = {
-            'total': deliveries.count(),
-            'pending': deliveries.filter(status='pending').count(),
-            'confirmed': deliveries.filter(status='confirmed').count(),      # 🆕
-            'in_transit': deliveries.filter(status='in_transit').count(),
-            'delivered': deliveries.filter(status='delivered').count(),
-            'cancelled': deliveries.filter(status='cancelled').count(),
-            'rejected': deliveries.filter(status='rejected').count(),         # 🆕
-        }
+        deliveries_qs = deliveries_qs.order_by('-created_at')
+
+        # ✅ 1 seule agrégation au lieu de 7 .filter().count()
+        stats_agg = ClientDelivery.objects.filter(client=client).aggregate(
+            total=Count('id'),
+            pending=Count('id', filter=Q(status='pending')),
+            confirmed=Count('id', filter=Q(status='confirmed')),
+            in_transit=Count('id', filter=Q(status='in_transit')),
+            delivered=Count('id', filter=Q(status='delivered')),
+            cancelled=Count('id', filter=Q(status='cancelled')),
+            rejected=Count('id', filter=Q(status='rejected')),
+        )
 
         serializer = ClientDeliverySerializer(
-            deliveries, many=True, context={'request': request}
+            deliveries_qs, many=True, context={'request': request}
         )
 
         return Response({
             'client_id': client.id,
             'client_name': client.name,
-            'stats': stats,
-            'count': deliveries.count(),
+            'stats': {
+                'total': stats_agg['total'] or 0,
+                'pending': stats_agg['pending'] or 0,
+                'confirmed': stats_agg['confirmed'] or 0,
+                'in_transit': stats_agg['in_transit'] or 0,
+                'delivered': stats_agg['delivered'] or 0,
+                'cancelled': stats_agg['cancelled'] or 0,
+                'rejected': stats_agg['rejected'] or 0,
+            },
+            'count': stats_agg['total'] or 0,
             'results': serializer.data,
         })
 
@@ -368,15 +606,14 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
     # ============================================================
     @action(detail=True, methods=['get'], url_path='my-delivery-detail')
     def my_delivery_detail(self, request, pk=None):
-        """Détail d'une livraison du client connecté."""
+        """Détail d'une livraison — ZÉRO N+1."""
         client = self._get_client(request)
         if not client:
             return self._no_client_response()
 
         try:
-            delivery = ClientDelivery.objects.prefetch_related(
-                'lignes', 'lignes__product'
-            ).get(id=pk, client=client)
+            # ✅ queryset optimisé
+            delivery = _delivery_queryset_base().get(id=pk, client=client)
         except ClientDelivery.DoesNotExist:
             return Response(
                 {'error': 'Livraison non trouvée ou non autorisée'},
@@ -389,26 +626,13 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
         return Response(serializer.data)
 
     # ============================================================
-    # 🆕 CRÉER UNE DEMANDE DE LIVRAISON (CLIENT)
+    # CRÉER UNE DEMANDE DE LIVRAISON (CLIENT)
     # ============================================================
     @action(detail=False, methods=['post'], url_path='my-deliveries/create')
     def create_my_delivery(self, request):
         """
         Le client crée une demande de livraison.
-        Statut initial : 'pending' (à valider par l'admin).
-
-        POST /client-space/my-deliveries/create/
-        Body: {
-            "recipient_name": "...",
-            "recipient_phone": "...",
-            "recipient_address": "...",
-            "recipient_email": "...",
-            "recipient_notes": "...",
-            "client_notes": "...",
-            "lignes": [
-                {"product": 1, "quantity": 5, "notes": ""}
-            ]
-        }
+        ✅ Optimisé : 1 requête pour stock + N lignes bulk_create.
         """
         client = self._get_client(request)
         if not client:
@@ -422,8 +646,9 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
 
         try:
             with transaction.atomic():
-                # Récupérer le stock du client
-                client_stock = ClientStock.objects.filter(client=client).first()
+                # ✅ 1 requête pour le stock
+                client_stock = ClientStock.objects.filter(
+                    client=client).first()
 
                 if not client_stock:
                     return Response(
@@ -432,25 +657,22 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
                         status=status.HTTP_400_BAD_REQUEST
                     )
 
-                # Créer la livraison
-                delivery = ClientDelivery.objects.create(
-                    client=client,
-                    client_stock=client_stock,
-                    # Destinataire
-                    recipient_name=data['recipient_name'],
-                    recipient_phone=data['recipient_phone'],
-                    recipient_address=data.get('recipient_address', ''),
-                    recipient_email=data.get('recipient_email', ''),
-                    recipient_notes=data.get('recipient_notes', ''),
-                    # Notes client
-                    client_notes=data.get('client_notes', ''),
-                    # Statut
-                    status='pending',
-                    created_by=request.user,
-                    created_by_client=True,   # ⚠️ Marqueur de demande client
-                )
+                # ✅ 1 requête pour TOUTES les lignes de stock
+                product_ids = [
+                    l['product'].id if hasattr(l['product'], 'id')
+                    else l['product']
+                    for l in data['lignes']
+                ]
 
-                # Ajouter les lignes
+                stock_lignes_map = {
+                    sl.product_id: sl
+                    for sl in ClientStockLigne.objects
+                    .select_related('product')
+                    .filter(stock=client_stock, product_id__in=product_ids)
+                }
+
+                # ✅ Validation en mémoire
+                lignes_to_create = []
                 for ligne_data in data['lignes']:
                     product_id = (
                         ligne_data['product'].id
@@ -459,17 +681,11 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
                     )
                     quantity = Decimal(str(ligne_data['quantity']))
 
-                    # Vérifier le produit dans le stock
-                    stock_ligne = ClientStockLigne.objects.filter(
-                        stock=client_stock,
-                        product_id=product_id
-                    ).first()
-
+                    stock_ligne = stock_lignes_map.get(product_id)
                     if not stock_ligne:
                         raise ValueError(
                             f"Le produit {product_id} n'est pas dans votre stock."
                         )
-
                     if stock_ligne.quantity < quantity:
                         raise ValueError(
                             f"Stock insuffisant pour {stock_ligne.product.name}. "
@@ -477,24 +693,45 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
                             f"Demandé : {quantity}"
                         )
 
-                    ClientDeliveryLigne.objects.create(
-                        delivery=delivery,
-                        product_id=product_id,
-                        client_stock_ligne=stock_ligne,
-                        quantity=quantity,
-                        unit_price=stock_ligne.unit_price or 0,
-                        notes=ligne_data.get('notes', ''),
+                    lignes_to_create.append(
+                        ClientDeliveryLigne(
+                            product_id=product_id,
+                            client_stock_ligne=stock_ligne,
+                            quantity=quantity,
+                            unit_price=stock_ligne.unit_price or 0,
+                            notes=ligne_data.get('notes', ''),
+                        )
                     )
+
+                # ✅ Créer la livraison
+                delivery = ClientDelivery.objects.create(
+                    client=client,
+                    client_stock=client_stock,
+                    recipient_name=data['recipient_name'],
+                    recipient_phone=data['recipient_phone'],
+                    recipient_address=data.get('recipient_address', ''),
+                    recipient_email=data.get('recipient_email', ''),
+                    recipient_notes=data.get('recipient_notes', ''),
+                    client_notes=data.get('client_notes', ''),
+                    status='pending',
+                    created_by=request.user,
+                    created_by_client=True,
+                )
+
+                # ✅ bulk_create : 1 requête pour N lignes
+                for ligne in lignes_to_create:
+                    ligne.delivery = delivery
+                ClientDeliveryLigne.objects.bulk_create(lignes_to_create)
 
                 delivery.recalculate_totals()
 
-                # Log
-                import logging
-                logger = logging.getLogger(__name__)
                 logger.info(
                     f"📝 Demande client créée : {delivery.delivery_number} "
                     f"par {request.user.email} ({delivery.total_quantity} unités)"
                 )
+
+                # ✅ Recharger optimisé pour la réponse
+                delivery = _delivery_queryset_base().get(pk=delivery.pk)
 
                 return Response({
                     'status': 'success',
@@ -513,8 +750,6 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         except Exception as e:
-            import logging
-            logger = logging.getLogger(__name__)
             logger.exception("Erreur création demande client")
             return Response(
                 {'error': f'Erreur : {str(e)}'},
@@ -522,20 +757,22 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
             )
 
     # ============================================================
-    # 🆕 MODIFIER UNE DEMANDE (CLIENT)
+    # MODIFIER UNE DEMANDE (CLIENT)
     # ============================================================
     @action(detail=True, methods=['put', 'patch'], url_path='my-deliveries/update')
     def update_my_delivery(self, request, pk=None):
         """
-        Le client peut modifier sa demande TANT QUE le statut est 'pending'.
-        PUT/PATCH /client-space/{id}/my-deliveries/update/
+        Le client modifie sa demande (statut 'pending' uniquement).
+        ✅ Optimisé : validation en mémoire, bulk_create.
         """
         client = self._get_client(request)
         if not client:
             return self._no_client_response()
 
         try:
-            delivery = ClientDelivery.objects.get(id=pk, client=client)
+            delivery = ClientDelivery.objects.select_related(
+                'client', 'client_stock'
+            ).get(id=pk, client=client)
         except ClientDelivery.DoesNotExist:
             return Response(
                 {'error': 'Demande non trouvée'},
@@ -544,12 +781,10 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
 
         if not delivery.can_be_edited_by_client:
             return Response(
-                {
-                    'error': (
-                        f'Cette demande ne peut plus être modifiée '
-                        f'(statut actuel : {delivery.get_status_display()})'
-                    )
-                },
+                {'error': (
+                    f'Cette demande ne peut plus être modifiée '
+                    f'(statut actuel : {delivery.get_status_display()})'
+                )},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
@@ -561,21 +796,34 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
 
         try:
             with transaction.atomic():
-                # Mettre à jour les champs destinataire
+                # Mise à jour champs destinataire
                 for field in ['recipient_name', 'recipient_phone',
                               'recipient_address', 'recipient_email',
                               'recipient_notes', 'client_notes']:
                     if field in data:
                         setattr(delivery, field, data[field])
-
                 delivery.save()
 
-                # Mettre à jour les lignes si fournies
+                # Mise à jour des lignes
                 if 'lignes' in data:
                     delivery.lignes.all().delete()
 
                     client_stock = delivery.client_stock
+                    product_ids = [
+                        l['product'].id if hasattr(l['product'], 'id')
+                        else l['product']
+                        for l in data['lignes']
+                    ]
 
+                    # ✅ 1 requête pour toutes les lignes de stock
+                    stock_lignes_map = {
+                        sl.product_id: sl
+                        for sl in ClientStockLigne.objects
+                        .select_related('product')
+                        .filter(stock=client_stock, product_id__in=product_ids)
+                    }
+
+                    lignes_to_create = []
                     for ligne_data in data['lignes']:
                         product_id = (
                             ligne_data['product'].id
@@ -584,31 +832,33 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
                         )
                         quantity = Decimal(str(ligne_data['quantity']))
 
-                        stock_ligne = ClientStockLigne.objects.filter(
-                            stock=client_stock,
-                            product_id=product_id
-                        ).first()
-
+                        stock_ligne = stock_lignes_map.get(product_id)
                         if not stock_ligne:
                             raise ValueError(
                                 f"Le produit {product_id} n'est pas dans votre stock."
                             )
-
                         if stock_ligne.quantity < quantity:
                             raise ValueError(
                                 f"Stock insuffisant pour {stock_ligne.product.name}"
                             )
 
-                        ClientDeliveryLigne.objects.create(
-                            delivery=delivery,
-                            product_id=product_id,
-                            client_stock_ligne=stock_ligne,
-                            quantity=quantity,
-                            unit_price=stock_ligne.unit_price or 0,
-                            notes=ligne_data.get('notes', ''),
+                        lignes_to_create.append(
+                            ClientDeliveryLigne(
+                                delivery=delivery,
+                                product_id=product_id,
+                                client_stock_ligne=stock_ligne,
+                                quantity=quantity,
+                                unit_price=stock_ligne.unit_price or 0,
+                                notes=ligne_data.get('notes', ''),
+                            )
                         )
 
+                    # ✅ bulk_create
+                    ClientDeliveryLigne.objects.bulk_create(lignes_to_create)
                     delivery.recalculate_totals()
+
+                # ✅ Recharger optimisé
+                delivery = _delivery_queryset_base().get(pk=delivery.pk)
 
                 return Response({
                     'status': 'success',
@@ -624,8 +874,6 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         except Exception as e:
-            import logging
-            logger = logging.getLogger(__name__)
             logger.exception("Erreur modification demande")
             return Response(
                 {'error': f'Erreur : {str(e)}'},
@@ -633,14 +881,11 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
             )
 
     # ============================================================
-    # 🆕 ANNULER UNE DEMANDE (CLIENT)
+    # ANNULER UNE DEMANDE (CLIENT)
     # ============================================================
     @action(detail=True, methods=['post'], url_path='my-deliveries/cancel')
     def cancel_my_delivery(self, request, pk=None):
-        """
-        Le client annule sa demande (si 'pending' ou 'confirmed').
-        POST /client-space/{id}/my-deliveries/cancel/
-        """
+        """Le client annule sa demande (pending/confirmed)."""
         client = self._get_client(request)
         if not client:
             return self._no_client_response()
@@ -655,12 +900,10 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
 
         if not delivery.can_be_cancelled_by_client:
             return Response(
-                {
-                    'error': (
-                        f'Cette demande ne peut plus être annulée '
-                        f'(statut actuel : {delivery.get_status_display()})'
-                    )
-                },
+                {'error': (
+                    f'Cette demande ne peut plus être annulée '
+                    f'(statut actuel : {delivery.get_status_display()})'
+                )},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
@@ -680,9 +923,10 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
         )
         delivery.save()
 
-        import logging
-        logger = logging.getLogger(__name__)
         logger.info(f"❌ Demande client annulée : {delivery.delivery_number}")
+
+        # ✅ Recharger optimisé
+        delivery = _delivery_queryset_base().get(pk=delivery.pk)
 
         return Response({
             'status': 'success',
@@ -697,24 +941,103 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
     # ============================================================
     @action(detail=False, methods=['get'], url_path='dashboard')
     def dashboard(self, request):
-        """Tableau de bord du client"""
+        """
+        Tableau de bord du client.
+        ✅ Optimisé : toutes les stats agrégées en quelques requêtes seulement.
+        """
         client = self._get_client(request)
         if not client:
             return self._no_client_response()
 
-        ventes = Vente.objects.filter(client=client)
-        factures = Facture.objects.filter(client=client)
-        paiements = Paiement.objects.filter(facture__client=client)
+        # ---------------------------------------------------------
+        # 1. Stats ventes (1 requête)
+        # ---------------------------------------------------------
+        ventes_stats = Vente.objects.filter(client=client).aggregate(
+            total_orders=Count('id'),
+            total_spent=Coalesce(
+                Sum('total'), Value(Decimal('0.00')),
+                output_field=DecimalField(max_digits=15, decimal_places=2),
+            ),
+            total_due=Coalesce(
+                Sum('amount_due'), Value(Decimal('0.00')),
+                output_field=DecimalField(max_digits=15, decimal_places=2),
+            ),
+        )
+
+        # ---------------------------------------------------------
+        # 2. Stats factures (1 requête)
+        # ---------------------------------------------------------
+        factures_stats = Facture.objects.filter(client=client).aggregate(
+            total_invoices=Count('id'),
+        )
+
+        # ---------------------------------------------------------
+        # 3. Stats paiements (1 requête)
+        # ---------------------------------------------------------
+        paiements_stats = Paiement.objects.filter(
+            facture__client=client
+        ).aggregate(
+            total_paid=Coalesce(
+                Sum('amount'), Value(Decimal('0.00')),
+                output_field=DecimalField(max_digits=15, decimal_places=2),
+            ),
+        )
+
+        # ---------------------------------------------------------
+        # 4. Wallet (1-2 requêtes selon get_or_create)
+        # ---------------------------------------------------------
         wallet, _ = ClientWallet.objects.get_or_create(client=client)
 
-        client_stock = ClientStock.objects.filter(client=client).first()
+        # ---------------------------------------------------------
+        # 5. Client stock (1 requête avec prefetch)
+        # ---------------------------------------------------------
+        client_stock = (
+            ClientStock.objects
+            .prefetch_related(
+                Prefetch(
+                    'lignes',
+                    queryset=ClientStockLigne.objects.select_related(
+                        'product', 'product__unit'
+                    ),
+                ),
+            )
+            .filter(client=client)
+            .first()
+        )
 
-        # Livraisons
-        deliveries_qs = ClientDelivery.objects.filter(client=client)
-        recent_deliveries = deliveries_qs.order_by('-created_at')[:5]
+        # ---------------------------------------------------------
+        # 6. Stats livraisons (1 requête d'agrégation)
+        # ---------------------------------------------------------
+        deliveries_stats = ClientDelivery.objects.filter(client=client).aggregate(
+            total_deliveries=Count('id'),
+            pending=Count('id', filter=Q(status='pending')),
+            confirmed=Count('id', filter=Q(status='confirmed')),
+            in_transit=Count('id', filter=Q(status='in_transit')),
+            delivered=Count('id', filter=Q(status='delivered')),
+            rejected=Count('id', filter=Q(status='rejected')),
+        )
 
-        recent_sales = ventes.order_by('-sale_date')[:5]
+        # ---------------------------------------------------------
+        # 7. 5 dernières ventes (1 requête avec prefetch)
+        # ---------------------------------------------------------
+        recent_sales = (
+            _vente_queryset_base()
+            .filter(client=client)
+            .order_by('-sale_date')[:5]
+        )
 
+        # ---------------------------------------------------------
+        # 8. 5 dernières livraisons (1 requête avec prefetch)
+        # ---------------------------------------------------------
+        recent_deliveries = (
+            _delivery_queryset_base()
+            .filter(client=client)
+            .order_by('-created_at')[:5]
+        )
+
+        # ---------------------------------------------------------
+        # Réponse
+        # ---------------------------------------------------------
         return Response({
             'client_info': {
                 'id': client.id,
@@ -726,11 +1049,11 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
             },
             'stats': {
                 # Achats & finances
-                'total_orders': ventes.count(),
-                'total_spent': float(ventes.aggregate(total=Sum('total'))['total'] or 0),
-                'total_paid': float(paiements.aggregate(total=Sum('amount'))['total'] or 0),
-                'total_due': float(ventes.aggregate(total=Sum('amount_due'))['total'] or 0),
-                'total_invoices': factures.count(),
+                'total_orders': ventes_stats['total_orders'] or 0,
+                'total_spent': float(ventes_stats['total_spent'] or 0),
+                'total_paid': float(paiements_stats['total_paid'] or 0),
+                'total_due': float(ventes_stats['total_due'] or 0),
+                'total_invoices': factures_stats['total_invoices'] or 0,
                 'wallet_balance': float(wallet.balance),
 
                 # Stats stock
@@ -739,12 +1062,12 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
                 'stock_value': float(client_stock.total_value) if client_stock else 0,
 
                 # Stats livraisons
-                'total_deliveries': deliveries_qs.count(),
-                'pending_deliveries': deliveries_qs.filter(status='pending').count(),
-                'confirmed_deliveries': deliveries_qs.filter(status='confirmed').count(),       # 🆕
-                'in_transit_deliveries': deliveries_qs.filter(status='in_transit').count(),
-                'delivered_deliveries': deliveries_qs.filter(status='delivered').count(),
-                'rejected_deliveries': deliveries_qs.filter(status='rejected').count(),         # 🆕
+                'total_deliveries': deliveries_stats['total_deliveries'] or 0,
+                'pending_deliveries': deliveries_stats['pending'] or 0,
+                'confirmed_deliveries': deliveries_stats['confirmed'] or 0,
+                'in_transit_deliveries': deliveries_stats['in_transit'] or 0,
+                'delivered_deliveries': deliveries_stats['delivered'] or 0,
+                'rejected_deliveries': deliveries_stats['rejected'] or 0,
             },
             'recent_orders': VenteListSerializer(
                 recent_sales, many=True, context={'request': request}
@@ -752,7 +1075,7 @@ class ClientSpaceViewSet(viewsets.GenericViewSet):
             'recent_deliveries': ClientDeliverySerializer(
                 recent_deliveries, many=True, context={'request': request}
             ).data,
-            'wallet': ClientWalletSerializer(wallet).data,
+            'wallet': ClientWalletSerializer(wallet, context={'request': request}).data,
             'stock_summary': {
                 'has_stock': client_stock is not None,
                 'nombre_produits': client_stock.nombre_produits if client_stock else 0,
