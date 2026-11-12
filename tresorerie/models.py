@@ -3,10 +3,10 @@ from django.db import models
 from django.db.models import Sum, Count, Q, Value, DecimalField
 from django.db.models.functions import Coalesce
 from django.core.validators import MinValueValidator, MaxValueValidator
+from django.core.exceptions import ValidationError
 from django.utils import timezone
 from datetime import date, timedelta
 from decimal import Decimal
-from django.core.exceptions import ValidationError
 from users.models import CustomUser
 from produits_stocks.models import Warehouse
 
@@ -30,6 +30,7 @@ SOURCE_TYPE = (
     ('paiement_client', 'Paiement client'),
     ('paiement_fournisseur', 'Paiement fournisseur'),
     ('frais', 'Frais'),
+    ('depense', 'Depense'),
     ('caisse', 'Caisse'),
     ('compte_bancaire', 'Compte bancaire'),
     ('autre', 'Autre'),
@@ -138,6 +139,69 @@ class Caisse(models.Model):
     def est_sur_seuil_max(self):
         return self.seuil_max > 0 and self.solde_actuel > self.seuil_max
 
+    # =========================================================
+    # ✅ MÉTHODES DE CONTRÔLE DU SOLDE
+    # =========================================================
+
+    def solde_disponible(self):
+        """
+        Retourne le solde disponible (0 si négatif).
+        Utilisé pour l'affichage frontend.
+        """
+        return max(self.solde_actuel, Decimal('0'))
+
+    def peut_payer(self, montant):
+        """
+        Vérifie si la caisse peut payer un montant donné.
+
+        Args:
+            montant: Decimal, int ou str représentant le montant
+
+        Returns:
+            bool: True si le solde actuel >= montant
+        """
+        try:
+            montant_decimal = Decimal(str(montant))
+        except (ValueError, TypeError):
+            return False
+
+        if montant_decimal <= 0:
+            return False
+
+        return self.solde_actuel >= montant_decimal
+
+    def verifier_solde_suffisant(self, montant, contexte=""):
+        """
+        Lève une ValidationError si le solde est insuffisant.
+
+        Args:
+            montant: montant à payer
+            contexte: texte optionnel pour enrichir le message
+
+        Raises:
+            ValidationError
+        """
+        try:
+            montant_decimal = Decimal(str(montant))
+        except (ValueError, TypeError):
+            raise ValidationError(
+                f"Montant invalide : {montant}"
+            )
+
+        if montant_decimal <= 0:
+            raise ValidationError(
+                "Le montant à payer doit être supérieur à 0."
+            )
+
+        if self.solde_actuel < montant_decimal:
+            detail = f" ({contexte})" if contexte else ""
+            raise ValidationError(
+                f"❌ Solde insuffisant dans la caisse '{self.nom}'{detail}. "
+                f"Solde disponible : {self.solde_actuel:,.0f} FCFA, "
+                f"montant à payer : {montant_decimal:,.0f} FCFA. "
+                f"Manquant : {(montant_decimal - self.solde_actuel):,.0f} FCFA."
+            )
+
     def mettre_a_jour_solde(self):
         """
         CORRECTION N+1 : 1 seule requete au lieu de 2.
@@ -229,6 +293,63 @@ class CompteBancaire(models.Model):
 
     def __str__(self):
         return f"{self.banque} - {self.nom} ({self.numero_compte})"
+
+    # =========================================================
+    # ✅ MÉTHODES DE CONTRÔLE DU SOLDE
+    # =========================================================
+
+    def solde_disponible(self):
+        """Retourne le solde disponible (0 si négatif)."""
+        return max(self.solde_actuel, Decimal('0'))
+
+    def peut_payer(self, montant):
+        """
+        Vérifie si le compte peut payer un montant donné.
+
+        Args:
+            montant: Decimal, int ou str représentant le montant
+
+        Returns:
+            bool: True si le solde actuel >= montant
+        """
+        try:
+            montant_decimal = Decimal(str(montant))
+        except (ValueError, TypeError):
+            return False
+
+        if montant_decimal <= 0:
+            return False
+
+        return self.solde_actuel >= montant_decimal
+
+    def verifier_solde_suffisant(self, montant, contexte=""):
+        """
+        Lève une ValidationError si le solde est insuffisant.
+
+        Raises:
+            ValidationError
+        """
+        try:
+            montant_decimal = Decimal(str(montant))
+        except (ValueError, TypeError):
+            raise ValidationError(
+                f"Montant invalide : {montant}"
+            )
+
+        if montant_decimal <= 0:
+            raise ValidationError(
+                "Le montant à payer doit être supérieur à 0."
+            )
+
+        if self.solde_actuel < montant_decimal:
+            detail = f" ({contexte})" if contexte else ""
+            raise ValidationError(
+                f"❌ Solde insuffisant dans le compte '{self.nom}' "
+                f"({self.banque}){detail}. "
+                f"Solde disponible : {self.solde_actuel:,.0f} FCFA, "
+                f"montant à payer : {montant_decimal:,.0f} FCFA. "
+                f"Manquant : {(montant_decimal - self.solde_actuel):,.0f} FCFA."
+            )
 
     def mettre_a_jour_solde(self):
         """
@@ -352,6 +473,40 @@ class MouvementTresorerie(models.Model):
     def __str__(self):
         return f"{self.reference} - {self.type_mouvement} - {self.montant:,.0f} XOF"
 
+    def clean(self):
+        """
+        ✅ Validation complète incluant le contrôle du solde
+        pour les décaissements effectués.
+        """
+        # Au moins une destination
+        if not self.caisse and not self.compte_bancaire:
+            raise ValidationError(
+                "Vous devez spécifier une caisse ou un compte bancaire."
+            )
+
+        # Montant positif
+        if self.montant is not None and self.montant <= 0:
+            raise ValidationError(
+                {"montant": "Le montant doit etre superieur a 0."}
+            )
+
+        # ✅ Contrôle du solde pour les décaissements EFFECTUÉS
+        if (
+            self.type_mouvement == 'decaissement'
+            and self.status == 'effectue'
+            and self.pk is None  # uniquement à la création
+        ):
+            if self.caisse and not self.compte_bancaire:
+                self.caisse.verifier_solde_suffisant(
+                    self.montant,
+                    contexte=f"mouvement {self.reference or 'nouveau'}"
+                )
+            elif self.compte_bancaire and not self.caisse:
+                self.compte_bancaire.verifier_solde_suffisant(
+                    self.montant,
+                    contexte=f"mouvement {self.reference or 'nouveau'}"
+                )
+
     def save(self, *args, **kwargs):
         if not self.reference:
             from datetime import datetime
@@ -372,6 +527,24 @@ class MouvementTresorerie(models.Model):
             else:
                 self.reference = f"{prefix}0001"
 
+        # ✅ Contrôle du solde AVANT sauvegarde (sécurité supplémentaire)
+        if (
+            self.pk is None
+            and self.type_mouvement == 'decaissement'
+            and self.status == 'effectue'
+            and self.montant
+        ):
+            if self.caisse and not self.compte_bancaire:
+                self.caisse.verifier_solde_suffisant(
+                    self.montant,
+                    contexte=f"mouvement {self.reference}"
+                )
+            elif self.compte_bancaire and not self.caisse:
+                self.compte_bancaire.verifier_solde_suffisant(
+                    self.montant,
+                    contexte=f"mouvement {self.reference}"
+                )
+
         super().save(*args, **kwargs)
 
     def get_source_object(self):
@@ -381,37 +554,37 @@ class MouvementTresorerie(models.Model):
             try:
                 from achats_fournisseurs.models import PurchaseOrder
                 return PurchaseOrder.objects.get(id=self.source_id)
-            except:
+            except Exception:
                 return None
         elif self.source_type == 'facture_fournisseur':
             try:
                 from achats_fournisseurs.models import SupplierInvoice
                 return SupplierInvoice.objects.get(id=self.source_id)
-            except:
+            except Exception:
                 return None
         elif self.source_type == 'paiement_fournisseur':
             try:
                 from achats_fournisseurs.models import FournisseurPaiement
                 return FournisseurPaiement.objects.get(id=self.source_id)
-            except:
+            except Exception:
                 return None
         elif self.source_type == 'vente':
             try:
                 from ventes_clients.models import Vente
                 return Vente.objects.get(id=self.source_id)
-            except:
+            except Exception:
                 return None
         elif self.source_type == 'facture_client':
             try:
                 from ventes_clients.models import Facture
                 return Facture.objects.get(id=self.source_id)
-            except:
+            except Exception:
                 return None
         elif self.source_type == 'paiement_client':
             try:
                 from ventes_clients.models import Paiement
                 return Paiement.objects.get(id=self.source_id)
-            except:
+            except Exception:
                 return None
         return None
 
@@ -430,6 +603,20 @@ class MouvementTresorerie(models.Model):
     def valider(self, user=None):
         if self.status == 'effectue':
             return False
+
+        # ✅ Contrôle du solde AVANT validation
+        if self.type_mouvement == 'decaissement':
+            if self.caisse and not self.compte_bancaire:
+                self.caisse.verifier_solde_suffisant(
+                    self.montant,
+                    contexte=f"validation du mouvement {self.reference}"
+                )
+            elif self.compte_bancaire and not self.caisse:
+                self.compte_bancaire.verifier_solde_suffisant(
+                    self.montant,
+                    contexte=f"validation du mouvement {self.reference}"
+                )
+
         self.status = 'effectue'
         if user:
             self.valide_par = user
@@ -579,6 +766,12 @@ class Frais(models.Model):
                     f"caisse par defaut."
                 )
 
+            # ✅ Contrôle du solde AVANT création du mouvement
+            caisse_defaut.verifier_solde_suffisant(
+                self.montant,
+                contexte=f"paiement du frais {self.reference}"
+            )
+
             mouvement = MouvementTresorerie.objects.create(
                 type_mouvement='decaissement',
                 warehouse=self.warehouse,
@@ -602,7 +795,7 @@ class Frais(models.Model):
             try:
                 from achats_fournisseurs.models import Supplier
                 return Supplier.objects.get(id=self.supplier_id)
-            except:
+            except Exception:
                 return None
         return None
 

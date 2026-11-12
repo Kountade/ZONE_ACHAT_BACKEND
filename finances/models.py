@@ -5,6 +5,7 @@
 
 from django.db import models
 from django.utils import timezone
+from django.core.exceptions import ValidationError
 from decimal import Decimal
 from django.core.validators import MinValueValidator, MaxValueValidator
 
@@ -409,6 +410,12 @@ class Depense(models.Model):
     purchase_order_id = models.IntegerField(
         null=True, blank=True, verbose_name="ID Bon de commande")
 
+    # ✅ NOUVEAU : destination de paiement (caisse ou compte bancaire)
+    caisse_destination_id = models.IntegerField(
+        null=True, blank=True, verbose_name="ID Caisse de décaissement")
+    compte_destination_id = models.IntegerField(
+        null=True, blank=True, verbose_name="ID Compte bancaire de décaissement")
+
     notes = models.TextField(blank=True, verbose_name="Notes")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -473,18 +480,131 @@ class Depense(models.Model):
             'statut', 'approuve_par', 'approuve_le', 'updated_at'
         ])
 
+    # =========================================================
+    # ✅ MÉTHODES DE CONTRÔLE DU SOLDE
+    # =========================================================
+
+    def _resoudre_destination(self):
+        """
+        Résout la caisse ou le compte bancaire à débiter.
+
+        Ordre de priorité :
+        1. Caisse explicitement sélectionnée (caisse_destination_id)
+        2. Compte explicitement sélectionné (compte_destination_id)
+        3. Caisse par défaut active (is_default=True)
+        4. Première caisse active disponible
+
+        Returns:
+            tuple: (caisse, compte)
+        """
+        try:
+            from tresorerie.models import Caisse, CompteBancaire
+        except ImportError:
+            return None, None
+
+        caisse = None
+        compte = None
+
+        # 1. Destination explicite : caisse
+        if self.caisse_destination_id:
+            try:
+                caisse = Caisse.objects.get(
+                    id=self.caisse_destination_id, is_active=True
+                )
+            except Caisse.DoesNotExist:
+                caisse = None
+
+        # 2. Destination explicite : compte
+        if self.compte_destination_id and not caisse:
+            try:
+                compte = CompteBancaire.objects.get(
+                    id=self.compte_destination_id, is_active=True
+                )
+            except CompteBancaire.DoesNotExist:
+                compte = None
+
+        # 3. Fallback : caisse par défaut
+        if not caisse and not compte:
+            caisse = Caisse.objects.filter(
+                is_default=True, is_active=True
+            ).first()
+
+        # 4. Fallback : première caisse active
+        if not caisse and not compte:
+            caisse = Caisse.objects.filter(is_active=True).first()
+
+        return caisse, compte
+
+    def verifier_solde_suffisant(self):
+        """
+        Vérifie que la caisse/compte peut payer le montant total.
+
+        Lève ValidationError si insuffisant.
+        """
+        caisse, compte = self._resoudre_destination()
+
+        if not caisse and not compte:
+            raise ValidationError(
+                "❌ Aucune caisse active disponible pour enregistrer "
+                f"la dépense {self.reference}. Veuillez configurer une "
+                "caisse par défaut ou sélectionner une destination."
+            )
+
+        contexte = f"paiement de la dépense {self.reference}"
+
+        if caisse and not compte:
+            caisse.verifier_solde_suffisant(self.total, contexte=contexte)
+        elif compte and not caisse:
+            compte.verifier_solde_suffisant(self.total, contexte=contexte)
+
+        return True
+
+    def get_destination_info(self):
+        """
+        Retourne les informations sur la destination de paiement
+        (utile pour l'affichage frontend).
+        """
+        caisse, compte = self._resoudre_destination()
+
+        if caisse:
+            return {
+                'type': 'caisse',
+                'id': caisse.id,
+                'nom': caisse.nom,
+                'solde_actuel': caisse.solde_actuel,
+                'peut_payer': caisse.peut_payer(self.total),
+            }
+        elif compte:
+            return {
+                'type': 'compte_bancaire',
+                'id': compte.id,
+                'nom': compte.nom,
+                'banque': compte.banque,
+                'solde_actuel': compte.solde_actuel,
+                'peut_payer': compte.peut_payer(self.total),
+            }
+        return None
+
+    # =========================================================
+    # ✅ PAIEMENT
+    # =========================================================
+
     def payer(self, user):
         """
         ✅ Marque la dépense comme payée et déclenche automatiquement :
         - La création d'un MouvementTresorerie (décaissement)
         - La création d'une EcritureComptable
-        """
-        from django.core.exceptions import ValidationError
 
+        Contrôle du solde AVANT toute écriture.
+        """
         if self.statut not in ['approuve', 'en_attente']:
             raise ValidationError(
-                f"Impossible de payer une dépense au statut '{self.get_statut_display()}'"
+                f"Impossible de payer une dépense au statut "
+                f"'{self.get_statut_display()}'"
             )
+
+        # ✅ CONTRÔLE DU SOLDE AVANT DE MARQUER COMME PAYÉ
+        self.verifier_solde_suffisant()
 
         self.statut = 'paye'
         self.date_paiement = timezone.now().date()
@@ -498,6 +618,8 @@ class Depense(models.Model):
         """
         Crée le mouvement de trésorerie ET l'écriture comptable associée.
         Idempotent : ne crée pas de doublons.
+
+        ✅ Contrôle du solde avant création du mouvement.
         """
         result = {'mouvement_id': None, 'ecriture_id': None, 'errors': []}
 
@@ -506,19 +628,26 @@ class Depense(models.Model):
         # ============================================================
         if not self.tresorerie_id:
             try:
-                from tresorerie.models import MouvementTresorerie, Caisse
+                from tresorerie.models import MouvementTresorerie
 
-                caisse = Caisse.objects.filter(
-                    is_default=True, is_active=True
-                ).first()
+                caisse, compte = self._resoudre_destination()
 
-                if not caisse:
-                    caisse = Caisse.objects.filter(is_active=True).first()
-
-                if not caisse:
-                    from django.core.exceptions import ValidationError
+                if not caisse and not compte:
                     raise ValidationError(
-                        "Aucune caisse active disponible pour enregistrer la dépense."
+                        "❌ Aucune caisse active disponible pour enregistrer "
+                        f"la dépense {self.reference}. Veuillez configurer "
+                        "une caisse par défaut."
+                    )
+
+                # ✅ CONTRÔLE DU SOLDE AVANT CRÉATION
+                contexte = f"paiement de la dépense {self.reference}"
+                if caisse and not compte:
+                    caisse.verifier_solde_suffisant(
+                        self.total, contexte=contexte
+                    )
+                elif compte and not caisse:
+                    compte.verifier_solde_suffisant(
+                        self.total, contexte=contexte
                     )
 
                 mouvement = MouvementTresorerie.objects.create(
@@ -529,11 +658,14 @@ class Depense(models.Model):
                     montant=self.total,
                     mode_paiement=self.mode_paiement or 'especes',
                     caisse=caisse,
-                    compte_bancaire=None,
+                    compte_bancaire=compte,
                     date_mouvement=timezone.now(),
                     date_valeur=self.date_paiement or timezone.now().date(),
                     status='effectue',
-                    libelle=f"Dépense {self.reference} - {self.description[:100]}",
+                    libelle=(
+                        f"Dépense {self.reference} - "
+                        f"{self.description[:100]}"
+                    ),
                     notes=self.notes or '',
                     created_by=user
                 )
@@ -541,17 +673,25 @@ class Depense(models.Model):
                 self.tresorerie_id = mouvement.id
                 self.save(update_fields=['tresorerie_id', 'updated_at'])
 
-                # Mise à jour du solde de la caisse
-                caisse.solde_actuel -= self.total
-                caisse.save(update_fields=['solde_actuel', 'updated_at'])
+                # Mise à jour du solde (en plus de la mise à jour via signal)
+                if caisse:
+                    caisse.solde_actuel -= self.total
+                    caisse.save(update_fields=['solde_actuel', 'updated_at'])
+                if compte:
+                    compte.solde_actuel -= self.total
+                    compte.save(update_fields=['solde_actuel', 'updated_at'])
 
                 result['mouvement_id'] = mouvement.id
 
             except ImportError as e:
                 result['errors'].append(
                     f"Module trésorerie indisponible : {e}")
+            except ValidationError as e:
+                # ✅ Propager l'erreur de solde insuffisant
+                raise
             except Exception as e:
-                result['errors'].append(f"Erreur mouvement trésorerie : {e}")
+                result['errors'].append(
+                    f"Erreur mouvement trésorerie : {e}")
 
         else:
             result['mouvement_id'] = self.tresorerie_id
@@ -601,7 +741,11 @@ class Depense(models.Model):
                 )
 
                 ecriture = EcritureComptable.objects.create(
-                    numero=f"ECR-DEP-{timezone.now().strftime('%Y%m%d%H%M%S')}-{self.id}",
+                    numero=(
+                        f"ECR-DEP-"
+                        f"{timezone.now().strftime('%Y%m%d%H%M%S')}-"
+                        f"{self.id}"
+                    ),
                     date_ecriture=self.date_paiement or timezone.now().date(),
                     compte_debit=compte_charge,
                     compte_credit=compte_tresorerie,
@@ -611,8 +755,14 @@ class Depense(models.Model):
                     reference=self.reference,
                     type='depense',
                     statut='valide',
-                    description=f"Dépense {self.reference} - {self.description[:200]}",
-                    notes=f"Écriture générée automatiquement depuis la dépense {self.reference}",
+                    description=(
+                        f"Dépense {self.reference} - "
+                        f"{self.description[:200]}"
+                    ),
+                    notes=(
+                        f"Écriture générée automatiquement depuis "
+                        f"la dépense {self.reference}"
+                    ),
                     created_by=user,
                     validated_by=user,
                     validated_at=timezone.now()

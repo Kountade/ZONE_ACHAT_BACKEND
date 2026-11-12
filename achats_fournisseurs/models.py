@@ -612,8 +612,13 @@ class Receipt(models.Model):
         self.qr_code.save(filename, File(buffer), save=False)
 
     def creer_mouvement_decaissement(self, user):
+        """
+        ✅ Crée un mouvement de décaissement pour la réception.
+        Contrôle du solde AVANT création.
+        """
         if self.mouvement_tresorerie_id:
             return self.mouvement_tresorerie_id
+
         try:
             from tresorerie.models import MouvementTresorerie, Caisse, CompteBancaire
         except ImportError:
@@ -649,6 +654,18 @@ class Receipt(models.Model):
 
         if not caisse and not compte:
             return None
+
+        # ✅ CONTRÔLE DU SOLDE AVANT DÉCAISSEMENT
+        if caisse and not compte:
+            caisse.verifier_solde_suffisant(
+                total_recu,
+                contexte=f"réception {self.receipt_number}"
+            )
+        elif compte and not caisse:
+            compte.verifier_solde_suffisant(
+                total_recu,
+                contexte=f"réception {self.receipt_number}"
+            )
 
         mouvement = MouvementTresorerie.objects.create(
             type_mouvement='decaissement',
@@ -1087,13 +1104,19 @@ class FournisseurPaiement(models.Model):
         filename = f"qr_fournisseur_paiement_{self.reference}.png"
         self.qr_code.save(filename, File(buffer), save=False)
 
-    def creer_mouvement_tresorerie(self, user):
-        if self.mouvement_tresorerie_id:
-            return self.mouvement_tresorerie_id
+    # =========================================================
+    # ✅ MÉTHODE UTILITAIRE : Résoudre la caisse/compte
+    # =========================================================
+
+    def _resoudre_destination(self):
+        """
+        Résout la caisse ou le compte bancaire à débiter.
+        Retourne (caisse, compte, warehouse) ou (None, None, None).
+        """
         try:
-            from tresorerie.models import MouvementTresorerie, Caisse, CompteBancaire
+            from tresorerie.models import Caisse, CompteBancaire
         except ImportError:
-            return None
+            return None, None, None
 
         caisse = None
         compte = None
@@ -1111,12 +1134,11 @@ class FournisseurPaiement(models.Model):
             except CompteBancaire.DoesNotExist:
                 pass
 
+        # Fallback caisse par défaut
         if not caisse and not compte:
             caisse = Caisse.objects.filter(is_default=True).first()
 
-        if not caisse and not compte:
-            return None
-
+        # Résolution warehouse
         warehouse = None
         if self.purchase_order:
             receipt = self.purchase_order.receipts.first()
@@ -1130,6 +1152,63 @@ class FournisseurPaiement(models.Model):
 
         if not warehouse and caisse:
             warehouse = caisse.warehouse
+
+        return caisse, compte, warehouse
+
+    # =========================================================
+    # ✅ CONTRÔLE DU SOLDE AVANT DÉCAISSEMENT
+    # =========================================================
+
+    def verifier_solde_suffisant(self):
+        """
+        Vérifie que la caisse/compte peut payer le montant.
+        Lève ValidationError si insuffisant.
+        """
+        caisse, compte, _ = self._resoudre_destination()
+
+        if not caisse and not compte:
+            raise ValidationError(
+                "❌ Aucune caisse ou compte bancaire disponible pour "
+                "enregistrer le paiement. Veuillez configurer une caisse "
+                "par défaut ou sélectionner une destination."
+            )
+
+        contexte = f"paiement {self.reference or 'nouveau'} - facture {self.supplier_invoice.invoice_number}"
+
+        if caisse and not compte:
+            caisse.verifier_solde_suffisant(self.amount, contexte=contexte)
+        elif compte and not caisse:
+            compte.verifier_solde_suffisant(self.amount, contexte=contexte)
+
+        return True
+
+    def creer_mouvement_tresorerie(self, user):
+        """
+        ✅ Crée un mouvement de décaissement pour le paiement.
+        Contrôle du solde AVANT création.
+        """
+        if self.mouvement_tresorerie_id:
+            return self.mouvement_tresorerie_id
+
+        try:
+            from tresorerie.models import MouvementTresorerie
+        except ImportError:
+            return None
+
+        caisse, compte, warehouse = self._resoudre_destination()
+
+        if not caisse and not compte:
+            raise ValidationError(
+                "❌ Aucune caisse ou compte bancaire disponible pour "
+                "enregistrer le paiement."
+            )
+
+        # ✅ CONTRÔLE DU SOLDE AVANT CRÉATION
+        contexte = f"paiement {self.reference} - facture {self.supplier_invoice.invoice_number}"
+        if caisse and not compte:
+            caisse.verifier_solde_suffisant(self.amount, contexte=contexte)
+        elif compte and not caisse:
+            compte.verifier_solde_suffisant(self.amount, contexte=contexte)
 
         mouvement = MouvementTresorerie.objects.create(
             type_mouvement='decaissement',
@@ -1148,6 +1227,7 @@ class FournisseurPaiement(models.Model):
             created_by=user
         )
 
+        # Mise à jour directe du solde (en plus de la mise à jour via signal)
         if caisse:
             caisse.solde_actuel -= self.amount
             caisse.save(update_fields=['solde_actuel', 'updated_at'])

@@ -18,8 +18,9 @@ from produits_stocks.models import Product, Lot, Stock, StockMovement
 
 
 # ============================================================
-# ✅ FONCTION UTILITAIRE : Calcul du % de réception
+# ✅ FONCTIONS UTILITAIRES
 # ============================================================
+
 def calculate_receipt_progress(obj):
     """
     ✅ Calcule le % de réception d'une commande.
@@ -27,13 +28,11 @@ def calculate_receipt_progress(obj):
     - Fallback sur les quantités si total = 0
     """
     try:
-        # Option 1 : Montant
         if obj.total and float(obj.total) > 0:
             received = float(obj.total_received_amount or 0)
             total = float(obj.total)
             return round((received / total) * 100, 2)
 
-        # Option 2 : Quantités (fallback)
         lines = obj.lines.all()
         total_ordered = sum(line.quantity for line in lines)
         total_received = sum(line.quantity_received for line in lines)
@@ -68,6 +67,72 @@ def calculate_payment_progress(obj):
     return 0
 
 
+def valider_solde_destination(caisse_id, compte_id, montant, champ_name='amount'):
+    """
+    ✅ Valide que la caisse ou le compte bancaire peut payer le montant.
+
+    Args:
+        caisse_id: ID de la caisse (ou None)
+        compte_id: ID du compte bancaire (ou None)
+        montant: Montant à payer
+        champ_name: Nom du champ pour le message d'erreur
+
+    Raises:
+        serializers.ValidationError si solde insuffisant
+    """
+    try:
+        from tresorerie.models import Caisse, CompteBancaire
+    except ImportError:
+        # Module trésorerie indisponible : on ne peut pas vérifier
+        return
+
+    caisse = None
+    compte = None
+
+    if caisse_id:
+        caisse = Caisse.objects.filter(id=caisse_id, is_active=True).first()
+        if not caisse:
+            raise serializers.ValidationError({
+                champ_name: f"Caisse introuvable ou inactive (ID: {caisse_id})"
+            })
+
+    if compte_id:
+        compte = CompteBancaire.objects.filter(
+            id=compte_id, is_active=True
+        ).first()
+        if not compte:
+            raise serializers.ValidationError({
+                champ_name: f"Compte bancaire introuvable ou inactif (ID: {compte_id})"
+            })
+
+    if not caisse and not compte:
+        raise serializers.ValidationError({
+            champ_name: "Veuillez sélectionner une caisse ou un compte bancaire."
+        })
+
+    # ✅ CONTRÔLE DU SOLDE
+    if caisse and not compte:
+        if not caisse.peut_payer(montant):
+            raise serializers.ValidationError({
+                champ_name: (
+                    f"❌ Solde insuffisant dans la caisse '{caisse.nom}'. "
+                    f"Solde disponible : {caisse.solde_actuel:,.0f} FCFA, "
+                    f"montant à payer : {montant:,.0f} FCFA."
+                )
+            })
+
+    if compte and not caisse:
+        if not compte.peut_payer(montant):
+            raise serializers.ValidationError({
+                champ_name: (
+                    f"❌ Solde insuffisant dans le compte '{compte.nom}' "
+                    f"({compte.banque}). "
+                    f"Solde disponible : {compte.solde_actuel:,.0f} FCFA, "
+                    f"montant à payer : {montant:,.0f} FCFA."
+                )
+            })
+
+
 # ============================================================
 # ✅ SERIALIZERS LITE (pour éviter N+1)
 # ============================================================
@@ -90,19 +155,15 @@ class SupplierLiteSerializer(serializers.ModelSerializer):
 class PurchaseOrderLiteSerializer(serializers.ModelSerializer):
     """
     ✅ Serializer léger pour listes déroulantes (réceptions, factures).
-    ⚠️ CORRIGÉ : Ajoute le % de réception calculé AVANT sélection.
     """
     supplier_name = serializers.CharField(
         source='supplier.name', read_only=True)
     status_display = serializers.CharField(
         source='get_status_display', read_only=True)
 
-    # ✅ NOUVEAU : Pourcentage de réception calculé
     receipt_progress = serializers.SerializerMethodField()
-    # ✅ NOUVEAU : Autres progressions (utiles pour d'autres écrans)
     invoice_progress = serializers.SerializerMethodField()
     payment_progress = serializers.SerializerMethodField()
-    # ✅ NOUVEAU : Montants détaillés
     total_received_amount = serializers.ReadOnlyField()
     total_invoiced_amount = serializers.ReadOnlyField()
     total_paid_amount = serializers.ReadOnlyField()
@@ -114,14 +175,12 @@ class PurchaseOrderLiteSerializer(serializers.ModelSerializer):
             'order_date', 'expected_delivery_date',
             'total', 'status', 'status_display',
             'is_fully_received', 'is_fully_invoiced', 'is_fully_paid',
-            # ✅ Nouveaux champs
             'receipt_progress', 'invoice_progress', 'payment_progress',
             'total_received_amount', 'total_invoiced_amount', 'total_paid_amount',
         ]
         read_only_fields = ['id', 'order_date', 'po_number']
 
     def get_receipt_progress(self, obj):
-        """✅ Calcule le % de réception - disponible AVANT sélection."""
         return calculate_receipt_progress(obj)
 
     def get_invoice_progress(self, obj):
@@ -332,11 +391,9 @@ class PurchaseOrderListSerializer(serializers.ModelSerializer):
     status_display = serializers.CharField(
         source='get_status_display', read_only=True)
     has_qr_code = serializers.SerializerMethodField()
-    # ✅ CORRIGÉ : utiliser les mêmes utilitaires que Lite
     receipt_progress = serializers.SerializerMethodField()
     payment_progress = serializers.SerializerMethodField()
     invoice_progress = serializers.SerializerMethodField()
-    # ✅ NOUVEAU : Montants
     total_received_amount = serializers.ReadOnlyField()
     total_invoiced_amount = serializers.ReadOnlyField()
     total_paid_amount = serializers.ReadOnlyField()
@@ -695,12 +752,56 @@ class ReceiptCreateSerializer(serializers.ModelSerializer):
                     f"restante ({quantity_remaining})"
                 )
 
-        caisse = data.get('caisse_destination_id')
-        compte = data.get('compte_destination_id')
-        if caisse and compte:
+        caisse_id = data.get('caisse_destination_id')
+        compte_id = data.get('compte_destination_id')
+        if caisse_id and compte_id:
             raise serializers.ValidationError(
                 "Choisissez une seule destination (caisse ou compte)."
             )
+
+        # ✅ CONTRÔLE DU SOLDE AVANT CRÉATION
+        # Calcul du montant total de la réception
+        montant_total = Decimal('0')
+        for line_data in lines_data:
+            po_line = line_data.get('po_line')
+            quantity_received = line_data.get('quantity_received', 0)
+            if po_line:
+                montant_total += Decimal(quantity_received) * \
+                    po_line.unit_price
+
+        if montant_total > 0:
+            # Vérifier que la destination est fournie
+            if not caisse_id and not compte_id:
+                # Fallback : caisse par défaut du warehouse
+                warehouse = data.get('warehouse')
+                if warehouse:
+                    try:
+                        from tresorerie.models import Caisse
+                        caisse_defaut = Caisse.objects.filter(
+                            warehouse=warehouse, is_default=True, is_active=True
+                        ).first()
+                        if caisse_defaut:
+                            caisse_id = caisse_defaut.id
+                            data['caisse_destination_id'] = caisse_id
+                        else:
+                            # Fallback global
+                            caisse_global = Caisse.objects.filter(
+                                is_default=True, is_active=True
+                            ).first()
+                            if caisse_global:
+                                caisse_id = caisse_global.id
+                                data['caisse_destination_id'] = caisse_id
+                    except ImportError:
+                        pass
+
+            # ✅ Vérifier le solde
+            valider_solde_destination(
+                caisse_id=caisse_id,
+                compte_id=compte_id,
+                montant=montant_total,
+                champ_name='lines'
+            )
+
         return data
 
     @transaction.atomic
@@ -807,7 +908,15 @@ class ReceiptCreateSerializer(serializers.ModelSerializer):
         receipt.status = 'completed'
         receipt.save()
 
-        receipt.creer_mouvement_decaissement(user)
+        # ✅ Créer le mouvement de décaissement (avec contrôle du solde)
+        try:
+            receipt.creer_mouvement_decaissement(user)
+        except Exception as e:
+            # Propager l'erreur de solde insuffisant
+            raise serializers.ValidationError({
+                'lines': f"❌ Impossible de créer le mouvement de trésorerie : {str(e)}"
+            })
+
         receipt.generate_qr_code()
         receipt.save()
 
@@ -1307,6 +1416,10 @@ class SupplierInvoiceUpdateSerializer(serializers.ModelSerializer):
 
 
 class SupplierInvoicePaymentSerializer(serializers.Serializer):
+    """
+    ✅ Serializer pour l'action add_payment sur une facture.
+    Contrôle du solde de la caisse/compte AVANT paiement.
+    """
     amount = serializers.DecimalField(max_digits=12, decimal_places=2)
     payment_date = serializers.DateField()
     payment_reference = serializers.CharField(required=False, allow_blank=True)
@@ -1323,12 +1436,27 @@ class SupplierInvoicePaymentSerializer(serializers.Serializer):
         return value
 
     def validate(self, data):
-        caisse = data.get('caisse_destination_id')
-        compte = data.get('compte_destination_id')
-        if caisse and compte:
+        caisse_id = data.get('caisse_destination_id')
+        compte_id = data.get('compte_destination_id')
+
+        if caisse_id and compte_id:
             raise serializers.ValidationError(
                 "Choisissez une seule destination (caisse ou compte)."
             )
+
+        if not caisse_id and not compte_id:
+            raise serializers.ValidationError(
+                "Veuillez sélectionner une caisse ou un compte bancaire."
+            )
+
+        # ✅ CONTRÔLE DU SOLDE
+        valider_solde_destination(
+            caisse_id=caisse_id,
+            compte_id=compte_id,
+            montant=data.get('amount', 0),
+            champ_name='amount'
+        )
+
         return data
 
 
@@ -1444,6 +1572,11 @@ class FournisseurPaiementSerializer(serializers.ModelSerializer):
 
 
 class FournisseurPaiementCreateSerializer(serializers.ModelSerializer):
+    """
+    ✅ Serializer pour créer un paiement fournisseur.
+    Contrôle du solde de la caisse/compte AVANT paiement.
+    """
+
     class Meta:
         model = FournisseurPaiement
         fields = ['supplier_invoice', 'purchase_order', 'amount', 'method',
@@ -1460,6 +1593,7 @@ class FournisseurPaiementCreateSerializer(serializers.ModelSerializer):
         supplier_invoice = data.get('supplier_invoice')
         amount = data.get('amount', 0)
 
+        # ✅ Validation par rapport à la facture
         if supplier_invoice:
             remaining = supplier_invoice.total_amount - supplier_invoice.amount_paid
 
@@ -1476,17 +1610,26 @@ class FournisseurPaiementCreateSerializer(serializers.ModelSerializer):
                     "supplier_invoice": "❌ Cette facture est déjà entièrement payée"
                 })
 
-        caisse = data.get('caisse_destination_id')
-        compte = data.get('compte_destination_id')
-        if caisse and compte:
+        caisse_id = data.get('caisse_destination_id')
+        compte_id = data.get('compte_destination_id')
+
+        if caisse_id and compte_id:
             raise serializers.ValidationError(
                 "Choisissez une seule destination (caisse ou compte)."
             )
 
-        if not caisse and not compte:
+        if not caisse_id and not compte_id:
             raise serializers.ValidationError(
                 "Veuillez sélectionner une caisse ou un compte bancaire."
             )
+
+        # ✅ CONTRÔLE DU SOLDE
+        valider_solde_destination(
+            caisse_id=caisse_id,
+            compte_id=compte_id,
+            montant=amount,
+            champ_name='amount'
+        )
 
         return data
 
@@ -1517,7 +1660,15 @@ class FournisseurPaiementCreateSerializer(serializers.ModelSerializer):
         if purchase_order:
             purchase_order.update_payment_status()
 
-        paiement.creer_mouvement_tresorerie(user)
+        # ✅ Créer le mouvement (contrôle du solde en interne)
+        try:
+            paiement.creer_mouvement_tresorerie(user)
+        except Exception as e:
+            # Propager l'erreur de solde insuffisant
+            raise serializers.ValidationError({
+                'amount': f"❌ Impossible de créer le mouvement : {str(e)}"
+            })
+
         paiement.generate_qr_code()
         paiement.save()
 

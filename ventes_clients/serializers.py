@@ -2,6 +2,7 @@
 # ============================================================
 # SERIALIZERS COMPLET — LOGICIEL B
 # ✅ ZÉRO N+1 — Optimisé pour 10 000+ lignes < 1s
+# ✅ FIX : total des lignes calculé AVANT bulk_create
 # ============================================================
 
 from django.db import models
@@ -41,9 +42,18 @@ def _cached_related(obj, attr):
     Accède à une relation one-to-one / FK déjà chargée via select_related.
     Utilise le cache d'attribut Django — pas de requête si select_related est fait.
     """
-    # Django cache les FK après le premier accès -> si la vue a fait
-    # select_related, aucune requête n'est émise ici.
     return getattr(obj, attr, None)
+
+
+def _compute_line_total(quantity, unit_price, discount):
+    """
+    ✅ Calcule le total d'une ligne : (qty × prix) − remise, jamais négatif.
+    Utilisé pour contourner bulk_create() qui bypass LigneVente.save().
+    """
+    qty = Decimal(str(quantity or 0))
+    price = Decimal(str(unit_price or 0))
+    disc = Decimal(str(discount or 0))
+    return max(Decimal('0.00'), (qty * price) - disc)
 
 
 # ============================================================
@@ -116,8 +126,7 @@ class DevisListSerializer(serializers.ModelSerializer):
     """
     ✅ Anti-N+1 :
     - select_related('client', 'warehouse') côté vue
-    - get_has_been_converted utilise la FK `sale` (déjà chargée via select_related
-      si la vue le fait ; sinon Django cache après 1er accès)
+    - get_has_been_converted utilise la FK `sale` (déjà chargée via select_related)
     """
     client_name = serializers.CharField(source='client.name', read_only=True)
     status_display = serializers.CharField(
@@ -145,7 +154,6 @@ class DevisListSerializer(serializers.ModelSerializer):
         return obj.valid_until < date.today() and obj.status not in ['accepted', 'converted']
 
     def get_has_been_converted(self, obj):
-        # ✅ Pas de requête : utilise la FK sale (select_related côté vue)
         return obj.status == 'converted' and obj.sale_id is not None
 
 
@@ -204,7 +212,6 @@ class DevisDetailSerializer(serializers.ModelSerializer):
         return None
 
     def get_sale_info(self, obj):
-        # ✅ Pas de requête si select_related('sale__client', 'sale__warehouse')
         if not obj.sale_id:
             return None
         return VenteListSerializer(obj.sale, context=self.context).data
@@ -248,7 +255,6 @@ class DevisCreateSerializer(serializers.ModelSerializer):
         lignes_data = validated_data.pop('lignes')
         client = validated_data.get('client')
 
-        # ✅ Génération du numéro : 1 seule requête (fiable)
         from .models import generate_number
         devis_number = generate_number(Devis, 'devis_number', 'DEV')
 
@@ -261,11 +267,19 @@ class DevisCreateSerializer(serializers.ModelSerializer):
             **validated_data
         )
 
-        # ✅ bulk_create : 1 seule requête au lieu de N
-        LigneDevis.objects.bulk_create([
-            LigneDevis(devis=devis, **line_data)
-            for line_data in lignes_data
-        ])
+        # ✅ FIX : calculer total AVANT bulk_create
+        lignes_to_create = []
+        for line_data in lignes_data:
+            line_total = _compute_line_total(
+                line_data.get('quantity'),
+                line_data.get('unit_price'),
+                line_data.get('discount'),
+            )
+            lignes_to_create.append(
+                LigneDevis(devis=devis, total=line_total, **line_data)
+            )
+
+        LigneDevis.objects.bulk_create(lignes_to_create)
 
         devis.calculate_totals()
         devis.generate_qr_code()
@@ -389,9 +403,9 @@ class VenteListSerializer(serializers.ModelSerializer):
     """
     ✅ Anti-N+1 :
     - `has_facture` : utilise l'annotation `has_invoice_annotated`
-      OU le prefetch `invoices` (via _prefetched_objects_cache). Aucune requête.
-    - `from_devis` : utilise le prefetch `devis_source` (pas de filter/exists).
-    - `client_name` : select_related côté vue (pas de requête).
+      OU le prefetch `invoices`. Aucune requête.
+    - `from_devis` : utilise le prefetch `devis_source`.
+    - `client_name` : select_related côté vue.
     - `warehouse_name` : select_related côté vue.
     """
     client_name = serializers.CharField(source='client.name', read_only=True)
@@ -419,29 +433,24 @@ class VenteListSerializer(serializers.ModelSerializer):
         return f"{obj.total:,.0f} FCFA" if obj.total else "0 FCFA"
 
     def get_has_facture(self, obj):
-        # ✅ 1) Annotation (préférée — fournie par la vue)
         if hasattr(obj, 'has_invoice_annotated'):
             return bool(obj.has_invoice_annotated)
-        # ✅ 2) Prefetch (si la vue a fait prefetch_related('invoices'))
         if _has_prefetch(obj, 'invoices'):
             return len(obj._prefetched_objects_cache['invoices']) > 0
-        # ⚠️ 3) Fallback : 1 requête (à éviter)
         return obj.invoices.exists()
 
     def get_from_devis(self, obj):
-        # ✅ Prefetch devis_source -> zéro requête
         if _has_prefetch(obj, 'devis_source'):
             return any(d.status == 'converted'
                        for d in obj._prefetched_objects_cache['devis_source'])
-        # ⚠️ Fallback
         return obj.devis_source.filter(status='converted').exists()
 
 
 class VenteDetailSerializer(serializers.ModelSerializer):
     """
     ✅ Anti-N+1 :
-    - `payments` : utilise le prefetch `invoices__paiements__facture__client`
-    - `factures` : utilise le prefetch `invoices` + `paiements`
+    - `payments` : prefetch `invoices__paiements__...`
+    - `factures` : prefetch `invoices`
     - `client_*` : select_related('client')
     - `from_devis` : prefetch `devis_source`
     """
@@ -501,9 +510,6 @@ class VenteDetailSerializer(serializers.ModelSerializer):
         return None
 
     def get_payments(self, obj):
-        """
-        ✅ Zéro requête si prefetch `invoices__paiements__facture__client` faits.
-        """
         paiements = []
         for facture in obj.invoices.all():
             for paiement in facture.paiements.all():
@@ -526,6 +532,10 @@ class VenteDetailSerializer(serializers.ModelSerializer):
 
 
 class VenteCreateSerializer(serializers.ModelSerializer):
+    """
+    ✅ FIX : calcule le total de chaque ligne AVANT bulk_create.
+    (bulk_create ne passe PAS par LigneVente.save() qui calcule normalement total.)
+    """
     lines = LigneVenteCreateSerializer(many=True)
 
     class Meta:
@@ -592,14 +602,26 @@ class VenteCreateSerializer(serializers.ModelSerializer):
             **validated_data
         )
 
-        # ✅ bulk_create au lieu de N create()
-        LigneVente.objects.bulk_create([
-            LigneVente(
-                sale=vente,
-                **{k: v for k, v in line_data.items() if k != 'price_type'}
+        # ✅ FIX : calculer total AVANT bulk_create
+        lignes_to_create = []
+        for line_data in lines_data:
+            line_total = _compute_line_total(
+                line_data.get('quantity'),
+                line_data.get('unit_price'),
+                line_data.get('discount'),
             )
-            for line_data in lines_data
-        ])
+            # Retirer 'price_type' (write_only, non stocké)
+            data = {k: v for k, v in line_data.items() if k != 'price_type'}
+
+            lignes_to_create.append(
+                LigneVente(
+                    sale=vente,
+                    total=line_total,   # ✅ total calculé
+                    **data
+                )
+            )
+
+        LigneVente.objects.bulk_create(lignes_to_create)
 
         vente.calculate_totals()
         vente.generate_qr_code()
@@ -609,6 +631,9 @@ class VenteCreateSerializer(serializers.ModelSerializer):
 
 
 class VenteUpdateSerializer(serializers.ModelSerializer):
+    """
+    ✅ FIX : calcule le total de chaque ligne AVANT bulk_create.
+    """
     lines = LigneVenteCreateSerializer(many=True, required=False)
 
     class Meta:
@@ -645,17 +670,32 @@ class VenteUpdateSerializer(serializers.ModelSerializer):
 
         if lines_data is not None:
             instance.lines.all().delete()
-            LigneVente.objects.bulk_create([
-                LigneVente(
-                    sale=instance,
-                    **{k: v for k, v in line_data.items() if k != 'price_type'}
+
+            # ✅ FIX : calculer total AVANT bulk_create
+            lignes_to_create = []
+            for line_data in lines_data:
+                line_total = _compute_line_total(
+                    line_data.get('quantity'),
+                    line_data.get('unit_price'),
+                    line_data.get('discount'),
                 )
-                for line_data in lines_data
-            ])
+                data = {k: v for k, v in line_data.items() if k !=
+                        'price_type'}
+
+                lignes_to_create.append(
+                    LigneVente(
+                        sale=instance,
+                        total=line_total,   # ✅ total calculé
+                        **data
+                    )
+                )
+
+            LigneVente.objects.bulk_create(lignes_to_create)
 
         instance.calculate_totals()
         instance.generate_qr_code()
         instance.save()
+
         return instance
 
 
@@ -682,8 +722,7 @@ class FactureSerializer(serializers.ModelSerializer):
     - `paiements` : prefetch('paiements__...') côté vue
     - `client_name` : select_related('client')
     - `sale_number` : select_related('sale')
-    - `remaining_amount` : champ ReadOnlyField → pas de requête (déjà calculé)
-    - `total_display`, `remaining_display` : formatage pur (zéro requête)
+    - `remaining_amount` : ReadOnlyField (déjà calculé)
     """
     client_name = serializers.CharField(source='client.name', read_only=True)
     sale_number = serializers.CharField(
@@ -721,8 +760,6 @@ class FactureSerializer(serializers.ModelSerializer):
         return None
 
     def get_paiements(self, obj):
-        # ✅ Pas de slice [:20] qui casserait le prefetch.
-        # Utilise les prefetch 'paiements__...' faits côté vue.
         if _has_prefetch(obj, 'paiements'):
             paiements = obj._prefetched_objects_cache['paiements']
         else:
@@ -1000,6 +1037,7 @@ class AvoirCreateSerializer(serializers.ModelSerializer):
     ✅ Anti-N+1 dans `validate` :
     - 1 requête pour toutes les lignes de la vente
     - 1 requête pour tous les retours cumulés
+    ✅ FIX : total LigneAvoir calculé AVANT bulk_create.
     """
     lignes = LigneAvoirCreateSerializer(many=True, required=False)
     restore_stock = serializers.BooleanField(
@@ -1065,7 +1103,8 @@ class AvoirCreateSerializer(serializers.ModelSerializer):
                     .values('ligne_vente_id')
                     .annotate(total_qty=models.Sum('quantity'))
                 )
-                deja_map = {r['ligne_vente_id']: r['total_qty'] for r in deja_qs}
+                deja_map = {r['ligne_vente_id']: r['total_qty']
+                            for r in deja_qs}
 
             for l in lignes:
                 product = l["product"]
@@ -1103,18 +1142,31 @@ class AvoirCreateSerializer(serializers.ModelSerializer):
 
         if lignes_data:
             total = sum(
-                (l["quantity"] * l["unit_price"]) - l.get("discount", 0)
+                (Decimal(str(l["quantity"])) * Decimal(str(l["unit_price"])))
+                - Decimal(str(l.get("discount") or 0))
                 for l in lignes_data
             )
             validated_data["amount"] = total
 
         avoir = Avoir.objects.create(**validated_data)
 
-        # ✅ bulk_create
-        LigneAvoir.objects.bulk_create([
-            LigneAvoir(avoir=avoir, **ligne_data)
-            for ligne_data in lignes_data
-        ])
+        # ✅ FIX : calculer total AVANT bulk_create
+        lignes_to_create = []
+        for ligne_data in lignes_data:
+            ligne_total = _compute_line_total(
+                ligne_data.get("quantity"),
+                ligne_data.get("unit_price"),
+                ligne_data.get("discount"),
+            )
+            lignes_to_create.append(
+                LigneAvoir(
+                    avoir=avoir,
+                    total=ligne_total,   # ✅ total calculé
+                    **{k: v for k, v in ligne_data.items() if k != "total"}
+                )
+            )
+
+        LigneAvoir.objects.bulk_create(lignes_to_create)
 
         return avoir
 
@@ -1156,7 +1208,6 @@ class RemiseSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at']
 
     def get_clients_count(self, obj):
-        # ✅ Annotation 'clients_count' si la vue la fournit
         if hasattr(obj, 'clients_count_annotated'):
             return obj.clients_count_annotated
         return obj.clients.count()
