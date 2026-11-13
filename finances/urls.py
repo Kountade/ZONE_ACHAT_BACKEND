@@ -9,11 +9,13 @@ from .views import (
     BudgetCategorieViewSet,
     RapportFinancierViewSet,
     ConfigurationFinanciereViewSet,
+    JournalComptableViewSet,
+    GrandLivreViewSet,
+    BalanceGeneraleViewSet,
     DashboardFinancierViewSet
 )
 
 router = DefaultRouter()
-
 router.register('comptes-comptables', CompteComptableViewSet,
                 basename='comptes-comptables')
 router.register('ecritures-comptables', EcritureComptableViewSet,
@@ -26,6 +28,11 @@ router.register('rapports-financiers', RapportFinancierViewSet,
                 basename='rapports-financiers')
 router.register('configuration-financiere',
                 ConfigurationFinanciereViewSet, basename='configuration-financiere')
+router.register('journal-comptable', JournalComptableViewSet,
+                basename='journal-comptable')
+router.register('grand-livre', GrandLivreViewSet, basename='grand-livre')
+router.register('balance-generale', BalanceGeneraleViewSet,
+                basename='balance-generale')
 router.register('dashboard-financier', DashboardFinancierViewSet,
                 basename='dashboard-financier')
 
