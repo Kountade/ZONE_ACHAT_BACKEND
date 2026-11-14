@@ -1,6 +1,6 @@
 # apps/achats_fournisseurs/serializers.py
 # ============================================================
-# SERIALIZERS COMPLET OPTIMISÉ - VERSION MISE À JOUR
+# SERIALIZERS COMPLET OPTIMISÉ - VERSION CORRIGÉE
 # ============================================================
 
 from rest_framework import serializers
@@ -22,11 +22,7 @@ from produits_stocks.models import Product, Lot, Stock, StockMovement
 # ============================================================
 
 def calculate_receipt_progress(obj):
-    """
-    ✅ Calcule le % de réception d'une commande.
-    - Basé sur le montant reçu / total (le plus fiable)
-    - Fallback sur les quantités si total = 0
-    """
+    """Calcule le % de réception d'une commande."""
     try:
         if obj.total and float(obj.total) > 0:
             received = float(obj.total_received_amount or 0)
@@ -44,7 +40,7 @@ def calculate_receipt_progress(obj):
 
 
 def calculate_invoice_progress(obj):
-    """✅ Calcule le % de facturation."""
+    """Calcule le % de facturation."""
     try:
         if obj.total and float(obj.total) > 0:
             invoiced = float(obj.total_invoiced_amount or 0)
@@ -56,7 +52,7 @@ def calculate_invoice_progress(obj):
 
 
 def calculate_payment_progress(obj):
-    """✅ Calcule le % de paiement."""
+    """Calcule le % de paiement."""
     try:
         if obj.total_invoiced_amount and float(obj.total_invoiced_amount) > 0:
             paid = float(obj.total_paid_amount or 0)
@@ -69,21 +65,11 @@ def calculate_payment_progress(obj):
 
 def valider_solde_destination(caisse_id, compte_id, montant, champ_name='amount'):
     """
-    ✅ Valide que la caisse ou le compte bancaire peut payer le montant.
-
-    Args:
-        caisse_id: ID de la caisse (ou None)
-        compte_id: ID du compte bancaire (ou None)
-        montant: Montant à payer
-        champ_name: Nom du champ pour le message d'erreur
-
-    Raises:
-        serializers.ValidationError si solde insuffisant
+    Valide que la caisse ou le compte bancaire peut payer le montant.
     """
     try:
         from tresorerie.models import Caisse, CompteBancaire
     except ImportError:
-        # Module trésorerie indisponible : on ne peut pas vérifier
         return
 
     caisse = None
@@ -110,7 +96,6 @@ def valider_solde_destination(caisse_id, compte_id, montant, champ_name='amount'
             champ_name: "Veuillez sélectionner une caisse ou un compte bancaire."
         })
 
-    # ✅ CONTRÔLE DU SOLDE
     if caisse and not compte:
         if not caisse.peut_payer(montant):
             raise serializers.ValidationError({
@@ -153,9 +138,7 @@ class SupplierLiteSerializer(serializers.ModelSerializer):
 
 
 class PurchaseOrderLiteSerializer(serializers.ModelSerializer):
-    """
-    ✅ Serializer léger pour listes déroulantes (réceptions, factures).
-    """
+    """Serializer léger pour listes déroulantes (réceptions, factures)."""
     supplier_name = serializers.CharField(
         source='supplier.name', read_only=True)
     status_display = serializers.CharField(
@@ -722,16 +705,21 @@ class ReceiptDetailSerializer(serializers.ModelSerializer):
         return None
 
 
+# ============================================================
+# ✅ RÉCEPTION - CREATE SERIALIZER (CORRIGÉ)
+# ============================================================
+
 class ReceiptCreateSerializer(serializers.ModelSerializer):
     lines = ReceiptLineCreateSerializer(many=True)
 
     class Meta:
         model = Receipt
         fields = ['purchase_order', 'expected_date', 'warehouse', 'delivery_note',
-                  'invoice_number', 'notes', 'lines', 'caisse_destination_id',
-                  'compte_destination_id', 'auto_invoice']
+                  'invoice_number', 'notes', 'lines', 'auto_invoice']
+        # ⚠️ SUPPRIMÉ : 'caisse_destination_id', 'compte_destination_id'
 
     def validate(self, data):
+        """Validation SANS contrôle de solde (pas de décaissement ici)."""
         purchase_order = data.get('purchase_order')
         if purchase_order and purchase_order.status in ['cancelled', 'received']:
             raise serializers.ValidationError(
@@ -739,68 +727,58 @@ class ReceiptCreateSerializer(serializers.ModelSerializer):
             )
 
         lines_data = data.get('lines', [])
+        if not lines_data:
+            raise serializers.ValidationError(
+                {"lines": "Au moins une ligne de réception est requise"}
+            )
+
+        # Récupérer les PO lines en une seule requête
+        po_line_ids = [
+            l['po_line'].id if hasattr(l.get('po_line'), 'id')
+            else l.get('po_line')
+            for l in lines_data
+            if l.get('po_line') is not None
+        ]
+        po_lines_map = {
+            po.id: po
+            for po in PurchaseOrderLine.objects.select_related('product').filter(
+                id__in=po_line_ids
+            )
+        }
+
         for line_data in lines_data:
-            po_line = line_data.get('po_line')
+            po_line_raw = line_data.get('po_line')
+            po_line_id = po_line_raw.id if hasattr(po_line_raw, 'id') else po_line_raw
             quantity_received = line_data.get('quantity_received', 0)
-            total_received = ReceiptLine.objects.filter(
-                po_line=po_line
-            ).aggregate(total=Sum('quantity_received'))['total'] or 0
+
+            po_line = po_lines_map.get(po_line_id)
+            if not po_line:
+                raise serializers.ValidationError({
+                    "lines": f"Ligne de commande {po_line_id} introuvable"
+                })
+
+            if purchase_order and po_line.purchase_order_id != purchase_order.id:
+                raise serializers.ValidationError({
+                    "lines": (
+                        f"La ligne {po_line_id} n'appartient pas à la commande "
+                        f"{purchase_order.po_number}"
+                    )
+                })
+
+            total_received = (
+                ReceiptLine.objects
+                .filter(po_line=po_line)
+                .aggregate(total=Sum('quantity_received'))['total'] or 0
+            )
             quantity_remaining = po_line.quantity - total_received
             if quantity_received > quantity_remaining:
-                raise serializers.ValidationError(
-                    f"Quantité reçue ({quantity_received}) dépasse la quantité "
-                    f"restante ({quantity_remaining})"
-                )
-
-        caisse_id = data.get('caisse_destination_id')
-        compte_id = data.get('compte_destination_id')
-        if caisse_id and compte_id:
-            raise serializers.ValidationError(
-                "Choisissez une seule destination (caisse ou compte)."
-            )
-
-        # ✅ CONTRÔLE DU SOLDE AVANT CRÉATION
-        # Calcul du montant total de la réception
-        montant_total = Decimal('0')
-        for line_data in lines_data:
-            po_line = line_data.get('po_line')
-            quantity_received = line_data.get('quantity_received', 0)
-            if po_line:
-                montant_total += Decimal(quantity_received) * \
-                    po_line.unit_price
-
-        if montant_total > 0:
-            # Vérifier que la destination est fournie
-            if not caisse_id and not compte_id:
-                # Fallback : caisse par défaut du warehouse
-                warehouse = data.get('warehouse')
-                if warehouse:
-                    try:
-                        from tresorerie.models import Caisse
-                        caisse_defaut = Caisse.objects.filter(
-                            warehouse=warehouse, is_default=True, is_active=True
-                        ).first()
-                        if caisse_defaut:
-                            caisse_id = caisse_defaut.id
-                            data['caisse_destination_id'] = caisse_id
-                        else:
-                            # Fallback global
-                            caisse_global = Caisse.objects.filter(
-                                is_default=True, is_active=True
-                            ).first()
-                            if caisse_global:
-                                caisse_id = caisse_global.id
-                                data['caisse_destination_id'] = caisse_id
-                    except ImportError:
-                        pass
-
-            # ✅ Vérifier le solde
-            valider_solde_destination(
-                caisse_id=caisse_id,
-                compte_id=compte_id,
-                montant=montant_total,
-                champ_name='lines'
-            )
+                raise serializers.ValidationError({
+                    "lines": (
+                        f"Quantité reçue ({quantity_received}) dépasse la quantité "
+                        f"restante ({quantity_remaining}) pour "
+                        f"{po_line.product.name}"
+                    )
+                })
 
         return data
 
@@ -823,6 +801,8 @@ class ReceiptCreateSerializer(serializers.ModelSerializer):
             **validated_data
         )
 
+        total_received_amount = Decimal('0')
+
         for line_data in lines_data:
             po_line = line_data['po_line']
             quantity_received = line_data['quantity_received']
@@ -837,8 +817,7 @@ class ReceiptCreateSerializer(serializers.ModelSerializer):
             lot = None
 
             if lot_number:
-                existing_lot = Lot.objects.filter(
-                    lot_number=lot_number).first()
+                existing_lot = Lot.objects.filter(lot_number=lot_number).first()
                 if existing_lot:
                     lot = existing_lot
                     if not lot.warehouse:
@@ -900,28 +879,23 @@ class ReceiptCreateSerializer(serializers.ModelSerializer):
                 created_by=user, notes=f"Réception n°{receipt_number}"
             )
 
-            purchase_order.total_received_amount += quantity_received * po_line.unit_price
+            total_received_amount += Decimal(quantity_received) * po_line.unit_price
 
+        purchase_order.total_received_amount = (
+            (purchase_order.total_received_amount or Decimal('0'))
+            + total_received_amount
+        )
+        purchase_order.save(update_fields=['total_received_amount'])
         purchase_order.update_receipt_status()
-        purchase_order.save()
 
         receipt.status = 'completed'
         receipt.save()
 
-        # ✅ Créer le mouvement de décaissement (avec contrôle du solde)
-        try:
-            receipt.creer_mouvement_decaissement(user)
-        except Exception as e:
-            # Propager l'erreur de solde insuffisant
-            raise serializers.ValidationError({
-                'lines': f"❌ Impossible de créer le mouvement de trésorerie : {str(e)}"
-            })
-
+        # ✅ AUCUN décaissement ici — le signal post_save créera la facture automatique
         receipt.generate_qr_code()
         receipt.save()
 
         return receipt
-
 
 class ReceiptChoiceSerializer(serializers.ModelSerializer):
     po_number = serializers.CharField(
@@ -1417,7 +1391,7 @@ class SupplierInvoiceUpdateSerializer(serializers.ModelSerializer):
 
 class SupplierInvoicePaymentSerializer(serializers.Serializer):
     """
-    ✅ Serializer pour l'action add_payment sur une facture.
+    Serializer pour l'action add_payment sur une facture.
     Contrôle du solde de la caisse/compte AVANT paiement.
     """
     amount = serializers.DecimalField(max_digits=12, decimal_places=2)
@@ -1449,7 +1423,6 @@ class SupplierInvoicePaymentSerializer(serializers.Serializer):
                 "Veuillez sélectionner une caisse ou un compte bancaire."
             )
 
-        # ✅ CONTRÔLE DU SOLDE
         valider_solde_destination(
             caisse_id=caisse_id,
             compte_id=compte_id,
@@ -1573,7 +1546,7 @@ class FournisseurPaiementSerializer(serializers.ModelSerializer):
 
 class FournisseurPaiementCreateSerializer(serializers.ModelSerializer):
     """
-    ✅ Serializer pour créer un paiement fournisseur.
+    Serializer pour créer un paiement fournisseur.
     Contrôle du solde de la caisse/compte AVANT paiement.
     """
 
@@ -1593,7 +1566,6 @@ class FournisseurPaiementCreateSerializer(serializers.ModelSerializer):
         supplier_invoice = data.get('supplier_invoice')
         amount = data.get('amount', 0)
 
-        # ✅ Validation par rapport à la facture
         if supplier_invoice:
             remaining = supplier_invoice.total_amount - supplier_invoice.amount_paid
 
@@ -1623,7 +1595,6 @@ class FournisseurPaiementCreateSerializer(serializers.ModelSerializer):
                 "Veuillez sélectionner une caisse ou un compte bancaire."
             )
 
-        # ✅ CONTRÔLE DU SOLDE
         valider_solde_destination(
             caisse_id=caisse_id,
             compte_id=compte_id,
@@ -1660,11 +1631,9 @@ class FournisseurPaiementCreateSerializer(serializers.ModelSerializer):
         if purchase_order:
             purchase_order.update_payment_status()
 
-        # ✅ Créer le mouvement (contrôle du solde en interne)
         try:
             paiement.creer_mouvement_tresorerie(user)
         except Exception as e:
-            # Propager l'erreur de solde insuffisant
             raise serializers.ValidationError({
                 'amount': f"❌ Impossible de créer le mouvement : {str(e)}"
             })
