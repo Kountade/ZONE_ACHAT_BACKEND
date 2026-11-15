@@ -1,6 +1,7 @@
 # apps/produits_stocks/serializers.py
 # ============================================================
 # SERIALIZERS OPTIMISÉS - Compatible annotations SQL
+# ✅ Mise à jour : upload image produit + galerie
 # ============================================================
 
 from rest_framework import serializers
@@ -24,22 +25,23 @@ from users.models import CustomUser
 class CategorySerializer(serializers.ModelSerializer):
     """
     ✅ Category optimisé - utilise annotations SQL si disponibles.
+    ✅ Support image upload
     """
     full_path = serializers.ReadOnlyField()
     children_count = serializers.SerializerMethodField()
     products_count = serializers.SerializerMethodField()
+    image_url = serializers.SerializerMethodField()
 
     class Meta:
         model = Category
         fields = [
             'id', 'name', 'code', 'description', 'parent', 'full_path',
-            'image', 'is_active', 'children_count', 'products_count',
+            'image', 'image_url', 'is_active', 'children_count', 'products_count',
             'created_at', 'updated_at', 'created_by'
         ]
-        read_only_fields = ['id', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'created_at', 'updated_at', 'created_by']
 
     def get_children_count(self, obj):
-        # ✅ Utilise l'annotation SQL si disponible
         if hasattr(obj, 'children_count_annotated'):
             return obj.children_count_annotated
         return obj.children.filter(is_active=True).count()
@@ -49,6 +51,17 @@ class CategorySerializer(serializers.ModelSerializer):
             return obj.products_count_annotated
         return obj.products.filter(status='active').count()
 
+    def get_image_url(self, obj):
+        if not obj.image:
+            return None
+        request = self.context.get('request')
+        try:
+            if request:
+                return request.build_absolute_uri(obj.image.url)
+            return obj.image.url
+        except Exception:
+            return None
+
     def validate_code(self, value):
         if Category.objects.exclude(
             id=self.instance.id if self.instance else None
@@ -56,12 +69,36 @@ class CategorySerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("Ce code existe déjà")
         return value
 
+    def validate_image(self, value):
+        """✅ Validation image : type + taille max 5 Mo"""
+        if value:
+            if value.size > 5 * 1024 * 1024:
+                raise serializers.ValidationError(
+                    "L'image ne doit pas dépasser 5 Mo")
+            if not value.content_type.startswith('image/'):
+                raise serializers.ValidationError(
+                    "Le fichier doit être une image")
+        return value
+
 
 class CategoryListSerializer(serializers.ModelSerializer):
     """Serializer léger pour les listes de catégories."""
+    image_url = serializers.SerializerMethodField()
+
     class Meta:
         model = Category
-        fields = ['id', 'name', 'code', 'is_active']
+        fields = ['id', 'name', 'code', 'image', 'image_url', 'is_active']
+
+    def get_image_url(self, obj):
+        if not obj.image:
+            return None
+        request = self.context.get('request')
+        try:
+            if request:
+                return request.build_absolute_uri(obj.image.url)
+            return obj.image.url
+        except Exception:
+            return None
 
 
 # ============================================================
@@ -85,7 +122,6 @@ class UnitMeasureSerializer(serializers.ModelSerializer):
 class ProductLiteSerializer(serializers.ModelSerializer):
     """
     ✅ Serializer ULTRA-LÉGER pour le POS, listes rapides.
-    Utilise current_stock_annotated (annotation SQL).
     """
     category_name = serializers.CharField(
         source='category.name', read_only=True)
@@ -114,7 +150,6 @@ class ProductLiteSerializer(serializers.ModelSerializer):
         ]
 
     def get_current_stock(self, obj):
-        # ✅ Utilise l'annotation si disponible
         if hasattr(obj, 'current_stock_annotated'):
             return obj.current_stock_annotated or 0
         return obj.current_stock
@@ -134,7 +169,6 @@ class ProductLiteSerializer(serializers.ModelSerializer):
 class ProductListSerializer(serializers.ModelSerializer):
     """
     ✅ Serializer OPTIMISÉ pour les listes standards.
-    Utilise current_stock_annotated (annotation SQL).
     """
     category_name = serializers.CharField(
         source='category.name', read_only=True)
@@ -143,6 +177,7 @@ class ProductListSerializer(serializers.ModelSerializer):
         source='get_status_display', read_only=True)
     current_stock = serializers.SerializerMethodField()
     current_stock_value = serializers.SerializerMethodField()
+    image_url = serializers.SerializerMethodField()
 
     class Meta:
         model = Product
@@ -157,12 +192,11 @@ class ProductListSerializer(serializers.ModelSerializer):
             'min_stock',
             'status', 'status_display',
             'has_expiry',
-            'image',
+            'image', 'image_url',
             'is_featured'
         ]
 
     def get_current_stock(self, obj):
-        # ✅ Utilise l'annotation SQL si disponible
         if hasattr(obj, 'current_stock_annotated'):
             return obj.current_stock_annotated or 0
         return obj.current_stock
@@ -171,10 +205,22 @@ class ProductListSerializer(serializers.ModelSerializer):
         stock = self.get_current_stock(obj)
         return float(stock) * float(obj.purchase_price or 0)
 
+    def get_image_url(self, obj):
+        if not obj.image:
+            return None
+        request = self.context.get('request')
+        try:
+            if request:
+                return request.build_absolute_uri(obj.image.url)
+            return obj.image.url
+        except Exception:
+            return None
+
 
 class ProductDetailSerializer(serializers.ModelSerializer):
     """
     ✅ Serializer détaillé - utilise annotations SQL.
+    ✅ Expose image + image_url + gallery + gallery_urls
     """
     category_name = serializers.CharField(
         source='category.name', read_only=True)
@@ -187,6 +233,8 @@ class ProductDetailSerializer(serializers.ModelSerializer):
     current_stock_value = serializers.SerializerMethodField()
     expired_lots_count = serializers.SerializerMethodField()
     expiring_lots_count = serializers.SerializerMethodField()
+    image_url = serializers.SerializerMethodField()
+    gallery_urls = serializers.SerializerMethodField()
 
     class Meta:
         model = Product
@@ -200,13 +248,13 @@ class ProductDetailSerializer(serializers.ModelSerializer):
             'has_expiry', 'shelf_life_days', 'alert_days',
             'min_stock', 'max_stock',
             'reorder_point', 'reorder_quantity',
-            'image', 'gallery',
+            'image', 'image_url', 'gallery', 'gallery_urls',
             'status', 'status_display', 'is_featured',
             'current_stock', 'current_stock_value',
             'expired_lots_count', 'expiring_lots_count',
             'created_at', 'updated_at', 'created_by'
         ]
-        read_only_fields = ['id', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'created_at', 'updated_at', 'created_by']
 
     def get_current_stock(self, obj):
         if hasattr(obj, 'current_stock_annotated'):
@@ -227,49 +275,86 @@ class ProductDetailSerializer(serializers.ModelSerializer):
             return obj.expiring_lots_annotated or 0
         return obj.expiring_lots_count
 
+    def get_image_url(self, obj):
+        if not obj.image:
+            return None
+        request = self.context.get('request')
+        try:
+            if request:
+                return request.build_absolute_uri(obj.image.url)
+            return obj.image.url
+        except Exception:
+            return None
+
+    def get_gallery_urls(self, obj):
+        """✅ Retourne les URLs absolues de chaque image de la galerie"""
+        if not obj.gallery:
+            return []
+        request = self.context.get('request')
+        urls = []
+        for item in obj.gallery:
+            # item peut être une string (URL) ou un dict
+            if isinstance(item, dict):
+                url = item.get('url', '')
+            else:
+                url = str(item)
+            if not url:
+                continue
+            # Si l'URL est déjà absolue, on la garde
+            if url.startswith('http'):
+                urls.append(url)
+            elif request:
+                urls.append(request.build_absolute_uri(url))
+            else:
+                urls.append(url)
+        return urls
+
 
 class ProductWriteSerializer(serializers.ModelSerializer):
-    """Serializer pour l'écriture (création/modification)."""
+    gallery_files = serializers.ListField(
+        child=serializers.ImageField(),
+        write_only=True,
+        required=False,
+    )
+    # ✅ Accepte les deux noms
+    clear_image = serializers.BooleanField(
+        write_only=True, required=False, default=False
+    )
+    _clear_image = serializers.BooleanField(
+        write_only=True, required=False, default=False
+    )
+
     class Meta:
         model = Product
         fields = [
             'code', 'barcode', 'name', 'description', 'category', 'unit',
-            'type',
-            'purchase_price',
-            'selling_price',
-            'wholesale_price',
-            'promo_price', 'tax_rate',
-            'has_expiry', 'shelf_life_days', 'alert_days',
-            'min_stock', 'max_stock',
-            'reorder_point', 'reorder_quantity',
-            'image', 'gallery', 'status', 'is_featured'
+            'type', 'purchase_price', 'selling_price', 'wholesale_price',
+            'promo_price', 'tax_rate', 'has_expiry', 'shelf_life_days',
+            'alert_days', 'min_stock', 'max_stock', 'reorder_point',
+            'reorder_quantity', 'image', 'gallery', 'gallery_files',
+            'clear_image', '_clear_image', 'status', 'is_featured'
         ]
 
-    def validate_code(self, value):
-        if Product.objects.exclude(
-            id=self.instance.id if self.instance else None
-        ).filter(code=value).exists():
-            raise serializers.ValidationError("Ce code produit existe déjà")
-        return value
+    def update(self, instance, validated_data):
+        gallery_files = validated_data.pop('gallery_files', [])
+        clear_image = validated_data.pop('clear_image', False) or \
+            validated_data.pop('_clear_image', False)
 
-    def validate_barcode(self, value):
-        if value and Product.objects.exclude(
-            id=self.instance.id if self.instance else None
-        ).filter(barcode=value).exists():
-            raise serializers.ValidationError("Ce code-barres existe déjà")
-        return value
+        if clear_image:
+            instance.image = None
+            validated_data.pop('image', None)
 
-    def validate_purchase_price(self, value):
-        if value < 0:
-            raise serializers.ValidationError(
-                "Le prix d'achat ne peut pas être négatif")
-        return value
+        request = self.context.get('request')
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
 
-    def validate_selling_price(self, value):
-        if value < 0:
-            raise serializers.ValidationError(
-                "Le prix de vente ne peut pas être négatif")
-        return value
+        if gallery_files:
+            instance.gallery = self._build_gallery(
+                gallery_files, existing=instance.gallery or [], request=request
+            )
+
+        instance.save()
+        return instance
 
 
 # ============================================================
@@ -370,7 +455,7 @@ class LotDetailSerializer(serializers.ModelSerializer):
             'is_blocked', 'block_reason', 'blocked_date',
             'notes', 'created_at', 'created_by'
         ]
-        read_only_fields = ['id', 'reception_date', 'created_at']
+        read_only_fields = ['id', 'reception_date', 'created_at', 'created_by']
 
 
 class LotWriteSerializer(serializers.ModelSerializer):
@@ -408,17 +493,15 @@ class LotWriteSerializer(serializers.ModelSerializer):
 
 # ============================================================
 # STOCK
+# ============================================================
+
 class StockSerializer(serializers.ModelSerializer):
-    """
-    ✅ Serializer OPTIMISÉ - Utilise les annotations SQL
-    pour éviter les N+1 sur min_stock/max_stock.
-    """
+    """Serializer OPTIMISÉ - Utilise les annotations SQL."""
     product_name = serializers.CharField(source='product.name', read_only=True)
     product_code = serializers.CharField(source='product.code', read_only=True)
     warehouse_name = serializers.CharField(
         source='warehouse.name', read_only=True)
 
-    # ✅ Ces champs utilisent les annotations SQL si disponibles
     available_quantity = serializers.SerializerMethodField()
     is_low_stock = serializers.SerializerMethodField()
     is_over_stock = serializers.SerializerMethodField()
@@ -439,10 +522,8 @@ class StockSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'last_update']
 
     def _get_min_stock(self, obj):
-        """✅ Utilise l'annotation SQL si dispo, sinon fallback sur product__min_stock."""
         if hasattr(obj, 'min_stock_annotated'):
             return obj.min_stock_annotated
-        # Fallback : accède à product.min_stock (peut causer N+1 si pas de select_related)
         return obj.min_stock_override or obj.product.min_stock
 
     def _get_max_stock(self, obj):

@@ -1,3 +1,4 @@
+#2
 # apps/produits_stocks/models.py
 # ============================================================
 # MODELS OPTIMISÉS - Index ajoutés pour performances

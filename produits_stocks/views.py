@@ -1,18 +1,20 @@
 # apps/produits_stocks/views.py
 # ============================================================
 # VIEWS OPTIMISÉS - select_related, prefetch_related, annotations
+# ✅ Support multipart ajouté pour upload image (Category + Product)
 # ============================================================
 
 from rest_framework import viewsets, status, permissions
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from django.db.models import Q, Sum, F, Count, Prefetch
 from django.utils import timezone
 from django.db import transaction
 from datetime import date, timedelta
 from decimal import Decimal
 import uuid
-from django.db.models import Q, Sum, F, Count, Prefetch
+import datetime as dt
 from django.db.models.functions import Coalesce
 
 from .models import (
@@ -50,7 +52,6 @@ from .serializers import (
 )
 from users.permissions import IsAdmin, IsGestionnaire, IsMagasinier
 
-# ✅ Import de la pagination personnalisée
 from .pagination import (
     ProductPagination, StockPagination,
     MovementPagination, LotPagination, LargePagination
@@ -63,24 +64,27 @@ from .pagination import (
 class CategoryViewSet(viewsets.ModelViewSet):
     """
     ✅ ViewSet optimisé avec annotations SQL.
+    ✅ Support upload image via multipart/form-data.
     """
     queryset = Category.objects.all()
     permission_classes = [permissions.IsAuthenticated]
     pagination_class = LargePagination
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def get_serializer_class(self):
         if self.action == 'list':
             return CategoryListSerializer
         return CategorySerializer
 
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context['request'] = self.request
+        return context
+
     def get_queryset(self):
-        """
-        ✅ Queryset avec select_related + annotations SQL.
-        Évite N+1 sur children_count et products_count.
-        """
         queryset = (
             Category.objects
-            .select_related('parent', 'created_by')  # ✅
+            .select_related('parent', 'created_by')
             .annotate(
                 children_count_annotated=Count(
                     'children',
@@ -134,6 +138,7 @@ class UnitMeasureViewSet(viewsets.ModelViewSet):
 class ProductViewSet(viewsets.ModelViewSet):
     """
     ✅ ViewSet OPTIMISÉ pour les produits.
+    - Support multipart/form-data (upload image + galerie)
     - Pagination serveur
     - select_related pour éviter N+1
     - Annotations SQL (current_stock, lots_count)
@@ -141,6 +146,7 @@ class ProductViewSet(viewsets.ModelViewSet):
     queryset = Product.objects.all()
     permission_classes = [permissions.IsAuthenticated]
     pagination_class = ProductPagination
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def get_serializer_class(self):
         if self.action == 'list':
@@ -154,31 +160,21 @@ class ProductViewSet(viewsets.ModelViewSet):
         context['request'] = self.request
         return context
 
-    # ================================================================
-    # ✅ QUERYSET OPTIMISÉ (pour sérialisation UNIQUEMENT)
-    # ================================================================
     def get_queryset(self):
-        """
-        ✅ Queryset ENRICHI avec select_related + annotations SQL.
-        Évite TOUTES les requêtes N+1.
-        """
         queryset = (
             Product.objects
-            .select_related('category', 'unit', 'created_by')  # ✅
+            .select_related('category', 'unit', 'created_by')
             .annotate(
-                # ✅ Stock total depuis les lots (annotation SQL)
                 current_stock_annotated=Sum(
                     'lots__current_quantity',
                     filter=Q(lots__is_blocked=False) & ~Q(
                         lots__status='expired')
                 ),
-                # ✅ Nombre de lots expirés
                 expired_lots_annotated=Count(
                     'lots',
                     filter=Q(lots__status='expired'),
                     distinct=True
                 ),
-                # ✅ Nombre de lots expirants
                 expiring_lots_annotated=Count(
                     'lots',
                     filter=Q(lots__status='expiring'),
@@ -188,7 +184,6 @@ class ProductViewSet(viewsets.ModelViewSet):
             .order_by('name')
         )
 
-        # Filtres
         search = self.request.query_params.get('search')
         if search:
             queryset = queryset.filter(
@@ -205,7 +200,6 @@ class ProductViewSet(viewsets.ModelViewSet):
         if status_filter:
             queryset = queryset.filter(status=status_filter)
 
-        # ✅ Filtre stock faible en SQL (pas de Python loop)
         low_stock = self.request.query_params.get('low_stock')
         if low_stock == 'true':
             queryset = queryset.annotate(
@@ -230,11 +224,10 @@ class ProductViewSet(viewsets.ModelViewSet):
     # ================================================================
     @action(detail=True, methods=['get'])
     def lots(self, request, pk=None):
-        """✅ Récupère les lots d'un produit (optimisé)."""
         product = self.get_object()
         lots = (
             product.lots
-            .select_related('product', 'warehouse', 'unit')  # ✅
+            .select_related('product', 'warehouse', 'unit')
             .order_by('expiry_date')
         )
         serializer = LotListSerializer(lots, many=True)
@@ -245,7 +238,6 @@ class ProductViewSet(viewsets.ModelViewSet):
     # ================================================================
     @action(detail=True, methods=['get'])
     def expiring_lots(self, request, pk=None):
-        """✅ Récupère les lots expirants d'un produit."""
         product = self.get_object()
         alert_date = date.today() + timedelta(days=product.alert_days)
 
@@ -263,16 +255,12 @@ class ProductViewSet(viewsets.ModelViewSet):
         return Response(serializer.data)
 
     # ================================================================
-    # ACTION: PRODUITS QUI EXPIRE BIENTÔT (optimisé)
+    # ACTION: PRODUITS QUI EXPIRE BIENTÔT
     # ================================================================
     @action(detail=False, methods=['get'])
     def expiring_soon(self, request):
-        """
-        ✅ Version OPTIMISÉE - utilise prefetch_related au lieu de N+1.
-        """
         alert_date = date.today() + timedelta(days=30)
 
-        # ✅ Prefetch UNIQUEMENT les lots expirants
         expiring_lots_prefetch = Prefetch(
             'lots',
             queryset=(
@@ -321,13 +309,10 @@ class ProductViewSet(viewsets.ModelViewSet):
         return Response(result)
 
     # ================================================================
-    # ACTION: PRODUITS EN STOCK FAIBLE (optimisé)
+    # ACTION: PRODUITS EN STOCK FAIBLE
     # ================================================================
     @action(detail=False, methods=['get'])
     def low_stock_list(self, request):
-        """
-        ✅ Version OPTIMISÉE - utilise annotations SQL.
-        """
         products = (
             Product.objects
             .filter(min_stock__gt=0)
@@ -366,7 +351,6 @@ class ProductViewSet(viewsets.ModelViewSet):
         permission_classes=[permissions.IsAuthenticated, IsGestionnaire]
     )
     def add_stock_manual(self, request):
-        """Ajoute du stock manuellement sans passer par une commande."""
         serializer = ManualStockAddSerializer(data=request.data)
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
@@ -479,7 +463,6 @@ class ProductViewSet(viewsets.ModelViewSet):
         permission_classes=[permissions.IsAuthenticated, IsGestionnaire]
     )
     def add_stock(self, request, pk=None):
-        """Ajoute du stock à un produit spécifique."""
         product = self.get_object()
         warehouse_id = request.data.get('warehouse_id')
         quantity = request.data.get('quantity')
@@ -595,11 +578,9 @@ class WarehouseViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['get'])
     def stocks(self, request, pk=None):
-        """✅ Stocks d'un entrepôt (optimisé)."""
         warehouse = self.get_object()
         stocks = (
             warehouse.stocks
-            # ✅
             .select_related('product', 'product__category', 'product__unit')
             .order_by('product__name')
         )
@@ -608,11 +589,10 @@ class WarehouseViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['get'])
     def lots(self, request, pk=None):
-        """✅ Lots d'un entrepôt (optimisé)."""
         warehouse = self.get_object()
         lots = (
             warehouse.lots
-            .select_related('product', 'warehouse', 'unit')  # ✅
+            .select_related('product', 'warehouse', 'unit')
             .order_by('expiry_date')
         )
         serializer = LotListSerializer(lots, many=True)
@@ -623,9 +603,6 @@ class WarehouseViewSet(viewsets.ModelViewSet):
 # LOT VIEWSET - OPTIMISÉ
 # ============================================================
 class LotViewSet(viewsets.ModelViewSet):
-    """
-    ✅ ViewSet optimisé pour les lots.
-    """
     queryset = Lot.objects.all()
     permission_classes = [permissions.IsAuthenticated, IsMagasinier]
     pagination_class = LotPagination
@@ -638,12 +615,9 @@ class LotViewSet(viewsets.ModelViewSet):
         return LotDetailSerializer
 
     def get_queryset(self):
-        """
-        ✅ Queryset optimisé avec select_related.
-        """
         queryset = (
             Lot.objects
-            .select_related('product', 'warehouse', 'unit', 'created_by')  # ✅
+            .select_related('product', 'warehouse', 'unit', 'created_by')
             .order_by('expiry_date', 'created_at')
         )
 
@@ -759,24 +733,17 @@ class LotViewSet(viewsets.ModelViewSet):
 # STOCK VIEWSET - OPTIMISÉ
 # ============================================================
 class StockViewSet(viewsets.ReadOnlyModelViewSet):
-    """
-    ✅ ViewSet optimisé pour les stocks.
-    """
     queryset = Stock.objects.all()
     serializer_class = StockSerializer
     permission_classes = [permissions.IsAuthenticated]
     pagination_class = StockPagination
 
     def get_queryset(self):
-        """
-        ✅ Queryset optimisé avec annotations SQL.
-        Évite TOUTES les requêtes N+1.
-        """
         queryset = (
             Stock.objects
-            .select_related('product', 'product__category', 'product__unit', 'warehouse')
+            .select_related('product', 'product__category',
+                            'product__unit', 'warehouse')
             .annotate(
-                # ✅ Annotations SQL pour min_stock / max_stock
                 min_stock_annotated=Coalesce(
                     'min_stock_override',
                     'product__min_stock'
@@ -818,39 +785,25 @@ class StockViewSet(viewsets.ReadOnlyModelViewSet):
         serializer = StockDetailSerializer(stock)
         return Response(serializer.data)
 
+
 # ============================================================
 # STOCK MOVEMENT VIEWSET - OPTIMISÉ
 # ============================================================
-
-
-# apps/produits_stocks/views.py
-
 class StockMovementViewSet(viewsets.ReadOnlyModelViewSet):
-    """
-    ✅ ViewSet optimisé pour les mouvements de stock.
-    - Pagination serveur
-    - select_related complet (pas de N+1)
-    - Recherche serveur enrichie
-    - Filtres multiples (type, date, entrepôt, référence)
-    """
     queryset = StockMovement.objects.all()
     serializer_class = StockMovementSerializer
     permission_classes = [permissions.IsAuthenticated]
     pagination_class = MovementPagination
 
     def get_queryset(self):
-        """
-        ✅ Queryset optimisé avec select_related.
-        Évite TOUTES les requêtes N+1.
-        """
         queryset = (
             StockMovement.objects
             .select_related(
                 'product',
-                'product__category',      # ✅ pour affichage catégorie
-                'product__unit',          # ✅ pour affichage unité
+                'product__category',
+                'product__unit',
                 'lot',
-                'lot__warehouse',         # ✅ pour affichage entrepôt du lot
+                'lot__warehouse',
                 'from_warehouse',
                 'to_warehouse',
                 'created_by',
@@ -858,21 +811,14 @@ class StockMovementViewSet(viewsets.ReadOnlyModelViewSet):
             .order_by('-created_at')
         )
 
-        # ============================================================
-        # FILTRES
-        # ============================================================
-
-        # Filtre produit
         product_id = self.request.query_params.get('product')
         if product_id:
             queryset = queryset.filter(product_id=product_id)
 
-        # Filtre lot
         lot_id = self.request.query_params.get('lot')
         if lot_id:
             queryset = queryset.filter(lot_id=lot_id)
 
-        # Filtre type de mouvement (peut être multiple : "sale_out,purchase_in")
         movement_type = self.request.query_params.get('type')
         if movement_type:
             type_list = [t.strip()
@@ -880,7 +826,6 @@ class StockMovementViewSet(viewsets.ReadOnlyModelViewSet):
             if type_list:
                 queryset = queryset.filter(movement_type__in=type_list)
 
-        # Filtre entrepôt (source OU destination)
         warehouse_id = self.request.query_params.get('warehouse')
         if warehouse_id:
             queryset = queryset.filter(
@@ -888,17 +833,14 @@ class StockMovementViewSet(viewsets.ReadOnlyModelViewSet):
                 Q(to_warehouse_id=warehouse_id)
             )
 
-        # Filtre référence (type de référence : sale, avoir, transfert, etc.)
         reference_type = self.request.query_params.get('reference_type')
         if reference_type:
             queryset = queryset.filter(reference_type=reference_type)
 
-        # Filtre ID de référence
         reference_id = self.request.query_params.get('reference_id')
         if reference_id:
             queryset = queryset.filter(reference_id=reference_id)
 
-        # ✅ Filtres INDEX-FRIENDLY (pas de __date__gte)
         date_from = self.request.query_params.get('date_from')
         if date_from:
             try:
@@ -916,46 +858,33 @@ class StockMovementViewSet(viewsets.ReadOnlyModelViewSet):
             except ValueError:
                 pass
 
-        # ============================================================
-        # ✅ RECHERCHE SERVEUR ENRICHIE
-        # ============================================================
         search = self.request.query_params.get('search')
         if search:
             queryset = queryset.filter(
                 Q(product__name__icontains=search) |
-                Q(product__code__icontains=search) |       # ✅ AJOUTÉ
-                Q(lot__lot_number__icontains=search) |     # ✅ AJOUTÉ
-                Q(lot__batch_number__icontains=search) |   # ✅ AJOUTÉ
+                Q(product__code__icontains=search) |
+                Q(lot__lot_number__icontains=search) |
+                Q(lot__batch_number__icontains=search) |
                 Q(reference_number__icontains=search) |
                 Q(reason__icontains=search) |
-                Q(notes__icontains=search) |               # ✅ AJOUTÉ
-                Q(created_by__first_name__icontains=search) |  # ✅ AJOUTÉ
-                Q(created_by__last_name__icontains=search)     # ✅ AJOUTÉ
+                Q(notes__icontains=search) |
+                Q(created_by__first_name__icontains=search) |
+                Q(created_by__last_name__icontains=search)
             )
 
         return queryset
 
-    # ================================================================
-    # ✅ ACTION: STATISTIQUES
-    # ================================================================
     @action(detail=False, methods=['get'])
     def stats(self, request):
-        """
-        ✅ Statistiques des mouvements (agrégations SQL).
-        """
         queryset = self.get_queryset()
-
-        # Total global
         total = queryset.count()
 
-        # Group by type
         by_type = dict(
             queryset.values('movement_type')
             .annotate(count=Count('id'))
             .values_list('movement_type', 'count')
         )
 
-        # Total entrées / sorties
         entrees_types = [
             'purchase_in', 'transfer_in',
             'return_in', 'adjustment_plus'
@@ -969,7 +898,6 @@ class StockMovementViewSet(viewsets.ReadOnlyModelViewSet):
         total_entrees = sum(by_type.get(t, 0) for t in entrees_types)
         total_sorties = sum(by_type.get(t, 0) for t in sorties_types)
 
-        # Quantités totales
         quantities = queryset.aggregate(
             total_entrees_qty=Sum(
                 'quantity',
@@ -991,14 +919,8 @@ class StockMovementViewSet(viewsets.ReadOnlyModelViewSet):
             'ajustements': by_type.get('adjustment_plus', 0) + by_type.get('adjustment_minus', 0),
         })
 
-    # ================================================================
-    # ✅ ACTION: EXPORTER EN CSV
-    # ================================================================
     @action(detail=False, methods=['get'], url_path='export')
     def export_csv(self, request):
-        """
-        ✅ Export CSV des mouvements (limité à 10 000 lignes).
-        """
         import csv
         from django.http import HttpResponse
 
@@ -1008,23 +930,13 @@ class StockMovementViewSet(viewsets.ReadOnlyModelViewSet):
         response['Content-Disposition'] = (
             f'attachment; filename="mouvements_{date.today().isoformat()}.csv"'
         )
-
-        # BOM UTF-8 pour Excel
         response.write('\ufeff')
 
         writer = csv.writer(response, delimiter=';')
         writer.writerow([
-            'Date',
-            'Produit',
-            'Code produit',
-            'N° Lot',
-            'Type',
-            'Quantité',
-            'Entrepôt source',
-            'Entrepôt destination',
-            'Référence',
-            'Raison',
-            'Créé par',
+            'Date', 'Produit', 'Code produit', 'N° Lot', 'Type',
+            'Quantité', 'Entrepôt source', 'Entrepôt destination',
+            'Référence', 'Raison', 'Créé par',
         ])
 
         for m in queryset:
@@ -1051,9 +963,6 @@ class StockMovementViewSet(viewsets.ReadOnlyModelViewSet):
 # EXPIRY ALERT VIEWSET - OPTIMISÉ
 # ============================================================
 class ExpiryAlertViewSet(viewsets.ReadOnlyModelViewSet):
-    """
-    ✅ ViewSet optimisé pour les alertes d'expiration.
-    """
     queryset = ExpiryAlert.objects.all()
     serializer_class = ExpiryAlertSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -1062,7 +971,7 @@ class ExpiryAlertViewSet(viewsets.ReadOnlyModelViewSet):
     def get_queryset(self):
         queryset = (
             ExpiryAlert.objects
-            .select_related('lot', 'product', 'warehouse', 'processed_by')  # ✅
+            .select_related('lot', 'product', 'warehouse', 'processed_by')
             .order_by('days_left', 'created_at')
         )
 
@@ -1101,16 +1010,13 @@ class ExpiryAlertViewSet(viewsets.ReadOnlyModelViewSet):
 # INVENTORY LINE VIEWSET - OPTIMISÉ
 # ============================================================
 class InventoryLineViewSet(viewsets.ModelViewSet):
-    """
-    ✅ ViewSet optimisé pour les lignes d'inventaire.
-    """
     queryset = InventoryLine.objects.all()
     permission_classes = [permissions.IsAuthenticated, IsGestionnaire]
 
     def get_queryset(self):
         queryset = (
             InventoryLine.objects
-            .select_related('inventory', 'product', 'lot', 'verified_by')  # ✅
+            .select_related('inventory', 'product', 'lot', 'verified_by')
         )
 
         inventory_id = self.request.query_params.get('inventory')
@@ -1132,7 +1038,6 @@ class InventoryLineViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         serializer.save()
 
-        # Recalcul des totaux
         inventory = instance.inventory
         inventory.total_expected_value = inventory.lines.aggregate(
             total=Sum('expected_value')
@@ -1181,9 +1086,6 @@ class InventoryLineViewSet(viewsets.ModelViewSet):
 # INVENTORY VIEWSET - OPTIMISÉ
 # ============================================================
 class InventoryViewSet(viewsets.ModelViewSet):
-    """
-    ✅ ViewSet optimisé pour les inventaires.
-    """
     queryset = Inventory.objects.all()
     permission_classes = [permissions.IsAuthenticated, IsGestionnaire]
     pagination_class = LargePagination
@@ -1196,12 +1098,9 @@ class InventoryViewSet(viewsets.ModelViewSet):
         return InventorySerializer
 
     def get_queryset(self):
-        """
-        ✅ Queryset avec annotations SQL.
-        """
         queryset = (
             Inventory.objects
-            .select_related('warehouse', 'created_by', 'verified_by')  # ✅
+            .select_related('warehouse', 'created_by', 'verified_by')
             .annotate(
                 lines_count_annotated=Count('lines', distinct=True)
             )
@@ -1226,11 +1125,9 @@ class InventoryViewSet(viewsets.ModelViewSet):
         inventory = self.get_object()
         inventory.start()
 
-        # ✅ Créer les lignes en une seule requête bulk_create
         products = Product.objects.filter(
             status='active').select_related('unit')
 
-        # Récupérer tous les stocks en UNE requête
         stocks = {
             s.product_id: s
             for s in Stock.objects.filter(warehouse=inventory.warehouse)
@@ -1247,7 +1144,6 @@ class InventoryViewSet(viewsets.ModelViewSet):
                 expected_quantity=expected_quantity
             ))
 
-        # ✅ bulk_create : 1 seule requête SQL !
         InventoryLine.objects.bulk_create(
             lines_to_create,
             ignore_conflicts=True,
@@ -1273,8 +1169,8 @@ class InventoryViewSet(viewsets.ModelViewSet):
         inventory = self.get_object()
         lines = (
             inventory.lines
-            # ✅
-            .select_related('product', 'product__category', 'lot', 'verified_by')
+            .select_related('product', 'product__category',
+                            'lot', 'verified_by')
         )
         serializer = InventoryLineSerializer(lines, many=True)
         return Response(serializer.data)
@@ -1284,13 +1180,9 @@ class InventoryViewSet(viewsets.ModelViewSet):
 # TRANSFER VIEWSET
 # ============================================================
 class TransferViewSet(viewsets.ViewSet):
-    """
-    ✅ ViewSet pour les transferts de stock entre entrepôts.
-    """
     permission_classes = [permissions.IsAuthenticated, IsGestionnaire]
 
     def list(self, request):
-        """Liste des transferts."""
         transfers = (
             Transfer.objects
             .select_related('from_warehouse', 'to_warehouse', 'created_by', 'validated_by')
@@ -1301,9 +1193,6 @@ class TransferViewSet(viewsets.ViewSet):
         return Response(serializer.data)
 
     def create(self, request):
-        """
-        Crée un transfert de stock entre deux entrepôts.
-        """
         serializer = TransferRequestSerializer(data=request.data)
         if not serializer.is_valid():
             return Response(
@@ -1331,7 +1220,6 @@ class TransferViewSet(viewsets.ViewSet):
         reference_number = f"TRANSF-{timezone.now().strftime('%Y%m%d%H%M%S')}"
 
         with transaction.atomic():
-            # Créer le Transfer
             transfer = Transfer.objects.create(
                 from_warehouse=from_warehouse,
                 to_warehouse=to_warehouse,
@@ -1366,7 +1254,6 @@ class TransferViewSet(viewsets.ViewSet):
                         status=status.HTTP_400_BAD_REQUEST
                     )
 
-                # Consommer le stock source (FIFO)
                 success, lots_used = stock_source.consume_stock(quantity)
                 if not success:
                     return Response(
@@ -1374,7 +1261,6 @@ class TransferViewSet(viewsets.ViewSet):
                         status=status.HTTP_400_BAD_REQUEST
                     )
 
-                # Créer les mouvements de sortie
                 for lot_data in lots_used:
                     lot = lot_data['lot']
                     qty = lot_data['quantity']
@@ -1392,7 +1278,6 @@ class TransferViewSet(viewsets.ViewSet):
                         reference_number=reference_number
                     )
 
-                    # Créer le nouveau lot dans destination
                     unique_suffix = uuid.uuid4().hex[:8]
                     new_lot_number = f"{lot.lot_number}-TRANSF-{unique_suffix}"
 
@@ -1428,7 +1313,6 @@ class TransferViewSet(viewsets.ViewSet):
                         reference_number=reference_number
                     )
 
-                    # Créer l'item de transfert
                     TransferItem.objects.create(
                         transfer=transfer,
                         product=product,
@@ -1437,7 +1321,6 @@ class TransferViewSet(viewsets.ViewSet):
                         destination_lot=new_lot,
                     )
 
-                # Mettre à jour les stocks
                 stock_source.update_quantity()
                 stock_dest, _ = Stock.objects.get_or_create(
                     product=product, warehouse=to_warehouse
@@ -1471,10 +1354,8 @@ class DashboardStatsViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=['get'])
     def summary(self, request):
-        """✅ Version optimisée avec agrégations SQL."""
         total_products = Product.objects.filter(status='active').count()
 
-        # ✅ Compter en SQL (pas de Python loop)
         products_with_stock = (
             Product.objects
             .filter(status='active', min_stock__gt=0)
@@ -1533,13 +1414,12 @@ class DashboardStatsViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=['get'])
     def expiring_products(self, request):
-        """✅ Version optimisée."""
         result = []
         alert_date = date.today() + timedelta(days=30)
 
         lots = (
             Lot.objects
-            .select_related('product', 'warehouse')  # ✅
+            .select_related('product', 'warehouse')
             .filter(
                 expiry_date__lte=alert_date,
                 expiry_date__gte=date.today(),
@@ -1574,13 +1454,12 @@ class DashboardStatsViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=['get'])
     def low_stock(self, request):
-        """✅ Version optimisée."""
         result = []
 
         stocks = (
             Stock.objects
             .filter(quantity__lte=F('product__min_stock'))
-            .select_related('product', 'warehouse')  # ✅
+            .select_related('product', 'warehouse')
         )
 
         for stock in stocks:
@@ -1599,20 +1478,6 @@ class DashboardStatsViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=['get'])
     def stock_value(self, request):
-        """✅ Version optimisée avec agrégation SQL."""
-        result = (
-            Lot.objects
-            .filter(current_quantity__gt=0)
-            .exclude(status='expired')
-            .aggregate(
-                total_value=Sum(
-                    F('current_quantity') * F('purchase_price'),
-                    output_field=Sum('current_quantity')  # placeholder
-                )
-            )
-        )
-
-        # Fallback plus simple
         total_value = 0
         lots = Lot.objects.filter(
             current_quantity__gt=0
