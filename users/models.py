@@ -2,6 +2,7 @@
 from django.db import models
 from django.contrib.auth.models import AbstractUser
 from django.contrib.auth.base_user import BaseUserManager
+from django.conf import settings  # ✅ AJOUTÉ : Nécessaire pour lire FRONTEND_URL
 from django_rest_passwordreset.signals import reset_password_token_created
 from django.dispatch import receiver
 from django.template.loader import render_to_string
@@ -277,9 +278,16 @@ class CustomUser(AbstractUser):
 
 @receiver(reset_password_token_created)
 def password_reset_token_created(reset_password_token, *args, **kwargs):
-    sitelink = "http://localhost:5173/"
-    token = "{}".format(reset_password_token.key)
-    full_link = str(sitelink) + str("password-reset/") + str(token)
+    """
+    ✅ CORRIGÉ : Utilise settings.FRONTEND_URL pour le lien de production
+    """
+    # 1. Récupération de l'URL depuis settings.py (qui gère localhost et Render)
+    sitelink = settings.FRONTEND_URL
+    if not sitelink.endswith('/'):
+        sitelink += '/'
+
+    token = str(reset_password_token.key)
+    full_link = f"{sitelink}password-reset/{token}"
 
     print(f"Token généré: {token}")
     print(f"Lien complet: {full_link}")
@@ -294,12 +302,15 @@ def password_reset_token_created(reset_password_token, *args, **kwargs):
     html_message = render_to_string("backend/email.html", context=context)
     plain_message = strip_tags(html_message)
 
-    msg = EmailMultiAlternatives(
-        subject=f"Réinitialisation de votre mot de passe",
-        body=plain_message,
-        from_email="codelivecamp@gmail.com",
-        to=[reset_password_token.user.email]
-    )
-
-    msg.attach_alternative(html_message, "text/html")
-    msg.send()
+    try:
+        msg = EmailMultiAlternatives(
+            subject=f"Réinitialisation de votre mot de passe",
+            body=plain_message,
+            from_email=settings.EMAIL_HOST_USER,  # ✅ CORRIGÉ : Utilise ton email Gmail
+            to=[reset_password_token.user.email]
+        )
+        msg.attach_alternative(html_message, "text/html")
+        msg.send(fail_silently=False)
+        print("✅ Email envoyé avec succès")
+    except Exception as e:
+        print(f"❌ Erreur envoi email : {e}")

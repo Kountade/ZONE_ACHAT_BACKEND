@@ -12,31 +12,28 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # ============================================================
 # SÉCURITÉ
 # ============================================================
-# On sécurise la clé pour qu'elle soit lue depuis Render (avec ta clé locale en fallback)
 SECRET_KEY = os.environ.get(
-    'SECRET_KEY',
+    'SECRET_KEY', 
     "django-insecure-$232vni+0*(&kifn+=h=+z4le9mc=6fa@d*4fdw+xw-84@^&kj"
 )
 
 DEBUG = True
 
 ALLOWED_HOSTS = [
-    "zone-achat-backend.onrender.com",
+    "zoneachat-backend.onrender.com", # ✅ Ton backend
     "localhost",
     "127.0.0.1",
 ]
 
 CSRF_TRUSTED_ORIGINS = [
-    'https://zone-achat-backend.onrender.com',
-    # ✅ Ajout de ton frontend (si c'est son nom)
-    'https://zone-achat.onrender.com',
+    'https://zoneachat-backend.onrender.com',
+    'https://zoneachat.onrender.com', # ✅ Ton frontend
 ]
 
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
-# ✅ LIGNE CRUCIALE POUR LE LIEN DE MOT DE PASSE
-# Remplace cette URL par l'URL exacte de ton frontend React sur Render
-FRONTEND_URL = 'https://zone-achat.onrender.com/'
+# ✅ LIGNE CRUCIALE : Le lien dans l'email pointera vers ton frontend React
+FRONTEND_URL = 'https://zoneachat.onrender.com/' 
 
 
 # ============================================================
@@ -85,8 +82,8 @@ MIDDLEWARE = [
 # ============================================================
 CORS_ALLOW_ALL_ORIGINS = True
 CORS_ALLOWED_ORIGINS = [
-    "https://zone-achat-backend.onrender.com",
-    "https://zone-achat.onrender.com",  # ✅ Ajout du frontend
+    "https://zoneachat-backend.onrender.com",
+    "https://zoneachat.onrender.com", # ✅ Ton frontend
     "http://localhost:3000",
     "http://127.0.0.1:3000",
 ]
@@ -97,6 +94,7 @@ CORS_ALLOWED_ORIGINS = [
 # ============================================================
 AUTH_USER_MODEL = 'users.CustomUser'
 AUTHENTICATION_BACKENDS = [
+    "users.auth_backend.EmailAuthBackend", # ✅ Ajouté pour le login email
     "django.contrib.auth.backends.ModelBackend",
 ]
 
@@ -129,7 +127,7 @@ WSGI_APPLICATION = "authentification.wsgi.application"
 
 
 # ============================================================
-# DATABASE
+# DATABASE (SQLite)
 # ============================================================
 DATABASES = {
     "default": {
@@ -165,14 +163,14 @@ DEFAULT_FROM_EMAIL = EMAIL_HOST_USER
 # ============================================================
 # I18N
 # ============================================================
-LANGUAGE_CODE = "en-us"
-TIME_ZONE = "UTC"
+LANGUAGE_CODE = "fr-fr"
+TIME_ZONE = "Africa/Dakar"
 USE_I18N = True
 USE_TZ = True
 
 
 # ============================================================
-# STATIC & MEDIA (Tes images sont protégées ici)
+# STATIC & MEDIA
 # ============================================================
 STATIC_URL = '/static/'
 STATICFILES_DIRS = [os.path.join(BASE_DIR, 'static')]
