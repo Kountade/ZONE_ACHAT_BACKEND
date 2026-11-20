@@ -13,27 +13,26 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # SÉCURITÉ
 # ============================================================
 SECRET_KEY = os.environ.get(
-    'SECRET_KEY', 
+    'SECRET_KEY',
     "django-insecure-$232vni+0*(&kifn+=h=+z4le9mc=6fa@d*4fdw+xw-84@^&kj"
 )
 
-DEBUG = True
+# ✅ Lit le DEBUG de Render (False en prod, True en local)
+DEBUG = os.environ.get('DEBUG', 'True') == 'True'
 
-ALLOWED_HOSTS = [
-    "zoneachat-backend.onrender.com", # ✅ Ton backend
-    "localhost",
-    "127.0.0.1",
-]
+ALLOWED_HOSTS = os.environ.get(
+    'ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
 
-CSRF_TRUSTED_ORIGINS = [
-    'https://zoneachat-backend.onrender.com',
-    'https://zoneachat.onrender.com', # ✅ Ton frontend
-]
+# ✅ Récupère les origines depuis Render pour le CORS et CSRF
+CORS_ALLOWED_ORIGINS = os.environ.get('CORS_ALLOWED_ORIGINS', '').split(',')
+CSRF_TRUSTED_ORIGINS = os.environ.get('CSRF_TRUSTED_ORIGINS', '').split(',')
 
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
-# ✅ LIGNE CRUCIALE : Le lien dans l'email pointera vers ton frontend React
-FRONTEND_URL = 'https://zoneachat.onrender.com/' 
+# ✅ LIGNE CRUCIALE : Lit l'URL de Render
+FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:5173/')
+if not FRONTEND_URL.endswith('/'):
+    FRONTEND_URL += '/'
 
 
 # ============================================================
@@ -78,23 +77,11 @@ MIDDLEWARE = [
 
 
 # ============================================================
-# CORS
-# ============================================================
-CORS_ALLOW_ALL_ORIGINS = True
-CORS_ALLOWED_ORIGINS = [
-    "https://zoneachat-backend.onrender.com",
-    "https://zoneachat.onrender.com", # ✅ Ton frontend
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-]
-
-
-# ============================================================
 # AUTHENTIFICATION & REST
 # ============================================================
+CORS_ALLOW_ALL_ORIGINS = True  # Gardé pour éviter les blocages en dev
 AUTH_USER_MODEL = 'users.CustomUser'
 AUTHENTICATION_BACKENDS = [
-    "users.auth_backend.EmailAuthBackend", # ✅ Ajouté pour le login email
     "django.contrib.auth.backends.ModelBackend",
 ]
 
@@ -127,7 +114,7 @@ WSGI_APPLICATION = "authentification.wsgi.application"
 
 
 # ============================================================
-# DATABASE (SQLite)
+# DATABASE
 # ============================================================
 DATABASES = {
     "default": {
@@ -149,14 +136,14 @@ AUTH_PASSWORD_VALIDATORS = [
 
 
 # ============================================================
-# EMAIL
+# EMAIL (Lit les variables de Render de ton image 2)
 # ============================================================
 EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
 EMAIL_HOST = 'smtp.gmail.com'
 EMAIL_PORT = 587
 EMAIL_USE_TLS = True
-EMAIL_HOST_USER = 'othyk2018@gmail.com'
-EMAIL_HOST_PASSWORD = 'ueirfedbfnnaizps'
+EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER', 'othyk2018@gmail.com')
+EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', 'ueirfedbfnnaizps')
 DEFAULT_FROM_EMAIL = EMAIL_HOST_USER
 
 
