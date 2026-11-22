@@ -5,7 +5,6 @@ Django settings for authentification project.
 from pathlib import Path
 import os
 
-# Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 
@@ -17,19 +16,58 @@ SECRET_KEY = os.environ.get(
     "django-insecure-$232vni+0*(&kifn+=h=+z4le9mc=6fa@d*4fdw+xw-84@^&kj"
 )
 
-# ✅ Lit le DEBUG de Render (False en prod, True en local)
 DEBUG = os.environ.get('DEBUG', 'True') == 'True'
 
-ALLOWED_HOSTS = os.environ.get(
-    'ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
+ALLOWED_HOSTS = [
+    h.strip() for h in os.environ.get(
+        'ALLOWED_HOSTS', 'localhost,127.0.0.1'
+    ).split(',') if h.strip()
+]
 
-# ✅ Récupère les origines depuis Render pour le CORS et CSRF
-CORS_ALLOWED_ORIGINS = os.environ.get('CORS_ALLOWED_ORIGINS', '').split(',')
-CSRF_TRUSTED_ORIGINS = os.environ.get('CSRF_TRUSTED_ORIGINS', '').split(',')
+
+# ============================================================
+# ✅ FONCTION UTILITAIRE — filtre les origines invalides
+# ============================================================
+def _parse_origins(env_var_name, default):
+    """
+    Lit une variable d'env type 'http://a.com,https://b.com'.
+    - Ignore les entrées vides ou sans '://'
+    - Retombe sur `default` si rien de valide
+    → Évite les erreurs 4_0.E001 et corsheaders.E013
+    """
+    raw = os.environ.get(env_var_name, "").strip()
+    if not raw:
+        return default
+    origins = [
+        o.strip()
+        for o in raw.split(",")
+        if o.strip() and "://" in o
+    ]
+    return origins or default
+
+
+CORS_ALLOWED_ORIGINS = _parse_origins(
+    "CORS_ALLOWED_ORIGINS",
+    [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+    ],
+)
+
+CSRF_TRUSTED_ORIGINS = _parse_origins(
+    "CSRF_TRUSTED_ORIGINS",
+    [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+    ],
+)
 
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
-# ✅ LIGNE CRUCIALE : Lit l'URL de Render
 FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:5173/')
 if not FRONTEND_URL.endswith('/'):
     FRONTEND_URL += '/'
@@ -56,14 +94,15 @@ INSTALLED_APPS = [
     "achats_fournisseurs",
     "finances",
     "ventes_clients",
-    "config"
+    "config",
 ]
 
 
 # ============================================================
-# MIDDLEWARE
+# MIDDLEWARE — ⚠️ CorsMiddleware en HAUT
 # ============================================================
 MIDDLEWARE = [
+    "corsheaders.middleware.CorsMiddleware",         # ✅ déplacé en premier
     "django.middleware.security.SecurityMiddleware",
     'whitenoise.middleware.WhiteNoiseMiddleware',
     "django.contrib.sessions.middleware.SessionMiddleware",
@@ -72,14 +111,17 @@ MIDDLEWARE = [
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
-    "corsheaders.middleware.CorsMiddleware",
 ]
 
 
 # ============================================================
 # AUTHENTIFICATION & REST
 # ============================================================
-CORS_ALLOW_ALL_ORIGINS = True  # Gardé pour éviter les blocages en dev
+# ⚠️ En production, à mettre False :
+CORS_ALLOW_ALL_ORIGINS = DEBUG   # True en dev, False en prod
+
+CORS_ALLOW_CREDENTIALS = True
+
 AUTH_USER_MODEL = 'users.CustomUser'
 AUTHENTICATION_BACKENDS = [
     "django.contrib.auth.backends.ModelBackend",
@@ -136,7 +178,7 @@ AUTH_PASSWORD_VALIDATORS = [
 
 
 # ============================================================
-# EMAIL (Lit les variables de Render de ton image 2)
+# EMAIL
 # ============================================================
 EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
 EMAIL_HOST = 'smtp.gmail.com'
@@ -157,15 +199,20 @@ USE_TZ = True
 
 
 # ============================================================
-# STATIC & MEDIA
+# ✅ STATIC & MEDIA — n'inclut QUE les dossiers existants
 # ============================================================
 STATIC_URL = '/static/'
-STATICFILES_DIRS = [os.path.join(BASE_DIR, 'static')]
-STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
+STATICFILES_DIRS = [
+    d for d in [
+        BASE_DIR / 'static',
+        BASE_DIR / 'authentification' / 'static',
+    ] if d.exists()
+]
+STATIC_ROOT = BASE_DIR / 'staticfiles'
 STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
 
 MEDIA_URL = '/media/'
-MEDIA_ROOT = os.path.join(BASE_DIR, 'media/')
+MEDIA_ROOT = BASE_DIR / 'media/'
 
 IMAGE_MAX_SIZE = (800, 800)
 THUMBNAIL_SIZE = (150, 150)
