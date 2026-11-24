@@ -2,11 +2,14 @@
 # ============================================================
 # SERIALIZERS OPTIMISÉS - Compatible annotations SQL
 # ✅ Mise à jour : upload image produit + galerie
+# ✅ Correction : clear_image / _clear_image ne polluent plus validated_data
+# ✅ Correction : create() ajouté, _build_gallery() ajouté
 # ============================================================
 
 from rest_framework import serializers
 from django.db import transaction
 from django.utils import timezone
+from django.core.files.storage import default_storage
 from datetime import date, timedelta
 from decimal import Decimal
 
@@ -311,12 +314,21 @@ class ProductDetailSerializer(serializers.ModelSerializer):
 
 
 class ProductWriteSerializer(serializers.ModelSerializer):
+    """
+    ✅ CORRIGÉ :
+      - clear_image / _clear_image sont retirés de validated_data
+        dans to_internal_value(), donc create() et update() fonctionnent
+        sans TypeError.
+      - create() implémenté explicitement.
+      - update() gère la suppression physique de l'image.
+      - _build_gallery() implémenté.
+    """
     gallery_files = serializers.ListField(
         child=serializers.ImageField(),
         write_only=True,
         required=False,
     )
-    # ✅ Accepte les deux noms
+    # ✅ Accepte les deux noms (compat frontend)
     clear_image = serializers.BooleanField(
         write_only=True, required=False, default=False
     )
@@ -335,12 +347,47 @@ class ProductWriteSerializer(serializers.ModelSerializer):
             'clear_image', '_clear_image', 'status', 'is_featured'
         ]
 
+    # ---------------------------------------------------------
+    # ✅ CORRECTION CLÉ : on extrait les flags AVANT validated_data
+    # ---------------------------------------------------------
+    def to_internal_value(self, data):
+        validated = super().to_internal_value(data)
+        # On stocke les flags sur l'instance de serializer, sans les
+        # laisser dans validated_data
+        self._clear_image_flag = bool(
+            validated.pop('clear_image', False)
+            or validated.pop('_clear_image', False)
+        )
+        return validated
+
+    # ---------------------------------------------------------
+    # ✅ create() — les flags ne sont plus dans validated_data
+    # ---------------------------------------------------------
+    def create(self, validated_data):
+        gallery_files = validated_data.pop('gallery_files', [])
+        request = self.context.get('request')
+
+        if gallery_files:
+            validated_data['gallery'] = self._build_gallery(
+                gallery_files, existing=[], request=request
+            )
+
+        return Product.objects.create(**validated_data)
+
+    # ---------------------------------------------------------
+    # ✅ update() — les flags ont déjà été extraits
+    # ---------------------------------------------------------
     def update(self, instance, validated_data):
         gallery_files = validated_data.pop('gallery_files', [])
-        clear_image = validated_data.pop('clear_image', False) or \
-            validated_data.pop('_clear_image', False)
+        clear_image = getattr(self, '_clear_image_flag', False)
 
         if clear_image:
+            # Supprime physiquement l'ancien fichier si présent
+            if instance.image:
+                try:
+                    instance.image.delete(save=False)
+                except Exception:
+                    pass
             instance.image = None
             validated_data.pop('image', None)
 
@@ -355,6 +402,30 @@ class ProductWriteSerializer(serializers.ModelSerializer):
 
         instance.save()
         return instance
+
+    # ---------------------------------------------------------
+    # ✅ Helper : construit la liste gallery à partir des fichiers
+    # ---------------------------------------------------------
+    def _build_gallery(self, files, existing=None, request=None):
+        """
+        Construit/met à jour la liste `gallery` du produit.
+        Chaque entrée est un dict { 'url': '...', 'name': '...' }.
+        """
+        gallery = list(existing or [])
+
+        for f in files:
+            try:
+                path = default_storage.save(
+                    f"products/gallery/{f.name}", f)
+                url = default_storage.url(path)
+                if request:
+                    url = request.build_absolute_uri(url)
+                gallery.append({'url': url, 'name': f.name})
+            except Exception:
+                # On ignore les fichiers en erreur pour ne pas casser la sauvegarde
+                continue
+
+        return gallery
 
 
 # ============================================================
