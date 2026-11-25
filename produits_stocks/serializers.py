@@ -1,22 +1,21 @@
 # apps/produits_stocks/serializers.py
 # ============================================================
-# SERIALIZERS OPTIMISÉS - Compatible annotations SQL
-# ✅ Mise à jour : upload image produit + galerie
-# ✅ Correction : clear_image / _clear_image ne polluent plus validated_data
-# ✅ Correction : create() ajouté, _build_gallery() ajouté
+# SERIALIZERS - Support complet des variantes
 # ============================================================
 
 from rest_framework import serializers
 from django.db import transaction
 from django.utils import timezone
 from django.core.files.storage import default_storage
-from datetime import date, timedelta
+from datetime import date
 from decimal import Decimal
 
 from .models import (
-    Category, UnitMeasure, Product, Warehouse, Lot,
-    Stock, StockMovement, ExpiryAlert, Inventory, InventoryLine,
-    Transfer, TransferItem
+    Category, UnitMeasure, Product, Warehouse, Lot, Stock,
+    StockMovement, ExpiryAlert, Inventory, InventoryLine,
+    Transfer, TransferItem,
+    # ✅ NOUVEAU
+    ProductOption, ProductOptionValue, ProductVariant,
 )
 from users.models import CustomUser
 
@@ -24,12 +23,7 @@ from users.models import CustomUser
 # ============================================================
 # CATEGORY
 # ============================================================
-
 class CategorySerializer(serializers.ModelSerializer):
-    """
-    ✅ Category optimisé - utilise annotations SQL si disponibles.
-    ✅ Support image upload
-    """
     full_path = serializers.ReadOnlyField()
     children_count = serializers.SerializerMethodField()
     products_count = serializers.SerializerMethodField()
@@ -59,9 +53,7 @@ class CategorySerializer(serializers.ModelSerializer):
             return None
         request = self.context.get('request')
         try:
-            if request:
-                return request.build_absolute_uri(obj.image.url)
-            return obj.image.url
+            return request.build_absolute_uri(obj.image.url) if request else obj.image.url
         except Exception:
             return None
 
@@ -73,7 +65,6 @@ class CategorySerializer(serializers.ModelSerializer):
         return value
 
     def validate_image(self, value):
-        """✅ Validation image : type + taille max 5 Mo"""
         if value:
             if value.size > 5 * 1024 * 1024:
                 raise serializers.ValidationError(
@@ -85,7 +76,6 @@ class CategorySerializer(serializers.ModelSerializer):
 
 
 class CategoryListSerializer(serializers.ModelSerializer):
-    """Serializer léger pour les listes de catégories."""
     image_url = serializers.SerializerMethodField()
 
     class Meta:
@@ -97,9 +87,7 @@ class CategoryListSerializer(serializers.ModelSerializer):
             return None
         request = self.context.get('request')
         try:
-            if request:
-                return request.build_absolute_uri(obj.image.url)
-            return obj.image.url
+            return request.build_absolute_uri(obj.image.url) if request else obj.image.url
         except Exception:
             return None
 
@@ -107,7 +95,6 @@ class CategoryListSerializer(serializers.ModelSerializer):
 # ============================================================
 # UNIT MEASURE
 # ============================================================
-
 class UnitMeasureSerializer(serializers.ModelSerializer):
     class Meta:
         model = UnitMeasure
@@ -119,13 +106,105 @@ class UnitMeasureSerializer(serializers.ModelSerializer):
 
 
 # ============================================================
+# ✅ NOUVEAU : PRODUCT VARIANTS SERIALIZERS
+# ============================================================
+class ProductOptionValueSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ProductOptionValue
+        fields = ['id', 'value', 'position']
+
+
+class ProductOptionSerializer(serializers.ModelSerializer):
+    values = ProductOptionValueSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = ProductOption
+        fields = ['id', 'name', 'position', 'values']
+
+
+class ProductVariantSerializer(serializers.ModelSerializer):
+    """Lecture d'une variante (liste / détail)."""
+    option_values = ProductOptionValueSerializer(many=True, read_only=True)
+    label = serializers.ReadOnlyField()
+    image_url = serializers.SerializerMethodField()
+    effective_purchase_price = serializers.ReadOnlyField()
+    effective_selling_price = serializers.ReadOnlyField()
+    current_stock = serializers.ReadOnlyField()
+
+    class Meta:
+        model = ProductVariant
+        fields = [
+            'id', 'product', 'sku', 'barcode',
+            'option_values', 'label',
+            'purchase_price', 'selling_price',
+            'wholesale_price', 'promo_price',
+            'effective_purchase_price', 'effective_selling_price',
+            'image', 'image_url',
+            'is_active', 'is_default',
+            'current_stock',
+            'created_at', 'updated_at',
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at', 'current_stock']
+
+    def get_image_url(self, obj):
+        if not obj.image:
+            return None
+        request = self.context.get('request')
+        try:
+            return request.build_absolute_uri(obj.image.url) if request else obj.image.url
+        except Exception:
+            return None
+
+
+class ProductVariantWriteSerializer(serializers.ModelSerializer):
+    """Création / mise à jour d'une variante."""
+    option_value_ids = serializers.ListField(
+        child=serializers.IntegerField(),
+        write_only=True, required=False
+    )
+
+    class Meta:
+        model = ProductVariant
+        fields = [
+            'id', 'sku', 'barcode',
+            'purchase_price', 'selling_price',
+            'wholesale_price', 'promo_price',
+            'image', 'is_active', 'is_default',
+            'option_value_ids',
+        ]
+
+    def validate_sku(self, value):
+        qs = ProductVariant.objects.exclude(
+            id=self.instance.id if self.instance else None
+        ).filter(sku=value)
+        if qs.exists():
+            raise serializers.ValidationError("Ce SKU existe déjà.")
+        return value
+
+    def _set_options(self, variant, value_ids):
+        if value_ids is None:
+            return
+        variant.option_values.set(value_ids)
+
+    def create(self, validated_data):
+        value_ids = validated_data.pop('option_value_ids', [])
+        variant = ProductVariant.objects.create(**validated_data)
+        self._set_options(variant, value_ids)
+        return variant
+
+    def update(self, instance, validated_data):
+        value_ids = validated_data.pop('option_value_ids', None)
+        for k, v in validated_data.items():
+            setattr(instance, k, v)
+        instance.save()
+        self._set_options(instance, value_ids)
+        return instance
+
+
+# ============================================================
 # PRODUCT
 # ============================================================
-
 class ProductLiteSerializer(serializers.ModelSerializer):
-    """
-    ✅ Serializer ULTRA-LÉGER pour le POS, listes rapides.
-    """
     category_name = serializers.CharField(
         source='category.name', read_only=True)
     unit_symbol = serializers.CharField(source='unit.symbol', read_only=True)
@@ -147,7 +226,7 @@ class ProductLiteSerializer(serializers.ModelSerializer):
             'tax_rate', 'has_expiry', 'alert_days',
             'min_stock', 'max_stock',
             'status', 'status_display',
-            'is_featured',
+            'is_featured', 'has_variants',  # ✅ NOUVEAU
             'image', 'image_url',
             'current_stock',
         ]
@@ -162,17 +241,12 @@ class ProductLiteSerializer(serializers.ModelSerializer):
             return None
         request = self.context.get('request')
         try:
-            if request:
-                return request.build_absolute_uri(obj.image.url)
-            return obj.image.url
+            return request.build_absolute_uri(obj.image.url) if request else obj.image.url
         except Exception:
             return None
 
 
 class ProductListSerializer(serializers.ModelSerializer):
-    """
-    ✅ Serializer OPTIMISÉ pour les listes standards.
-    """
     category_name = serializers.CharField(
         source='category.name', read_only=True)
     unit_symbol = serializers.CharField(source='unit.symbol', read_only=True)
@@ -188,15 +262,13 @@ class ProductListSerializer(serializers.ModelSerializer):
             'id', 'code', 'barcode', 'name',
             'category', 'category_name',
             'unit', 'unit_symbol',
-            'selling_price',
-            'wholesale_price',
-            'purchase_price',
+            'selling_price', 'wholesale_price', 'purchase_price',
             'current_stock', 'current_stock_value',
             'min_stock',
             'status', 'status_display',
-            'has_expiry',
+            'has_expiry', 'has_variants',  # ✅ NOUVEAU
             'image', 'image_url',
-            'is_featured'
+            'is_featured',
         ]
 
     def get_current_stock(self, obj):
@@ -213,18 +285,12 @@ class ProductListSerializer(serializers.ModelSerializer):
             return None
         request = self.context.get('request')
         try:
-            if request:
-                return request.build_absolute_uri(obj.image.url)
-            return obj.image.url
+            return request.build_absolute_uri(obj.image.url) if request else obj.image.url
         except Exception:
             return None
 
 
 class ProductDetailSerializer(serializers.ModelSerializer):
-    """
-    ✅ Serializer détaillé - utilise annotations SQL.
-    ✅ Expose image + image_url + gallery + gallery_urls
-    """
     category_name = serializers.CharField(
         source='category.name', read_only=True)
     unit_symbol = serializers.CharField(source='unit.symbol', read_only=True)
@@ -238,6 +304,10 @@ class ProductDetailSerializer(serializers.ModelSerializer):
     expiring_lots_count = serializers.SerializerMethodField()
     image_url = serializers.SerializerMethodField()
     gallery_urls = serializers.SerializerMethodField()
+
+    # ✅ NOUVEAU : variantes + options
+    options = ProductOptionSerializer(many=True, read_only=True)
+    variants = ProductVariantSerializer(many=True, read_only=True)
 
     class Meta:
         model = Product
@@ -253,6 +323,7 @@ class ProductDetailSerializer(serializers.ModelSerializer):
             'reorder_point', 'reorder_quantity',
             'image', 'image_url', 'gallery', 'gallery_urls',
             'status', 'status_display', 'is_featured',
+            'has_variants', 'options', 'variants',  # ✅ NOUVEAU
             'current_stock', 'current_stock_value',
             'expired_lots_count', 'expiring_lots_count',
             'created_at', 'updated_at', 'created_by'
@@ -283,27 +354,19 @@ class ProductDetailSerializer(serializers.ModelSerializer):
             return None
         request = self.context.get('request')
         try:
-            if request:
-                return request.build_absolute_uri(obj.image.url)
-            return obj.image.url
+            return request.build_absolute_uri(obj.image.url) if request else obj.image.url
         except Exception:
             return None
 
     def get_gallery_urls(self, obj):
-        """✅ Retourne les URLs absolues de chaque image de la galerie"""
         if not obj.gallery:
             return []
         request = self.context.get('request')
         urls = []
         for item in obj.gallery:
-            # item peut être une string (URL) ou un dict
-            if isinstance(item, dict):
-                url = item.get('url', '')
-            else:
-                url = str(item)
+            url = item.get('url', '') if isinstance(item, dict) else str(item)
             if not url:
                 continue
-            # Si l'URL est déjà absolue, on la garde
             if url.startswith('http'):
                 urls.append(url)
             elif request:
@@ -314,27 +377,13 @@ class ProductDetailSerializer(serializers.ModelSerializer):
 
 
 class ProductWriteSerializer(serializers.ModelSerializer):
-    """
-    ✅ CORRIGÉ :
-      - clear_image / _clear_image sont retirés de validated_data
-        dans to_internal_value(), donc create() et update() fonctionnent
-        sans TypeError.
-      - create() implémenté explicitement.
-      - update() gère la suppression physique de l'image.
-      - _build_gallery() implémenté.
-    """
+    """Création / mise à jour d'un produit (variantes gérées via actions dédiées)."""
     gallery_files = serializers.ListField(
-        child=serializers.ImageField(),
-        write_only=True,
-        required=False,
-    )
-    # ✅ Accepte les deux noms (compat frontend)
+        child=serializers.ImageField(), write_only=True, required=False)
     clear_image = serializers.BooleanField(
-        write_only=True, required=False, default=False
-    )
+        write_only=True, required=False, default=False)
     _clear_image = serializers.BooleanField(
-        write_only=True, required=False, default=False
-    )
+        write_only=True, required=False, default=False)
 
     class Meta:
         model = Product
@@ -344,45 +393,31 @@ class ProductWriteSerializer(serializers.ModelSerializer):
             'promo_price', 'tax_rate', 'has_expiry', 'shelf_life_days',
             'alert_days', 'min_stock', 'max_stock', 'reorder_point',
             'reorder_quantity', 'image', 'gallery', 'gallery_files',
-            'clear_image', '_clear_image', 'status', 'is_featured'
+            'clear_image', '_clear_image', 'status', 'is_featured',
+            'has_variants',  # ✅ NOUVEAU
         ]
 
-    # ---------------------------------------------------------
-    # ✅ CORRECTION CLÉ : on extrait les flags AVANT validated_data
-    # ---------------------------------------------------------
     def to_internal_value(self, data):
         validated = super().to_internal_value(data)
-        # On stocke les flags sur l'instance de serializer, sans les
-        # laisser dans validated_data
         self._clear_image_flag = bool(
             validated.pop('clear_image', False)
             or validated.pop('_clear_image', False)
         )
         return validated
 
-    # ---------------------------------------------------------
-    # ✅ create() — les flags ne sont plus dans validated_data
-    # ---------------------------------------------------------
     def create(self, validated_data):
         gallery_files = validated_data.pop('gallery_files', [])
         request = self.context.get('request')
-
         if gallery_files:
             validated_data['gallery'] = self._build_gallery(
-                gallery_files, existing=[], request=request
-            )
-
+                gallery_files, existing=[], request=request)
         return Product.objects.create(**validated_data)
 
-    # ---------------------------------------------------------
-    # ✅ update() — les flags ont déjà été extraits
-    # ---------------------------------------------------------
     def update(self, instance, validated_data):
         gallery_files = validated_data.pop('gallery_files', [])
         clear_image = getattr(self, '_clear_image_flag', False)
 
         if clear_image:
-            # Supprime physiquement l'ancien fichier si présent
             if instance.image:
                 try:
                     instance.image.delete(save=False)
@@ -397,41 +432,28 @@ class ProductWriteSerializer(serializers.ModelSerializer):
 
         if gallery_files:
             instance.gallery = self._build_gallery(
-                gallery_files, existing=instance.gallery or [], request=request
-            )
+                gallery_files, existing=instance.gallery or [], request=request)
 
         instance.save()
         return instance
 
-    # ---------------------------------------------------------
-    # ✅ Helper : construit la liste gallery à partir des fichiers
-    # ---------------------------------------------------------
     def _build_gallery(self, files, existing=None, request=None):
-        """
-        Construit/met à jour la liste `gallery` du produit.
-        Chaque entrée est un dict { 'url': '...', 'name': '...' }.
-        """
         gallery = list(existing or [])
-
         for f in files:
             try:
-                path = default_storage.save(
-                    f"products/gallery/{f.name}", f)
+                path = default_storage.save(f"products/gallery/{f.name}", f)
                 url = default_storage.url(path)
                 if request:
                     url = request.build_absolute_uri(url)
                 gallery.append({'url': url, 'name': f.name})
             except Exception:
-                # On ignore les fichiers en erreur pour ne pas casser la sauvegarde
                 continue
-
         return gallery
 
 
 # ============================================================
 # WAREHOUSE
 # ============================================================
-
 class WarehouseSerializer(serializers.ModelSerializer):
     occupancy_rate = serializers.ReadOnlyField()
 
@@ -453,7 +475,6 @@ class WarehouseSerializer(serializers.ModelSerializer):
 
 
 class WarehouseListSerializer(serializers.ModelSerializer):
-    """Serializer léger pour les listes."""
     class Meta:
         model = Warehouse
         fields = ['id', 'name', 'code', 'type', 'is_active']
@@ -462,13 +483,15 @@ class WarehouseListSerializer(serializers.ModelSerializer):
 # ============================================================
 # LOT
 # ============================================================
-
 class LotListSerializer(serializers.ModelSerializer):
-    """Serializer OPTIMISÉ pour la liste des lots."""
     product_name = serializers.CharField(source='product.name', read_only=True)
     product_code = serializers.CharField(source='product.code', read_only=True)
     warehouse_name = serializers.CharField(
         source='warehouse.name', read_only=True)
+    variant_sku = serializers.CharField(
+        source='variant.sku', read_only=True)  # ✅ NOUVEAU
+    variant_label = serializers.CharField(
+        source='variant.label', read_only=True)  # ✅ NOUVEAU
     days_until_expiry = serializers.ReadOnlyField()
     status_display = serializers.CharField(
         source='get_status_display', read_only=True)
@@ -479,6 +502,7 @@ class LotListSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'lot_number', 'batch_number',
             'product', 'product_name', 'product_code',
+            'variant', 'variant_sku', 'variant_label',  # ✅ NOUVEAU
             'warehouse', 'warehouse_name',
             'initial_quantity', 'current_quantity',
             'available_quantity', 'reserved_quantity',
@@ -491,7 +515,6 @@ class LotListSerializer(serializers.ModelSerializer):
 
 
 class LotDetailSerializer(serializers.ModelSerializer):
-    """Serializer détaillé d'un lot."""
     product_name = serializers.CharField(source='product.name', read_only=True)
     product_code = serializers.CharField(source='product.code', read_only=True)
     product_has_expiry = serializers.BooleanField(
@@ -499,6 +522,10 @@ class LotDetailSerializer(serializers.ModelSerializer):
     warehouse_name = serializers.CharField(
         source='warehouse.name', read_only=True)
     unit_symbol = serializers.CharField(source='unit.symbol', read_only=True)
+    variant_sku = serializers.CharField(
+        source='variant.sku', read_only=True)  # ✅ NOUVEAU
+    variant_label = serializers.CharField(
+        source='variant.label', read_only=True)  # ✅ NOUVEAU
     days_until_expiry = serializers.ReadOnlyField()
     is_expired = serializers.ReadOnlyField()
     is_expiring_soon = serializers.ReadOnlyField()
@@ -513,6 +540,7 @@ class LotDetailSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'lot_number', 'batch_number', 'barcode',
             'product', 'product_name', 'product_code', 'product_has_expiry',
+            'variant', 'variant_sku', 'variant_label',  # ✅ NOUVEAU
             'warehouse', 'warehouse_name',
             'unit', 'unit_symbol',
             'initial_quantity', 'current_quantity',
@@ -530,13 +558,15 @@ class LotDetailSerializer(serializers.ModelSerializer):
 
 
 class LotWriteSerializer(serializers.ModelSerializer):
-    """Serializer pour créer/modifier un lot."""
     class Meta:
         model = Lot
         fields = [
-            'lot_number', 'batch_number', 'barcode', 'product', 'warehouse',
-            'unit', 'initial_quantity', 'current_quantity', 'min_quantity_alert',
-            'manufacturing_date', 'expiry_date', 'purchase_price', 'selling_price',
+            'lot_number', 'batch_number', 'barcode',
+            'product', 'variant',  # ✅ NOUVEAU
+            'warehouse', 'unit',
+            'initial_quantity', 'current_quantity', 'min_quantity_alert',
+            'manufacturing_date', 'expiry_date',
+            'purchase_price', 'selling_price',
             'notes'
         ]
 
@@ -551,27 +581,31 @@ class LotWriteSerializer(serializers.ModelSerializer):
         if data.get('expiry_date') and data.get('manufacturing_date'):
             if data['manufacturing_date'] >= data['expiry_date']:
                 raise serializers.ValidationError(
-                    "La date de fabrication doit être antérieure à la date d'expiration"
-                )
-
+                    "La date de fabrication doit être antérieure à la date d'expiration")
         if data.get('current_quantity', 0) < 0:
             raise serializers.ValidationError(
-                {"current_quantity": "La quantité ne peut pas être négative"}
-            )
-
+                {"current_quantity": "La quantité ne peut pas être négative"})
+        # ✅ NOUVEAU : cohérence variant ↔ product
+        product = data.get('product')
+        variant = data.get('variant')
+        if variant and product and variant.product_id != product.id:
+            raise serializers.ValidationError(
+                {"variant": "La variante ne correspond pas au produit."})
         return data
 
 
 # ============================================================
 # STOCK
 # ============================================================
-
 class StockSerializer(serializers.ModelSerializer):
-    """Serializer OPTIMISÉ - Utilise les annotations SQL."""
     product_name = serializers.CharField(source='product.name', read_only=True)
     product_code = serializers.CharField(source='product.code', read_only=True)
     warehouse_name = serializers.CharField(
         source='warehouse.name', read_only=True)
+    variant_sku = serializers.CharField(
+        source='variant.sku', read_only=True)  # ✅ NOUVEAU
+    variant_label = serializers.CharField(
+        source='variant.label', read_only=True)  # ✅ NOUVEAU
 
     available_quantity = serializers.SerializerMethodField()
     is_low_stock = serializers.SerializerMethodField()
@@ -583,6 +617,7 @@ class StockSerializer(serializers.ModelSerializer):
         model = Stock
         fields = [
             'id', 'product', 'product_name', 'product_code',
+            'variant', 'variant_sku', 'variant_label',  # ✅ NOUVEAU
             'warehouse', 'warehouse_name',
             'quantity', 'available_quantity', 'reserved_quantity',
             'min_stock', 'max_stock',
@@ -612,8 +647,7 @@ class StockSerializer(serializers.ModelSerializer):
         return self._get_max_stock(obj)
 
     def get_is_low_stock(self, obj):
-        min_s = self._get_min_stock(obj)
-        return (obj.quantity or 0) <= min_s
+        return (obj.quantity or 0) <= self._get_min_stock(obj)
 
     def get_is_over_stock(self, obj):
         max_s = self._get_max_stock(obj)
@@ -621,10 +655,11 @@ class StockSerializer(serializers.ModelSerializer):
 
 
 class StockDetailSerializer(serializers.ModelSerializer):
-    """Serializer détaillé avec lots FIFO."""
     product_name = serializers.CharField(source='product.name', read_only=True)
     warehouse_name = serializers.CharField(
         source='warehouse.name', read_only=True)
+    variant_sku = serializers.CharField(
+        source='variant.sku', read_only=True)  # ✅ NOUVEAU
     available_quantity = serializers.ReadOnlyField()
     lots_fifo = serializers.SerializerMethodField()
 
@@ -632,6 +667,7 @@ class StockDetailSerializer(serializers.ModelSerializer):
         model = Stock
         fields = [
             'id', 'product', 'product_name',
+            'variant', 'variant_sku',  # ✅ NOUVEAU
             'warehouse', 'warehouse_name',
             'quantity', 'available_quantity', 'reserved_quantity',
             'min_stock', 'max_stock',
@@ -647,11 +683,11 @@ class StockDetailSerializer(serializers.ModelSerializer):
 # ============================================================
 # STOCK MOVEMENT
 # ============================================================
-
 class StockMovementSerializer(serializers.ModelSerializer):
-    """Serializer OPTIMISÉ pour les mouvements."""
     product_name = serializers.CharField(source='product.name', read_only=True)
     lot_number = serializers.CharField(source='lot.lot_number', read_only=True)
+    variant_sku = serializers.CharField(
+        source='variant.sku', read_only=True)  # ✅ NOUVEAU
     from_warehouse_name = serializers.CharField(
         source='from_warehouse.name', read_only=True)
     to_warehouse_name = serializers.CharField(
@@ -666,6 +702,7 @@ class StockMovementSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'product', 'product_name',
             'lot', 'lot_number',
+            'variant', 'variant_sku',  # ✅ NOUVEAU
             'from_warehouse', 'from_warehouse_name',
             'to_warehouse', 'to_warehouse_name',
             'movement_type', 'movement_type_display',
@@ -678,11 +715,11 @@ class StockMovementSerializer(serializers.ModelSerializer):
 
 
 class StockMovementCreateSerializer(serializers.ModelSerializer):
-    """Serializer pour créer un mouvement."""
     class Meta:
         model = StockMovement
         fields = [
-            'product', 'lot', 'from_warehouse', 'to_warehouse',
+            'product', 'lot', 'variant',  # ✅ NOUVEAU
+            'from_warehouse', 'to_warehouse',
             'movement_type', 'quantity', 'reference_type',
             'reference_id', 'reference_number', 'reason', 'notes'
         ]
@@ -690,7 +727,6 @@ class StockMovementCreateSerializer(serializers.ModelSerializer):
     def validate(self, data):
         movement_type = data.get('movement_type')
         quantity = data.get('quantity', 0)
-
         if quantity <= 0:
             raise serializers.ValidationError(
                 {"quantity": "La quantité doit être supérieure à 0"})
@@ -702,19 +738,18 @@ class StockMovementCreateSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError({
                     "quantity": f"Stock insuffisant. Disponible: {lot.available_quantity}"
                 })
-
         return data
 
 
 # ============================================================
 # EXPIRY ALERT
 # ============================================================
-
 class ExpiryAlertSerializer(serializers.ModelSerializer):
-    """Serializer OPTIMISÉ pour les alertes."""
     product_name = serializers.CharField(source='product.name', read_only=True)
     product_code = serializers.CharField(source='product.code', read_only=True)
     lot_number = serializers.CharField(source='lot.lot_number', read_only=True)
+    variant_sku = serializers.CharField(
+        source='lot.variant.sku', read_only=True)  # ✅ NOUVEAU
     warehouse_name = serializers.CharField(
         source='warehouse.name', read_only=True)
     severity_display = serializers.CharField(
@@ -725,6 +760,7 @@ class ExpiryAlertSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'lot', 'lot_number',
             'product', 'product_name', 'product_code',
+            'variant_sku',  # ✅ NOUVEAU
             'warehouse', 'warehouse_name',
             'severity', 'severity_display',
             'days_left', 'message',
@@ -737,17 +773,21 @@ class ExpiryAlertSerializer(serializers.ModelSerializer):
 # ============================================================
 # INVENTORY
 # ============================================================
-
 class InventoryLineSerializer(serializers.ModelSerializer):
-    """Serializer pour les lignes d'inventaire."""
     product_name = serializers.CharField(source='product.name', read_only=True)
     product_code = serializers.CharField(source='product.code', read_only=True)
+    variant_sku = serializers.CharField(
+        source='variant.sku', read_only=True)  # ✅ NOUVEAU
+    variant_label = serializers.CharField(
+        source='variant.label', read_only=True)  # ✅ NOUVEAU
     lot_number = serializers.CharField(source='lot.lot_number', read_only=True)
+    difference = serializers.ReadOnlyField()
 
     class Meta:
         model = InventoryLine
         fields = [
             'id', 'product', 'product_name', 'product_code',
+            'variant', 'variant_sku', 'variant_label',  # ✅ NOUVEAU
             'lot', 'lot_number',
             'expected_quantity', 'actual_quantity', 'difference',
             'expected_value', 'actual_value', 'value_difference',
@@ -756,7 +796,6 @@ class InventoryLineSerializer(serializers.ModelSerializer):
 
 
 class InventorySerializer(serializers.ModelSerializer):
-    """Serializer OPTIMISÉ pour les inventaires."""
     warehouse_name = serializers.CharField(
         source='warehouse.name', read_only=True)
     status_display = serializers.CharField(
@@ -781,7 +820,6 @@ class InventorySerializer(serializers.ModelSerializer):
 
 
 class InventoryListSerializer(serializers.ModelSerializer):
-    """Serializer léger pour la liste des inventaires."""
     warehouse_name = serializers.CharField(
         source='warehouse.name', read_only=True)
     status_display = serializers.CharField(
@@ -805,20 +843,12 @@ class InventoryListSerializer(serializers.ModelSerializer):
 
 
 class InventoryCreateSerializer(serializers.ModelSerializer):
-    """Serializer pour créer un inventaire."""
     class Meta:
         model = Inventory
         fields = ['warehouse', 'name', 'description', 'start_date', 'notes']
 
-    def validate_start_date(self, value):
-        if value < timezone.now():
-            raise serializers.ValidationError(
-                "La date de début ne peut pas être dans le passé")
-        return value
-
 
 class InventoryLineUpdateSerializer(serializers.ModelSerializer):
-    """Serializer pour mettre à jour une ligne d'inventaire."""
     class Meta:
         model = InventoryLine
         fields = ['actual_quantity', 'notes']
@@ -833,10 +863,10 @@ class InventoryLineUpdateSerializer(serializers.ModelSerializer):
 # ============================================================
 # TRANSFER
 # ============================================================
-
 class TransferItemSerializer(serializers.Serializer):
-    """Serializer pour un article à transférer."""
     product_id = serializers.IntegerField()
+    variant_id = serializers.IntegerField(
+        required=False, allow_null=True)  # ✅ NOUVEAU
     quantity = serializers.IntegerField(min_value=1)
 
     def validate_product_id(self, value):
@@ -849,7 +879,6 @@ class TransferItemSerializer(serializers.Serializer):
 
 
 class TransferRequestSerializer(serializers.Serializer):
-    """Serializer pour la requête de transfert."""
     from_warehouse_id = serializers.IntegerField()
     to_warehouse_id = serializers.IntegerField()
     items = TransferItemSerializer(many=True, allow_empty=False)
@@ -880,29 +909,33 @@ class TransferRequestSerializer(serializers.Serializer):
         from_warehouse_id = data['from_warehouse_id']
         for item in data['items']:
             product_id = item['product_id']
+            variant_id = item.get('variant_id')
             quantity = item['quantity']
 
             try:
-                stock = Stock.objects.get(
+                qs = Stock.objects.filter(
                     product_id=product_id,
-                    warehouse_id=from_warehouse_id
+                    warehouse_id=from_warehouse_id,
                 )
+                if variant_id:
+                    qs = qs.filter(variant_id=variant_id)
+                else:
+                    qs = qs.filter(variant__isnull=True)
+                stock = qs.get()
             except Stock.DoesNotExist:
+                v = f" (variante {variant_id})" if variant_id else ""
                 raise serializers.ValidationError(
-                    f"Le produit {product_id} n'a pas de stock dans l'entrepôt source."
-                )
+                    f"Le produit {product_id}{v} n'a pas de stock "
+                    f"dans l'entrepôt source.")
 
             if stock.available_quantity < quantity:
                 raise serializers.ValidationError(
                     f"Stock insuffisant pour le produit {product_id}. "
-                    f"Disponible : {stock.available_quantity}"
-                )
-
+                    f"Disponible : {stock.available_quantity}")
         return data
 
 
 class TransferSerializer(serializers.ModelSerializer):
-    """Serializer pour un transfert complet."""
     from_warehouse_name = serializers.CharField(
         source='from_warehouse.name', read_only=True)
     to_warehouse_name = serializers.CharField(
@@ -931,12 +964,14 @@ class TransferSerializer(serializers.ModelSerializer):
 
     def get_items(self, obj):
         items = obj.items.select_related(
-            'product', 'source_lot', 'destination_lot').all()
+            'product', 'variant', 'source_lot', 'destination_lot').all()
         return [{
             'id': item.id,
             'product': item.product.id,
             'product_name': item.product.name,
             'product_code': item.product.code,
+            'variant': item.variant.id if item.variant else None,
+            'variant_sku': item.variant.sku if item.variant else None,
             'quantity': item.quantity,
             'source_lot': item.source_lot.lot_number if item.source_lot else None,
             'destination_lot': item.destination_lot.lot_number if item.destination_lot else None,
@@ -944,7 +979,6 @@ class TransferSerializer(serializers.ModelSerializer):
 
 
 class TransferItemResponseSerializer(serializers.Serializer):
-    """Serializer pour un article dans la réponse de transfert."""
     product = serializers.CharField()
     quantity = serializers.IntegerField()
     from_warehouse = serializers.CharField()
@@ -953,7 +987,6 @@ class TransferItemResponseSerializer(serializers.Serializer):
 
 
 class TransferResponseSerializer(serializers.Serializer):
-    """Serializer pour la réponse de transfert."""
     message = serializers.CharField()
     movements = TransferItemResponseSerializer(many=True)
 
@@ -961,10 +994,10 @@ class TransferResponseSerializer(serializers.Serializer):
 # ============================================================
 # MANUAL STOCK ADD
 # ============================================================
-
 class ManualStockAddSerializer(serializers.Serializer):
-    """Serializer pour l'ajout manuel de stock."""
     product_id = serializers.IntegerField()
+    variant_id = serializers.IntegerField(
+        required=False, allow_null=True)  # ✅ NOUVEAU
     warehouse_id = serializers.IntegerField()
     quantity = serializers.IntegerField(min_value=1)
     lot_number = serializers.CharField(
@@ -994,6 +1027,22 @@ class ManualStockAddSerializer(serializers.Serializer):
             raise serializers.ValidationError(
                 {"warehouse_id": "Entrepôt non trouvé"})
 
+        # ✅ NOUVEAU : cohérence variant ↔ product
+        variant_id = data.get('variant_id')
+        if variant_id:
+            try:
+                variant = ProductVariant.objects.get(id=variant_id)
+            except ProductVariant.DoesNotExist:
+                raise serializers.ValidationError(
+                    {"variant_id": "Variante non trouvée"})
+            if variant.product_id != product.id:
+                raise serializers.ValidationError(
+                    {"variant_id": "La variante n'appartient pas à ce produit"})
+        elif product.has_variants:
+            raise serializers.ValidationError({
+                "variant_id": "Ce produit a des variantes, le champ variant_id est requis."
+            })
+
         if data.get('expiry_date') and data['expiry_date'] < date.today():
             raise serializers.ValidationError(
                 {"expiry_date": "La date d'expiration ne peut pas être dans le passé"})
@@ -1003,22 +1052,20 @@ class ManualStockAddSerializer(serializers.Serializer):
                 {"expiry_date": "Ce produit a une date d'expiration obligatoire"})
 
         if not data.get('lot_number'):
+            suffix = f"-{variant_id}" if variant_id else f"-{data['product_id']}"
             data['lot_number'] = (
-                f"MAN-{timezone.now().strftime('%Y%m%d%H%M%S')}-{data['product_id']}"
-            )
-
+                f"MAN-{timezone.now().strftime('%Y%m%d%H%M%S')}{suffix}")
         return data
 
 
 # ============================================================
 # DASHBOARD / STATS
 # ============================================================
-
 class LowStockSerializer(serializers.Serializer):
-    """Serializer pour les produits en stock faible."""
     product_id = serializers.IntegerField()
     product_name = serializers.CharField()
     product_code = serializers.CharField()
+    variant_sku = serializers.CharField(required=False, allow_null=True)
     current_stock = serializers.IntegerField()
     min_stock = serializers.IntegerField()
     warehouse_id = serializers.IntegerField()
@@ -1027,12 +1074,12 @@ class LowStockSerializer(serializers.Serializer):
 
 
 class ExpiringProductsSerializer(serializers.Serializer):
-    """Serializer pour les produits qui expirent bientôt."""
     lot_id = serializers.IntegerField()
     lot_number = serializers.CharField()
     product_id = serializers.IntegerField()
     product_name = serializers.CharField()
     product_code = serializers.CharField()
+    variant_sku = serializers.CharField(required=False, allow_null=True)
     warehouse_name = serializers.CharField()
     current_quantity = serializers.IntegerField()
     expiry_date = serializers.DateField()
