@@ -86,7 +86,6 @@ class LoginViewset(viewsets.ViewSet):
 
 
 class RegisterViewset(viewsets.ViewSet):
-    """Inscription interne (admin)"""
     permission_classes = [permissions.AllowAny]
     serializer_class = RegisterSerializer
 
@@ -106,11 +105,6 @@ class RegisterViewset(viewsets.ViewSet):
 
 
 class ClientRegisterViewset(viewsets.ViewSet):
-    """
-    Endpoint public d'inscription pour les CLIENTS uniquement.
-    Le compte est créé avec rôle='client' et is_approved=False.
-    Un admin doit l'approuver pour qu'il puisse accéder à son espace.
-    """
     permission_classes = [permissions.AllowAny]
     serializer_class = ClientRegisterSerializer
 
@@ -138,6 +132,9 @@ class ClientRegisterViewset(viewsets.ViewSet):
 class UserViewset(viewsets.ViewSet):
     permission_classes = [permissions.IsAuthenticated]
 
+    # ✅ N'accepte QUE des IDs numériques → /users/nouveau/ tombera en 404 propre
+    lookup_value_regex = '[0-9]+'
+
     def get_serializer_class(self):
         if self.action in ['create', 'update', 'partial_update']:
             return UserWriteSerializer
@@ -147,6 +144,25 @@ class UserViewset(viewsets.ViewSet):
 
     def is_admin(self, user):
         return user.role in self.ADMIN_ROLES
+
+    # ============================================================
+    # ✅ Helper : récupération sûre d'un utilisateur par pk
+    # ============================================================
+    def _get_user_or_error(self, pk):
+        try:
+            pk = int(pk)
+        except (ValueError, TypeError):
+            return None, Response(
+                {"error": "Identifiant utilisateur invalide"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        try:
+            return User.objects.get(pk=pk), None
+        except User.DoesNotExist:
+            return None, Response(
+                {"error": "Utilisateur non trouvé"},
+                status=status.HTTP_404_NOT_FOUND
+            )
 
     # ============================================================
     # LIST
@@ -205,18 +221,12 @@ class UserViewset(viewsets.ViewSet):
     # RETRIEVE
     # ============================================================
     def retrieve(self, request, pk=None):
-        try:
-            user = User.objects.get(pk=pk)
-        except User.DoesNotExist:
-            return Response({"error": "Utilisateur non trouvé"}, status=404)
+        user, err = self._get_user_or_error(pk)
+        if err:
+            return err
 
-        if self.is_admin(request.user):
-            serializer = UserDetailSerializer(user)
-            return Response(serializer.data)
-
-        if request.user.id == user.id:
-            serializer = UserDetailSerializer(user)
-            return Response(serializer.data)
+        if self.is_admin(request.user) or request.user.id == user.id:
+            return Response(UserDetailSerializer(user).data)
 
         return Response({"error": "Permission refusée"}, status=403)
 
@@ -224,10 +234,9 @@ class UserViewset(viewsets.ViewSet):
     # UPDATE
     # ============================================================
     def update(self, request, pk=None):
-        try:
-            user = User.objects.get(pk=pk)
-        except User.DoesNotExist:
-            return Response({"error": "Utilisateur non trouvé"}, status=404)
+        user, err = self._get_user_or_error(pk)
+        if err:
+            return err
 
         if self.is_admin(request.user):
             serializer = UserWriteSerializer(user, data=request.data)
@@ -252,10 +261,9 @@ class UserViewset(viewsets.ViewSet):
     # PARTIAL UPDATE
     # ============================================================
     def partial_update(self, request, pk=None):
-        try:
-            user = User.objects.get(pk=pk)
-        except User.DoesNotExist:
-            return Response({"error": "Utilisateur non trouvé"}, status=404)
+        user, err = self._get_user_or_error(pk)
+        if err:
+            return err
 
         if self.is_admin(request.user):
             serializer = UserWriteSerializer(
@@ -287,10 +295,9 @@ class UserViewset(viewsets.ViewSet):
                 status=403
             )
 
-        try:
-            user = User.objects.get(pk=pk)
-        except User.DoesNotExist:
-            return Response({"error": "Utilisateur non trouvé"}, status=404)
+        user, err = self._get_user_or_error(pk)
+        if err:
+            return err
 
         if user.id == request.user.id:
             return Response(
@@ -306,13 +313,7 @@ class UserViewset(viewsets.ViewSet):
     # ============================================================
     @action(detail=False, methods=['get'], url_path='me')
     def me(self, request):
-        """
-        Retourne les informations de l'utilisateur connecté.
-        GET /users/me/
-        """
-        user = request.user
-        serializer = UserDetailSerializer(user)
-        return Response(serializer.data)
+        return Response(UserDetailSerializer(request.user).data)
 
     # ============================================================
     # ACTION : APPROUVER UN CLIENT
@@ -320,20 +321,11 @@ class UserViewset(viewsets.ViewSet):
     @action(detail=True, methods=['post'], url_path='approve',
             permission_classes=[CanApproveClients])
     def approve_client(self, request, pk=None):
-        """
-        Approuver un compte client en attente.
-        ✅ S'assure que le profil Client existe et est actif.
-        ✅ Crée le wallet si absent.
-        """
         from ventes_clients.models import Client, ClientWallet
 
-        try:
-            user = User.objects.get(pk=pk)
-        except User.DoesNotExist:
-            return Response(
-                {"error": "Utilisateur non trouvé"},
-                status=status.HTTP_404_NOT_FOUND
-            )
+        user, err = self._get_user_or_error(pk)
+        if err:
+            return err
 
         if user.role != 'client':
             return Response(
@@ -349,11 +341,9 @@ class UserViewset(viewsets.ViewSet):
 
         try:
             with transaction.atomic():
-                # ✅ ÉTAPE 1 : S'assurer que le Client existe
                 client = user.client_profile
 
                 if not client:
-                    # Créer le Client si absent
                     count = Client.objects.count()
                     code = f"CLI-{count + 1:05d}"
                     while Client.objects.filter(code=code).exists():
@@ -379,18 +369,15 @@ class UserViewset(viewsets.ViewSet):
                     )
                     user.client_profile = client
 
-                # ✅ ÉTAPE 2 : Approuver l'utilisateur
                 user.is_approved = True
                 user.is_active = True
                 user.save(update_fields=[
                     'is_approved', 'is_active', 'client_profile', 'updated_at'
                 ])
 
-                # ✅ ÉTAPE 3 : S'assurer que le Client est actif
                 client.statut = 'actif'
                 client.save(update_fields=['statut', 'updated_at'])
 
-                # ✅ ÉTAPE 4 : Créer le wallet automatiquement
                 ClientWallet.objects.get_or_create(client=client)
 
                 print(
@@ -425,14 +412,9 @@ class UserViewset(viewsets.ViewSet):
     @action(detail=True, methods=['post'], url_path='reject',
             permission_classes=[CanApproveClients])
     def reject_client(self, request, pk=None):
-        """Rejeter un compte client en attente"""
-        try:
-            user = User.objects.get(pk=pk)
-        except User.DoesNotExist:
-            return Response(
-                {"error": "Utilisateur non trouvé"},
-                status=status.HTTP_404_NOT_FOUND
-            )
+        user, err = self._get_user_or_error(pk)
+        if err:
+            return err
 
         if user.role != 'client':
             return Response(
@@ -456,7 +438,6 @@ class UserViewset(viewsets.ViewSet):
     @action(detail=False, methods=['get'], url_path='pending-clients',
             permission_classes=[CanApproveClients])
     def pending_clients(self, request):
-        """Liste tous les clients en attente d'approbation"""
         clients = User.objects.filter(
             role='client',
             is_approved=False,
@@ -474,7 +455,6 @@ class UserViewset(viewsets.ViewSet):
     @action(detail=False, methods=['get'], url_path='approved-clients',
             permission_classes=[CanApproveClients])
     def approved_clients(self, request):
-        """Liste tous les clients approuvés"""
         clients = User.objects.filter(
             role='client',
             is_approved=True,
@@ -487,21 +467,13 @@ class UserViewset(viewsets.ViewSet):
         })
 
     # ============================================================
-    # ACTION : DIAGNOSTIC — Vérifier le lien client
+    # ACTION : DIAGNOSTIC
     # ============================================================
     @action(detail=True, methods=['get'], url_path='check-client-profile')
     def check_client_profile(self, request, pk=None):
-        """
-        Diagnostic : vérifier si un utilisateur a bien un profil client lié.
-        GET /users/{id}/check-client-profile/
-        """
-        try:
-            user = User.objects.get(pk=pk)
-        except User.DoesNotExist:
-            return Response(
-                {"error": "Utilisateur non trouvé"},
-                status=status.HTTP_404_NOT_FOUND
-            )
+        user, err = self._get_user_or_error(pk)
+        if err:
+            return err
 
         has_profile = user.client_profile is not None
 
