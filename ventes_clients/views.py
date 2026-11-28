@@ -2,6 +2,7 @@
 # ============================================================
 # VIEWS COMPLET OPTIMISÉ — LOGICIEL B
 # ✅ ZÉRO N+1 — Optimisé pour 10 000+ lignes < 1s
+# ✅ Support complet des variantes (ProductVariant)
 # ============================================================
 
 import logging
@@ -29,7 +30,10 @@ from .models import (
     ClientStock, ClientStockLigne, ClientStockMovement,
     ClientDelivery, ClientDeliveryLigne,
 )
-from produits_stocks.models import Stock, StockMovement, Warehouse, Product
+from produits_stocks.models import (
+    Stock, StockMovement, Warehouse, Product,
+    ProductVariant,   # ✅ VARIANTES
+)
 from users.permissions import IsAdmin, IsGestionnaire, IsCaissier
 
 # === Serializers ===
@@ -56,6 +60,9 @@ from .serializers import (
     ClientDeliveryLigneCreateSerializer, ClientDeliveryCreateSerializer,
     ClientDeliveryStatusUpdateSerializer,
     ClientDeliveryValidateSerializer, ClientDeliveryRejectSerializer,
+    ClientDeliveryRequestCreateSerializer,
+    ClientDeliveryRequestUpdateSerializer,
+    ClientDeliveryLigneRequestSerializer,
 )
 
 # === Pagination ===
@@ -66,10 +73,10 @@ logger = logging.getLogger(__name__)
 
 # ============================================================
 # QUERYSETS RÉUTILISABLES (anti-N+1)
+# ✅ VARIANTES : select_related('variant') ajouté partout
 # ============================================================
 
 def _vente_list_queryset():
-    """Queryset Vente liste — prefetch invoices/devis_source."""
     return (
         Vente.objects
         .select_related('client', 'warehouse', 'created_by')
@@ -78,12 +85,12 @@ def _vente_list_queryset():
 
 
 def _vente_detail_queryset():
-    """Queryset Vente détail — prefetch profond."""
     return (
         Vente.objects
         .select_related('client', 'warehouse', 'created_by')
         .prefetch_related(
             'lines__product',
+            'lines__variant',   # ✅ VARIANTES
             'lines__lot',
             'devis_source',
             Prefetch(
@@ -112,7 +119,6 @@ def _vente_detail_queryset():
 
 
 def _facture_list_queryset():
-    """Queryset Facture liste — prefetch paiements + annotation remaining_calc."""
     return (
         Facture.objects
         .select_related('client', 'sale', 'sale__warehouse')
@@ -140,7 +146,6 @@ def _facture_list_queryset():
 
 
 def _paiement_queryset():
-    """Queryset Paiement — select_related complet."""
     return (
         Paiement.objects
         .select_related(
@@ -155,7 +160,6 @@ def _paiement_queryset():
 
 
 def _devis_list_queryset():
-    """Queryset Devis liste — select_related complet."""
     return (
         Devis.objects
         .select_related('client', 'warehouse', 'created_by', 'sale')
@@ -163,12 +167,12 @@ def _devis_list_queryset():
 
 
 def _devis_detail_queryset():
-    """Queryset Devis détail — prefetch lignes."""
     return (
         Devis.objects
         .select_related('client', 'warehouse', 'created_by')
         .prefetch_related(
             'lignes__product',
+            'lignes__variant',   # ✅ VARIANTES
             Prefetch(
                 'sale',
                 queryset=(
@@ -182,19 +186,18 @@ def _devis_detail_queryset():
 
 
 def _avoir_queryset():
-    """Queryset Avoir — select_related FK + prefetch lignes."""
     return (
         Avoir.objects
         .select_related('client', 'sale', 'created_by')
         .prefetch_related(
             'lignes__product',
+            'lignes__variant',   # ✅ VARIANTES
             'lignes__ligne_vente',
         )
     )
 
 
 def _delivery_queryset():
-    """Queryset ClientDelivery — prefetch lignes."""
     return (
         ClientDelivery.objects
         .select_related('client', 'client_stock', 'created_by', 'validated_by')
@@ -203,7 +206,7 @@ def _delivery_queryset():
                 'lignes',
                 queryset=(
                     ClientDeliveryLigne.objects
-                    .select_related('product', 'client_stock_ligne')
+                    .select_related('product', 'variant', 'client_stock_ligne')  # ✅ VARIANTES
                 ),
             ),
         )
@@ -215,10 +218,6 @@ def _delivery_queryset():
 # ============================================================
 
 def creer_mouvement_paiement_manuel(paiement, facture, request_user):
-    """
-    Crée un mouvement de trésorerie pour un paiement.
-    ✅ Optimisé : utilise le cache des FK quand possible.
-    """
     logger.info(
         f"🔍 creer_mouvement_paiement_manuel - paiement {paiement.id}, "
         f"facture {facture.invoice_number}"
@@ -354,7 +353,6 @@ class ClientViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user)
 
-    # ✅ CORRIGÉ : filtre correct avec Vente.objects
     @action(detail=True, methods=['get'])
     def sales(self, request, pk=None):
         client = self.get_object()
@@ -368,7 +366,6 @@ class ClientViewSet(viewsets.ModelViewSet):
         )
         return Response(serializer.data)
 
-    # ✅ CORRIGÉ : Devis.objects.filter(client=client) (client.devis n'existe pas)
     @action(detail=True, methods=['get'])
     def devis(self, request, pk=None):
         client = self.get_object()
@@ -382,7 +379,6 @@ class ClientViewSet(viewsets.ModelViewSet):
         )
         return Response(serializer.data)
 
-    # ✅ CORRIGÉ : 1 requête d'agrégation
     @action(detail=True, methods=['get'])
     def statistics(self, request, pk=None):
         client = self.get_object()
@@ -455,7 +451,7 @@ class ClientViewSet(viewsets.ModelViewSet):
             Prefetch(
                 'lignes',
                 queryset=ClientStockLigne.objects.select_related(
-                    'product', 'product__unit'
+                    'product', 'product__unit', 'variant'   # ✅ VARIANTES
                 ),
             ),
         ).get_or_create(client=client)
@@ -486,7 +482,6 @@ class DevisViewSet(viewsets.ModelViewSet):
         context['request'] = self.request
         return context
 
-    # ✅ CORRIGÉ : date_from/date_to index-friendly
     def get_queryset(self):
         queryset = _devis_list_queryset().order_by('-devis_date', '-id')
 
@@ -504,7 +499,6 @@ class DevisViewSet(viewsets.ModelViewSet):
         if status_filter:
             queryset = queryset.filter(status=status_filter)
 
-        # ✅ Dates index-friendly
         date_from = self.request.query_params.get('date_from')
         if date_from:
             try:
@@ -598,19 +592,6 @@ class DevisViewSet(viewsets.ModelViewSet):
 # ============================================================
 # VENTE VIEWSET
 # ============================================================
-# ============================================================
-# VENTE VIEWSET — CORRIGÉ
-# ✅ ZÉRO N+1
-# ✅ Fix "Cannot compute Sum('total'): 'total' is an aggregate"
-#    → querysets séparés pour stats (nu) et liste (avec prefetch)
-# ============================================================
-
-# ============================================================
-# VENTE VIEWSET — CORRIGÉ
-# ✅ ZÉRO N+1
-# ✅ Fix "Cannot compute Sum('total'): 'total' is an aggregate"
-#    → alias renommé 'total' → 'total_count' (conflit avec le champ 'total')
-# ============================================================
 
 class VenteViewSet(viewsets.ModelViewSet):
     queryset = Vente.objects.all()
@@ -631,9 +612,6 @@ class VenteViewSet(viewsets.ModelViewSet):
         context['request'] = self.request
         return context
 
-    # ================================================================
-    # QUERYSET PRINCIPAL (liste, CRUD standard)
-    # ================================================================
     def get_queryset(self):
         queryset = _vente_list_queryset().order_by('-sale_date', '-id')
 
@@ -656,7 +634,6 @@ class VenteViewSet(viewsets.ModelViewSet):
         if payment_status:
             queryset = queryset.filter(payment_status=payment_status)
 
-        # ✅ Dates index-friendly
         date_from = self.request.query_params.get('date_from')
         if date_from:
             try:
@@ -687,19 +664,9 @@ class VenteViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user)
 
-    # ================================================================
-    # ✅ HELPER : agrégation des stats (CORRIGÉ)
-    # ================================================================
     def _aggregate_stats(self, stats_qs):
-        """
-        ✅ Applique .aggregate() sur un queryset Vente NU (sans prefetch/select_related).
-
-        ⚠️ FIX: l'alias 'total' est renommé en 'total_count'.
-        Django confondait l'alias 'total' (Count) avec le champ 'total'
-        dans Sum('total') → FieldError: 'total' is an aggregate.
-        """
         stats_agg = stats_qs.aggregate(
-            total_count=Count('id'),   # ← renommé (évite le conflit d'alias)
+            total_count=Count('id'),
             total_amount=Coalesce(
                 Sum('total'), Value(Decimal('0.00')),
                 output_field=DecimalField(max_digits=15, decimal_places=2),
@@ -716,7 +683,7 @@ class VenteViewSet(viewsets.ModelViewSet):
         )
 
         return {
-            'total': stats_agg['total_count'] or 0,   # ← clé API inchangée
+            'total': stats_agg['total_count'] or 0,
             'total_amount': float(stats_agg['total_amount'] or 0),
             'by_status': {
                 'draft': stats_agg['draft'],
@@ -733,9 +700,6 @@ class VenteViewSet(viewsets.ModelViewSet):
             },
         }
 
-    # ================================================================
-    # HELPER : filtres communs (appliqués à un queryset quelconque)
-    # ================================================================
     def _apply_list_filters(self, qs, request):
         status_filter = request.query_params.get('status')
         if status_filter:
@@ -758,9 +722,6 @@ class VenteViewSet(viewsets.ModelViewSet):
 
         return qs
 
-    # ================================================================
-    # 1. VENTES PAR DATE
-    # ================================================================
     @action(detail=False, methods=['get'], url_path='by-date')
     def get_by_date(self, request):
         date_str = request.query_params.get('date')
@@ -778,9 +739,6 @@ class VenteViewSet(viewsets.ModelViewSet):
         date_start = dt.datetime.combine(target_date, dt.datetime.min.time())
         date_end = date_start + timedelta(days=1)
 
-        # ============================================================
-        # ✅ ÉTAPE 1 : STATS sur queryset NU (pas de prefetch/select_related)
-        # ============================================================
         stats_qs = Vente.objects.filter(
             sale_date__gte=date_start,
             sale_date__lt=date_end,
@@ -788,9 +746,6 @@ class VenteViewSet(viewsets.ModelViewSet):
         stats_qs = self._apply_list_filters(stats_qs, request)
         stats = self._aggregate_stats(stats_qs)
 
-        # ============================================================
-        # ✅ ÉTAPE 2 : LISTE sur queryset enrichi (prefetch + select_related)
-        # ============================================================
         list_qs = (
             _vente_list_queryset()
             .filter(sale_date__gte=date_start, sale_date__lt=date_end)
@@ -817,9 +772,6 @@ class VenteViewSet(viewsets.ModelViewSet):
             'results': serializer.data,
         })
 
-    # ================================================================
-    # 2. VENTES SUR PLAGE DE DATES
-    # ================================================================
     @action(detail=False, methods=['get'], url_path='date-range')
     def get_date_range(self, request):
         date_from = request.query_params.get('date_from')
@@ -842,9 +794,6 @@ class VenteViewSet(viewsets.ModelViewSet):
 
         date_end = date_end.replace(hour=23, minute=59, second=59)
 
-        # ============================================================
-        # ✅ ÉTAPE 1 : STATS sur queryset NU
-        # ============================================================
         stats_qs = Vente.objects.filter(
             sale_date__gte=date_start,
             sale_date__lte=date_end,
@@ -852,9 +801,6 @@ class VenteViewSet(viewsets.ModelViewSet):
         stats_qs = self._apply_list_filters(stats_qs, request)
         stats = self._aggregate_stats(stats_qs)
 
-        # ============================================================
-        # ✅ ÉTAPE 2 : LISTE sur queryset enrichi
-        # ============================================================
         list_qs = (
             _vente_list_queryset()
             .filter(sale_date__gte=date_start, sale_date__lte=date_end)
@@ -883,9 +829,6 @@ class VenteViewSet(viewsets.ModelViewSet):
             'results': serializer.data,
         })
 
-    # ================================================================
-    # 3. CONFIRMER UNE VENTE
-    # ================================================================
     @action(detail=True, methods=['post'])
     def confirm(self, request, pk=None):
         vente = self.get_object()
@@ -903,22 +846,31 @@ class VenteViewSet(viewsets.ModelViewSet):
             )
 
         try:
-            lines = list(vente.lines.select_related('product').all())
-            stock_map = {
-                s.product_id: s
-                for s in Stock.objects.filter(
-                    product_id__in=[l.product_id for l in lines],
-                    warehouse=vente.warehouse,
-                )
-            }
+            # ✅ VARIANTES : select_related('variant')
+            lines = list(vente.lines.select_related('product', 'variant').all())
+
+            # ✅ VARIANTES : map par (product_id, variant_id)
+            stock_map = {}
+            product_variant_pairs = [
+                (l.product_id, l.variant_id) for l in lines
+            ]
+            stocks_qs = Stock.objects.filter(
+                warehouse=vente.warehouse,
+                product_id__in={p for p, _ in product_variant_pairs},
+            )
+            for s in stocks_qs:
+                stock_map[(s.product_id, s.variant_id)] = s
 
             stock_errors = []
             for line in lines:
-                stock = stock_map.get(line.product_id)
+                stock = stock_map.get((line.product_id, line.variant_id))
                 if not stock or stock.available_quantity < line.quantity:
                     available = stock.available_quantity if stock else 0
+                    label = line.product.name
+                    if line.variant_id:
+                        label += f" [{line.variant.sku}]"
                     stock_errors.append(
-                        f"{line.product.name}: disponible {available}, "
+                        f"{label}: disponible {available}, "
                         f"demandé {line.quantity}"
                     )
 
@@ -935,7 +887,6 @@ class VenteViewSet(viewsets.ModelViewSet):
             vente.status = 'confirmed'
             vente.save()
 
-            # Mouvement trésorerie
             mouvement = None
             try:
                 from tresorerie.models import MouvementTresorerie, Caisse
@@ -976,7 +927,6 @@ class VenteViewSet(viewsets.ModelViewSet):
             except Exception as e:
                 logger.error(f"Erreur mouvement trésorerie: {e}")
 
-            # Génération facture
             facture = Facture.objects.filter(sale=vente).first()
             if not facture:
                 from .models import generate_number
@@ -1027,9 +977,6 @@ class VenteViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
-    # ================================================================
-    # 4. ENREGISTRER UN PAIEMENT
-    # ================================================================
     @action(detail=True, methods=['post'])
     def register_payment(self, request, pk=None):
         vente = self.get_object()
@@ -1114,9 +1061,6 @@ class VenteViewSet(viewsets.ModelViewSet):
             'mouvement_cree': mouvement is not None,
         }, status=status.HTTP_201_CREATED)
 
-    # ================================================================
-    # 5. MISE À JOUR DU STATUT
-    # ================================================================
     @action(detail=True, methods=['post'])
     def update_status(self, request, pk=None):
         vente = self.get_object()
@@ -1159,9 +1103,6 @@ class VenteViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
-    # ================================================================
-    # 6. MARQUER COMME PAYÉE
-    # ================================================================
     @action(detail=True, methods=['post'])
     def mark_paid(self, request, pk=None):
         vente = self.get_object()
@@ -1225,9 +1166,6 @@ class VenteViewSet(viewsets.ModelViewSet):
             'mouvement_cree': mouvement is not None,
         })
 
-    # ================================================================
-    # 7. ANNULER
-    # ================================================================
     @action(detail=True, methods=['post'])
     def cancel(self, request, pk=None):
         vente = self.get_object()
@@ -1257,9 +1195,6 @@ class VenteViewSet(viewsets.ModelViewSet):
         except Exception as e:
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
-    # ================================================================
-    # 8. LIVRER
-    # ================================================================
     @action(detail=True, methods=['post'])
     def deliver(self, request, pk=None):
         vente = self.get_object()
@@ -1285,9 +1220,6 @@ class VenteViewSet(viewsets.ModelViewSet):
             'invoice_number': vente.invoice_number,
         })
 
-    # ================================================================
-    # 9. RETOURNER
-    # ================================================================
     @action(detail=True, methods=['post'])
     def return_sale(self, request, pk=None):
         vente = self.get_object()
@@ -1311,9 +1243,6 @@ class VenteViewSet(viewsets.ModelViewSet):
         except Exception as e:
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
-    # ================================================================
-    # 10. PAIEMENTS
-    # ================================================================
     @action(detail=True, methods=['get'])
     def payments(self, request, pk=None):
         vente = _vente_detail_queryset().get(pk=pk)
@@ -1326,9 +1255,6 @@ class VenteViewSet(viewsets.ModelViewSet):
         )
         return Response(serializer.data)
 
-    # ================================================================
-    # 11. FACTURES
-    # ================================================================
     @action(detail=True, methods=['get'])
     def invoices(self, request, pk=None):
         vente = _vente_detail_queryset().get(pk=pk)
@@ -1337,9 +1263,6 @@ class VenteViewSet(viewsets.ModelViewSet):
         )
         return Response(serializer.data)
 
-    # ================================================================
-    # 12. QR CODE
-    # ================================================================
     @action(detail=True, methods=['get'])
     def generate_qr(self, request, pk=None):
         vente = self.get_object()
@@ -1357,23 +1280,17 @@ class VenteViewSet(viewsets.ModelViewSet):
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
 
-    # ================================================================
-    # 13. MOUVEMENTS DE STOCK
-    # ================================================================
     @action(detail=True, methods=['get'])
     def stock_movements(self, request, pk=None):
         vente = self.get_object()
         movements = StockMovement.objects.filter(
             reference_type='sale',
             reference_id=vente.id,
-        ).select_related('product', 'lot').order_by('-created_at')
+        ).select_related('product', 'lot', 'variant').order_by('-created_at')  # ✅ VARIANTES
         from produits_stocks.serializers import StockMovementSerializer
         serializer = StockMovementSerializer(movements, many=True)
         return Response(serializer.data)
 
-    # ================================================================
-    # 14. STATS GLOBALES
-    # ================================================================
     @action(detail=False, methods=['get'])
     def stats(self, request):
         try:
@@ -1452,10 +1369,10 @@ class VenteViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
+
 # ============================================================
 # FACTURE VIEWSET
 # ============================================================
-
 
 class FactureViewSet(viewsets.ModelViewSet):
     queryset = Facture.objects.all()
@@ -1561,7 +1478,6 @@ class FactureViewSet(viewsets.ModelViewSet):
         )
         return Response(serializer.data)
 
-    # ✅ CORRIGÉ : statuts corrigés
     @action(detail=False, methods=['get'], url_path='client-stats')
     def client_stats(self, request):
         client_id = request.query_params.get('client_id')
@@ -1866,7 +1782,6 @@ class FactureViewSet(viewsets.ModelViewSet):
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
 
-    # ✅ CORRIGÉ : utilise _facture_list_queryset() (1 requête)
     @action(detail=True, methods=['get'])
     def paiements(self, request, pk=None):
         facture = _facture_list_queryset().get(pk=pk)
@@ -1994,7 +1909,6 @@ class AvoirViewSet(viewsets.ModelViewSet):
                     stock_restored = result["success"]
                     stock_details = result["details"]
 
-                # Mouvement trésorerie
                 mouvement_tresorerie = None
                 try:
                     from tresorerie.models import MouvementTresorerie, Caisse
@@ -2390,7 +2304,6 @@ class WalletViewSet(viewsets.ViewSet):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-    # ✅ CORRIGÉ : Vente.objects.filter(client=client).select_related('warehouse')
     @action(detail=False, methods=['post'])
     def deposit(self, request):
         client_id = request.data.get('client_id')
@@ -2440,7 +2353,6 @@ class WalletViewSet(viewsets.ViewSet):
                 try:
                     from tresorerie.models import MouvementTresorerie, Caisse
 
-                    # ✅ CORRIGÉ : Vente.objects.filter(...).select_related
                     sale = Vente.objects.filter(client=client).select_related(
                         'warehouse'
                     ).first()
@@ -2749,16 +2661,12 @@ class WalletViewSet(viewsets.ViewSet):
 
                     total_paye += amount
 
-                # ✅ bulk_create
                 WalletTransaction.objects.bulk_create(wallet_transactions)
                 Paiement.objects.bulk_create(paiements)
-
-                # ✅ bulk_update (colonnes éditables seulement)
                 Facture.objects.bulk_update(
                     facture_updates, ['amount_paid', 'status']
                 )
 
-                # ✅ sale updates
                 for sale_id, total_paid_sale in sale_updates.items():
                     sale = Vente.objects.get(pk=sale_id)
                     sale.amount_paid = total_paid_sale
@@ -3152,7 +3060,7 @@ class ClientWalletViewSet(viewsets.ViewSet):
 
 
 # ============================================================
-# CLIENT STOCK VIEWSET
+# CLIENT STOCK VIEWSET — avec variantes
 # ============================================================
 
 class ClientStockViewSet(viewsets.ViewSet):
@@ -3175,7 +3083,8 @@ class ClientStockViewSet(viewsets.ViewSet):
         stocks_qs = ClientStock.objects.select_related('client').prefetch_related(
             Prefetch(
                 'lignes',
-                queryset=ClientStockLigne.objects.select_related('product'),
+                queryset=ClientStockLigne.objects.select_related(
+                    'product', 'variant'),   # ✅ VARIANTES
             ),
         )
 
@@ -3209,7 +3118,7 @@ class ClientStockViewSet(viewsets.ViewSet):
                 Prefetch(
                     'lignes',
                     queryset=ClientStockLigne.objects.select_related(
-                        'product', 'product__unit'
+                        'product', 'product__unit', 'variant'   # ✅ VARIANTES
                     ),
                 ),
             ).get_or_create(client_id=pk)
@@ -3222,773 +3131,700 @@ class ClientStockViewSet(viewsets.ViewSet):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-    # ✅ CORRIGÉ : unit_price seulement si fourni (0 est une valeur valide)
+    # ✅ VARIANTES : dépôt avec variant_id
     @action(detail=False, methods=['post'], url_path='deposit')
-    def deposit_stock(self, request):
-        if not self._is_admin(request.user):
-            return Response(
-                {"error": "Permission non accordée"},
-                status=status.HTTP_403_FORBIDDEN,
-            )
-
+    def deposit(self, request):
         serializer = ClientStockDepositSerializer(data=request.data)
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
         data = serializer.validated_data
+        client_id = data['client_id']
+        product_id = data['product_id']
+        variant_id = data.get('variant_id')   # ✅ VARIANTES
+        quantity = data['quantity']
+        unit_price = data.get('unit_price', Decimal('0'))
+        notes = data.get('notes', '')
 
         try:
             with transaction.atomic():
-                client = Client.objects.get(id=data['client_id'])
-                product = Product.objects.get(id=data['product_id'])
-
-                stock, _ = ClientStock.objects.get_or_create(client=client)
-
-                # ✅ CORRIGÉ : unit_price fourni explicitement ou prix produit
-                unit_price_input = data.get('unit_price')
-                default_price = (
-                    unit_price_input
-                    if unit_price_input is not None and unit_price_input > 0
-                    else product.selling_price
+                stock, _ = ClientStock.objects.get_or_create(
+                    client_id=client_id
                 )
 
-                ligne, _ = ClientStockLigne.objects.get_or_create(
-                    stock=stock,
-                    product=product,
-                    defaults={
-                        'quantity': Decimal('0'),
-                        'unit_price': default_price,
-                    },
+                ligne_qs = ClientStockLigne.objects.select_for_update().filter(
+                    stock=stock, product_id=product_id
                 )
+                if variant_id:
+                    ligne_qs = ligne_qs.filter(variant_id=variant_id)
+                else:
+                    ligne_qs = ligne_qs.filter(variant__isnull=True)
+                ligne = ligne_qs.first()
 
-                previous_quantity = ligne.quantity
-                ligne.quantity += data['quantity']
-
-                if unit_price_input is not None and unit_price_input > 0:
-                    ligne.unit_price = unit_price_input
-
-                if data.get('notes'):
-                    ligne.notes = (
-                        f"{ligne.notes}\n{data['notes']}".strip()
-                        if ligne.notes else data['notes']
+                if ligne:
+                    ligne.quantity += quantity
+                    if unit_price > 0:
+                        ligne.unit_price = unit_price
+                    if notes:
+                        ligne.notes = (ligne.notes or '') + f"\n{notes}"
+                    ligne.save()
+                    created = False
+                else:
+                    ligne = ClientStockLigne.objects.create(
+                        stock=stock,
+                        product_id=product_id,
+                        variant_id=variant_id,   # ✅ VARIANTES
+                        quantity=quantity,
+                        unit_price=unit_price,
+                        notes=notes,
                     )
+                    created = True
 
-                ligne.save()
-
-                movement = ClientStockMovement.objects.create(
+                ClientStockMovement.objects.create(
                     client_stock=stock,
-                    product=product,
+                    product_id=product_id,
+                    variant_id=variant_id,   # ✅ VARIANTES
                     movement_type='deposit',
-                    quantity=data['quantity'],
-                    previous_quantity=previous_quantity,
+                    quantity=quantity,
+                    previous_quantity=ligne.quantity - quantity,
                     new_quantity=ligne.quantity,
-                    unit_price=ligne.unit_price,
+                    unit_price=unit_price,
                     reference=f"DEP-{timezone.now().strftime('%Y%m%d%H%M%S')}",
-                    notes=data.get('notes', ''),
+                    notes=notes,
                     created_by=request.user,
                 )
 
-                stock = ClientStock.objects.prefetch_related(
-                    Prefetch(
-                        'lignes',
-                        queryset=ClientStockLigne.objects.select_related(
-                            'product', 'product__unit'
-                        ),
-                    ),
-                ).get(pk=stock.pk)
+                # Stock global (produit) — décrémenter
+                stock_qs = Stock.objects.filter(
+                    product_id=product_id, warehouse__isnull=False
+                )
+                if variant_id:
+                    stock_qs = stock_qs.filter(variant_id=variant_id)
+                else:
+                    stock_qs = stock_qs.filter(variant__isnull=True)
+                global_stock = stock_qs.first()
+
+                if global_stock and global_stock.available_quantity >= quantity:
+                    global_stock.consume_stock(quantity)
 
                 return Response({
                     'status': 'success',
-                    'message': f'Ajout de {data["quantity"]} {product.name}',
-                    'client_stock': ClientStockSerializer(
-                        stock, context={'request': request}
-                    ).data,
-                    'movement': ClientStockMovementSerializer(
-                        movement, context={'request': request}
-                    ).data,
+                    'message': f'{quantity} unités déposées chez le client',
+                    'ligne_id': ligne.id,
+                    'new_quantity': ligne.quantity,
+                    'created': created,
                 }, status=status.HTTP_201_CREATED)
 
+        except Client.DoesNotExist:
+            return Response(
+                {"error": f"Client {client_id} non trouvé"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
         except Exception as e:
-            logger.exception("Erreur dépôt stock client")
+            logger.exception("Erreur dépôt client")
             return Response(
                 {"error": str(e)},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
-    @action(detail=False, methods=['post'], url_path='withdraw')
-    def withdraw_stock(self, request):
-        if not self._is_admin(request.user):
-            return Response(
-                {"error": "Permission non accordée"},
-                status=status.HTTP_403_FORBIDDEN,
-            )
-
+    # ✅ VARIANTES : retrait avec variant_id
+    @action(detail=False, methods=['post'], url_path='withdrawal')
+    def withdrawal(self, request):
         serializer = ClientStockWithdrawalSerializer(data=request.data)
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
         data = serializer.validated_data
+        client_id = data['client_id']
+        product_id = data['product_id']
+        variant_id = data.get('variant_id')   # ✅ VARIANTES
+        quantity = data['quantity']
+        notes = data.get('notes', '')
 
         try:
             with transaction.atomic():
-                client = Client.objects.get(id=data['client_id'])
-                product = Product.objects.get(id=data['product_id'])
-
-                stock = ClientStock.objects.get(client=client)
-                ligne = ClientStockLigne.objects.get(
-                    stock=stock, product=product
+                stock = ClientStock.objects.select_for_update().get(
+                    client_id=client_id
                 )
 
-                previous_quantity = ligne.quantity
-                ligne.quantity -= data['quantity']
-                ligne.save()
+                ligne_qs = ClientStockLigne.objects.select_for_update().filter(
+                    stock=stock, product_id=product_id
+                )
+                if variant_id:
+                    ligne_qs = ligne_qs.filter(variant_id=variant_id)
+                else:
+                    ligne_qs = ligne_qs.filter(variant__isnull=True)
+                ligne = ligne_qs.get()
 
-                movement = ClientStockMovement.objects.create(
+                previous_qty = ligne.quantity
+                ligne.quantity -= quantity
+                if ligne.quantity <= 0:
+                    ligne.delete()
+                    new_qty = 0
+                else:
+                    ligne.save()
+                    new_qty = ligne.quantity
+
+                ClientStockMovement.objects.create(
                     client_stock=stock,
-                    product=product,
+                    product_id=product_id,
+                    variant_id=variant_id,   # ✅ VARIANTES
                     movement_type='withdrawal',
-                    quantity=data['quantity'],
-                    previous_quantity=previous_quantity,
-                    new_quantity=ligne.quantity,
-                    unit_price=ligne.unit_price,
-                    reference=f"RET-{timezone.now().strftime('%Y%m%d%H%M%S')}",
-                    notes=data.get('notes', ''),
+                    quantity=quantity,
+                    previous_quantity=previous_qty,
+                    new_quantity=new_qty,
+                    unit_price=ligne.unit_price if ligne.pk else Decimal('0'),
+                    reference=f"WD-{timezone.now().strftime('%Y%m%d%H%M%S')}",
+                    notes=notes,
                     created_by=request.user,
                 )
 
-                stock = ClientStock.objects.prefetch_related(
-                    Prefetch(
-                        'lignes',
-                        queryset=ClientStockLigne.objects.select_related(
-                            'product', 'product__unit'
-                        ),
-                    ),
-                ).get(pk=stock.pk)
-
                 return Response({
                     'status': 'success',
-                    'message': f'Retrait de {data["quantity"]} {product.name}',
-                    'client_stock': ClientStockSerializer(
-                        stock, context={'request': request}
-                    ).data,
-                    'movement': ClientStockMovementSerializer(
-                        movement, context={'request': request}
-                    ).data,
-                }, status=status.HTTP_200_OK)
+                    'message': f'{quantity} unités retirées du stock client',
+                    'remaining_quantity': new_qty,
+                }, status=status.HTTP_201_CREATED)
 
+        except ClientStock.DoesNotExist:
+            return Response(
+                {"error": "Stock client non trouvé"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        except ClientStockLigne.DoesNotExist:
+            return Response(
+                {"error": "Ligne non trouvée"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
         except Exception as e:
-            logger.exception("Erreur retrait stock client")
+            logger.exception("Erreur retrait client")
             return Response(
                 {"error": str(e)},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
-    @action(detail=True, methods=['get'], url_path='movements')
-    def get_movements(self, request, pk=None):
+    # ✅ VARIANTES : mouvements avec variant
+    @action(detail=False, methods=['get'], url_path='movements')
+    def movements(self, request):
+        movements_qs = ClientStockMovement.objects.select_related(
+            'client_stock__client', 'product', 'variant', 'created_by'
+        ).order_by('-created_at')
+
+        client_id = request.query_params.get('client_id')
+        if client_id:
+            movements_qs = movements_qs.filter(
+                client_stock__client_id=client_id
+            )
+
+        product_id = request.query_params.get('product_id')
+        if product_id:
+            movements_qs = movements_qs.filter(product_id=product_id)
+
+        variant_id = request.query_params.get('variant_id')
+        if variant_id:
+            movements_qs = movements_qs.filter(variant_id=variant_id)
+
+        movements = movements_qs[:500]
+        serializer = ClientStockMovementSerializer(
+            movements, many=True, context={'request': request}
+        )
+        return Response(serializer.data)
+
+
+# ============================================================
+# CLIENT DELIVERY VIEWSET (admin / staff)
+# ✅ VARIANTES : select_related('variant')
+# ============================================================
+
+class ClientDeliveryViewSet(viewsets.ModelViewSet):
+    queryset = ClientDelivery.objects.all()
+    permission_classes = [permissions.IsAuthenticated]
+    pagination_class = OptimizedPagination
+
+    def get_serializer_class(self):
+        if self.action == 'create':
+            return ClientDeliveryCreateSerializer
+        elif self.action == 'update_status':
+            return ClientDeliveryStatusUpdateSerializer
+        elif self.action == 'validate_delivery':
+            return ClientDeliveryValidateSerializer
+        elif self.action == 'reject':
+            return ClientDeliveryRejectSerializer
+        return ClientDeliverySerializer
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context['request'] = self.request
+        return context
+
+    def get_queryset(self):
+        queryset = _delivery_queryset().order_by('-request_date', '-id')
+
+        search = self.request.query_params.get('search')
+        if search:
+            queryset = queryset.filter(
+                Q(delivery_number__icontains=search) |
+                Q(recipient_name__icontains=search) |
+                Q(recipient_phone__icontains=search) |
+                Q(client__name__icontains=search)
+            )
+
+        client = self.request.query_params.get('client')
+        if client:
+            queryset = queryset.filter(client_id=client)
+
+        status_filter = self.request.query_params.get('status')
+        if status_filter:
+            queryset = queryset.filter(status__in=status_filter.split(','))
+
+        from_client = self.request.query_params.get('from_client')
+        if from_client == 'true':
+            queryset = queryset.filter(created_by_client=True)
+
+        return queryset
+
+    def perform_create(self, serializer):
+        data = serializer.validated_data
+        client_id = data.pop('client_id')
+        lignes_data = data.pop('lignes', [])
+
         try:
-            client = Client.objects.get(id=pk)
-            stock = ClientStock.objects.filter(client=client).first()
-
-            if not stock:
-                return Response({
-                    'client_id': client.id,
-                    'client_name': client.name,
-                    'movements': [],
-                })
-
-            movements = (
-                stock.movements
-                .select_related('product', 'created_by', 'client_stock__client')
-                .order_by('-created_at')[:100]
-            )
-
-            serializer = ClientStockMovementSerializer(
-                movements, many=True, context={'request': request}
-            )
-            return Response({
-                'client_id': client.id,
-                'client_name': client.name,
-                'movements': serializer.data,
-            })
+            client = Client.objects.get(id=client_id)
         except Client.DoesNotExist:
-            return Response(
-                {"error": f"Client {pk} non trouvé"},
-                status=status.HTTP_404_NOT_FOUND,
+            raise ValidationError(f"Client {client_id} non trouvé")
+
+        with transaction.atomic():
+            delivery = ClientDelivery.objects.create(
+                delivery_number=self._generate_delivery_number(),
+                client=client,
+                created_by=self.request.user,
+                **data
             )
 
+            lignes_to_create = []
+            for ligne_data in lignes_data:
+                product = ligne_data['product']
+                variant = ligne_data.get('variant')   # ✅ VARIANTES
+                quantity = ligne_data['quantity']
+                unit_price = ligne_data.get('unit_price', Decimal('0'))
+                notes = ligne_data.get('notes', '')
+
+                lignes_to_create.append(ClientDeliveryLigne(
+                    delivery=delivery,
+                    product=product,
+                    variant=variant,
+                    quantity=quantity,
+                    unit_price=unit_price,
+                    total_value=quantity * unit_price,
+                    notes=notes,
+                ))
+
+            ClientDeliveryLigne.objects.bulk_create(lignes_to_create)
+
+            delivery.total_quantity = sum(l.quantity for l in lignes_to_create)
+            delivery.total_value = sum(l.total_value for l in lignes_to_create)
+            delivery.save(update_fields=['total_quantity', 'total_value'])
+
+        serializer.instance = delivery
+
+    def _generate_delivery_number(self):
+        year = date.today().year
+        count = ClientDelivery.objects.filter(
+            delivery_number__startswith=f"LIV-{year}-"
+        ).count() + 1
+        return f"LIV-{year}-{count:04d}"
+
+    @action(detail=True, methods=['post'], url_path='update-status')
+    def update_status(self, request, pk=None):
+        delivery = self.get_object()
+        serializer = ClientDeliveryStatusUpdateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        new_status = serializer.validated_data['status']
+        old_status = delivery.status
+
+        with transaction.atomic():
+            delivery.status = new_status
+
+            if new_status == 'confirmed' and not delivery.confirmed_date:
+                delivery.confirmed_date = timezone.now()
+            elif new_status == 'in_transit' and not delivery.shipped_date:
+                delivery.shipped_date = timezone.now()
+            elif new_status == 'delivered' and not delivery.delivered_date:
+                delivery.delivered_date = timezone.now()
+
+            for field in ['carrier', 'tracking_number', 'vehicle_plate',
+                          'driver_name', 'driver_phone', 'delivery_method', 'notes']:
+                if serializer.validated_data.get(field):
+                    setattr(delivery, field, serializer.validated_data[field])
+
+            delivery.save()
+
+        return Response({
+            'status': 'success',
+            'message': f'Statut changé de {old_status} à {new_status}',
+            'delivery_number': delivery.delivery_number,
+            'new_status': delivery.status,
+        })
+
+    @action(detail=True, methods=['post'])
+    def validate_delivery(self, request, pk=None):
+        delivery = self.get_object()
+
+        if not delivery.can_be_validated:
+            return Response(
+                {"error": "Cette livraison ne peut pas être validée"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        serializer = ClientDeliveryValidateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        with transaction.atomic():
+            delivery.status = 'confirmed'
+            delivery.confirmed_date = timezone.now()
+            delivery.validated_by = request.user
+
+            for field in ['carrier', 'tracking_number', 'vehicle_plate',
+                          'driver_name', 'driver_phone', 'delivery_method', 'notes']:
+                if serializer.validated_data.get(field):
+                    setattr(delivery, field, serializer.validated_data[field])
+
+            delivery.save()
+
+        return Response({
+            'status': 'success',
+            'message': 'Livraison validée',
+            'delivery_number': delivery.delivery_number,
+        })
+
+    @action(detail=True, methods=['post'])
+    def reject(self, request, pk=None):
+        delivery = self.get_object()
+
+        if not delivery.can_be_rejected:
+            return Response(
+                {"error": "Cette livraison ne peut pas être rejetée"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        serializer = ClientDeliveryRejectSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        with transaction.atomic():
+            delivery.status = 'rejected'
+            delivery.rejection_reason = serializer.validated_data['reason']
+            delivery.save()
+
+        return Response({
+            'status': 'success',
+            'message': 'Livraison rejetée',
+            'delivery_number': delivery.delivery_number,
+            'reason': delivery.rejection_reason,
+        })
+
+    @action(detail=True, methods=['post'])
+    def start_transit(self, request, pk=None):
+        delivery = self.get_object()
+
+        if not delivery.can_be_started:
+            return Response(
+                {"error": "Cette livraison ne peut pas être mise en transit"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        delivery.status = 'in_transit'
+        delivery.shipped_date = timezone.now()
+        delivery.save(update_fields=['status', 'shipped_date', 'updated_at'])
+
+        return Response({
+            'status': 'success',
+            'message': 'Livraison en transit',
+            'delivery_number': delivery.delivery_number,
+        })
+
+    @action(detail=True, methods=['post'])
+    def mark_delivered(self, request, pk=None):
+        delivery = self.get_object()
+
+        if not delivery.can_be_confirmed:
+            return Response(
+                {"error": "Cette livraison ne peut pas être marquée livrée"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        delivery.status = 'delivered'
+        delivery.delivered_date = timezone.now()
+        delivery.save(update_fields=['status', 'delivered_date', 'updated_at'])
+
+        return Response({
+            'status': 'success',
+            'message': 'Livraison effectuée',
+            'delivery_number': delivery.delivery_number,
+        })
+
+    @action(detail=True, methods=['get'], url_path='lignes')
+    def get_lignes(self, request, pk=None):
+        delivery = self.get_object()
+        lignes = delivery.lignes.select_related('product', 'variant').all()  # ✅ VARIANTES
+        serializer = ClientDeliveryLigneSerializer(
+            lignes, many=True, context={'request': request}
+        )
+        return Response(serializer.data)
+
 
 # ============================================================
-# LIVRAISON CLIENT VIEWSET
+# CLIENT DELIVERY REQUEST VIEWSET (espace client)
+# ✅ VARIANTES : select_related('variant')
 # ============================================================
 
-class ClientDeliveryViewSet(viewsets.ViewSet):
+class ClientDeliveryRequestViewSet(viewsets.ViewSet):
     permission_classes = [permissions.IsAuthenticated]
 
     def get_serializer_context(self):
         return {'request': self.request}
 
-    def _is_admin(self, user):
-        return user.role == 'admin' or user.is_staff or user.is_superuser
+    def _get_client(self, user):
+        try:
+            if hasattr(user, 'client_profile'):
+                return user.client_profile
+            elif hasattr(user, 'client'):
+                return user.client
+            return None
+        except Exception:
+            return None
 
-    def _forbidden(self):
-        return Response(
-            {"error": "Permission non accordée"},
-            status=status.HTTP_403_FORBIDDEN,
+    def _is_client(self, user):
+        return getattr(user, 'role', None) == 'client'
+
+    @action(detail=False, methods=['get'], url_path='my-deliveries')
+    def my_deliveries(self, request):
+        if not self._is_client(request.user):
+            return Response(
+                {"error": "Accès réservé aux clients"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        client = self._get_client(request.user)
+        if not client:
+            return Response(
+                {"error": "Profil client non trouvé"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        deliveries = (
+            _delivery_queryset()
+            .filter(client=client)
+            .order_by('-request_date')
         )
-
-    @action(detail=False, methods=['get'], url_path='list')
-    def list_deliveries(self, request):
-        if not self._is_admin(request.user):
-            return self._forbidden()
-
-        deliveries = _delivery_queryset()
 
         status_filter = request.query_params.get('status')
         if status_filter:
-            deliveries = deliveries.filter(status=status_filter)
-
-        client_id = request.query_params.get('client')
-        if client_id:
-            deliveries = deliveries.filter(client_id=client_id)
-
-        from_client = request.query_params.get('from_client')
-        if from_client == 'true':
-            deliveries = deliveries.filter(created_by_client=True)
-        elif from_client == 'false':
-            deliveries = deliveries.filter(created_by_client=False)
-
-        search = request.query_params.get('search')
-        if search:
-            deliveries = deliveries.filter(
-                Q(delivery_number__icontains=search) |
-                Q(client__name__icontains=search) |
-                Q(client__code__icontains=search) |
-                Q(recipient_name__icontains=search) |
-                Q(recipient_phone__icontains=search) |
-                Q(tracking_number__icontains=search)
-            )
-
-        date_from = request.query_params.get('date_from')
-        if date_from:
-            deliveries = deliveries.filter(request_date__date__gte=date_from)
-
-        date_to = request.query_params.get('date_to')
-        if date_to:
-            deliveries = deliveries.filter(request_date__date__lte=date_to)
-
-        deliveries = deliveries.order_by('-created_at')
+            deliveries = deliveries.filter(status__in=status_filter.split(','))
 
         serializer = ClientDeliverySerializer(
             deliveries, many=True, context={'request': request}
         )
 
-        stats_agg = deliveries.aggregate(
-            total=Count('id'),
-            pending=Count('id', filter=Q(status='pending')),
-            confirmed=Count('id', filter=Q(status='confirmed')),
-            in_transit=Count('id', filter=Q(status='in_transit')),
-            delivered=Count('id', filter=Q(status='delivered')),
-            cancelled=Count('id', filter=Q(status='cancelled')),
-            rejected=Count('id', filter=Q(status='rejected')),
-            pending_from_clients=Count(
-                'id', filter=Q(status='pending', created_by_client=True)
-            ),
-        )
+        stats_qs = ClientDelivery.objects.filter(client=client)
+        stats = {
+            'total': stats_qs.count(),
+            'pending': stats_qs.filter(status='pending').count(),
+            'confirmed': stats_qs.filter(status='confirmed').count(),
+            'in_transit': stats_qs.filter(status='in_transit').count(),
+            'delivered': stats_qs.filter(status='delivered').count(),
+            'cancelled': stats_qs.filter(status='cancelled').count(),
+            'rejected': stats_qs.filter(status='rejected').count(),
+        }
 
         return Response({
-            'count': stats_agg['total'] or 0,
-            'stats': {
-                'total': stats_agg['total'] or 0,
-                'pending': stats_agg['pending'] or 0,
-                'confirmed': stats_agg['confirmed'] or 0,
-                'in_transit': stats_agg['in_transit'] or 0,
-                'delivered': stats_agg['delivered'] or 0,
-                'cancelled': stats_agg['cancelled'] or 0,
-                'rejected': stats_agg['rejected'] or 0,
-                'pending_from_clients': stats_agg['pending_from_clients'] or 0,
-            },
+            'count': len(serializer.data),
+            'stats': stats,
             'results': serializer.data,
         })
 
-    @action(detail=True, methods=['get'], url_path='detail')
-    def delivery_detail(self, request, pk=None):
-        if not self._is_admin(request.user):
-            return self._forbidden()
+    @action(detail=False, methods=['post'], url_path='create-request')
+    def create_request(self, request):
+        if not self._is_client(request.user):
+            return Response(
+                {"error": "Accès réservé aux clients"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
 
+        client = self._get_client(request.user)
+        if not client:
+            return Response(
+                {"error": "Profil client non trouvé"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        serializer = ClientDeliveryRequestCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        lignes_data = serializer.validated_data.pop('lignes', [])
+
+        with transaction.atomic():
+            delivery = ClientDelivery.objects.create(
+                delivery_number=self._generate_delivery_number(),
+                client=client,
+                created_by_client=True,
+                created_by=request.user,
+                **serializer.validated_data
+            )
+
+            lignes_to_create = []
+            for ligne_data in lignes_data:
+                product = ligne_data['product']
+                variant = ligne_data.get('variant')   # ✅ VARIANTES
+                quantity = ligne_data['quantity']
+                notes = ligne_data.get('notes', '')
+
+                lignes_to_create.append(ClientDeliveryLigne(
+                    delivery=delivery,
+                    product=product,
+                    variant=variant,
+                    quantity=quantity,
+                    unit_price=Decimal('0'),
+                    total_value=Decimal('0'),
+                    notes=notes,
+                ))
+
+            ClientDeliveryLigne.objects.bulk_create(lignes_to_create)
+
+            delivery.total_quantity = sum(l.quantity for l in lignes_to_create)
+            delivery.save(update_fields=['total_quantity'])
+
+        delivery = _delivery_queryset().get(pk=delivery.pk)
+        return Response({
+            'status': 'success',
+            'message': 'Demande de livraison créée',
+            'delivery': ClientDeliverySerializer(
+                delivery, context={'request': request}
+            ).data,
+        }, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['patch'], url_path='update-request')
+    def update_request(self, request, pk=None):
+        if not self._is_client(request.user):
+            return Response(
+                {"error": "Accès réservé aux clients"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        client = self._get_client(request.user)
         try:
-            delivery = _delivery_queryset().get(id=pk)
+            delivery = ClientDelivery.objects.get(id=pk, client=client)
         except ClientDelivery.DoesNotExist:
             return Response(
                 {"error": "Livraison non trouvée"},
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        serializer = ClientDeliverySerializer(
-            delivery, context={'request': request}
-        )
-        return Response(serializer.data)
+        if not delivery.can_be_edited_by_client:
+            return Response(
+                {"error": "Cette livraison ne peut plus être modifiée"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
-    # ✅ CORRIGÉ : unit_price seulement si fourni
-    @action(detail=False, methods=['post'], url_path='create')
-    def create_delivery(self, request):
-        if not self._is_admin(request.user):
-            return self._forbidden()
+        serializer = ClientDeliveryRequestUpdateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
 
-        serializer = ClientDeliveryCreateSerializer(data=request.data)
-        if not serializer.is_valid():
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        lignes_data = serializer.validated_data.pop('lignes', None)
 
-        data = serializer.validated_data
+        with transaction.atomic():
+            for field, value in serializer.validated_data.items():
+                setattr(delivery, field, value)
 
-        try:
-            with transaction.atomic():
-                client = Client.objects.get(id=data['client_id'])
-                client_stock, _ = ClientStock.objects.get_or_create(
-                    client=client)
-
-                product_ids = [
-                    l['product'].id if hasattr(l['product'], 'id')
-                    else l['product']
-                    for l in data['lignes']
-                ]
-
-                stock_lignes_map = {
-                    sl.product_id: sl
-                    for sl in ClientStockLigne.objects
-                    .select_related('product')
-                    .filter(stock=client_stock, product_id__in=product_ids)
-                }
+            if lignes_data is not None:
+                delivery.lignes.all().delete()
 
                 lignes_to_create = []
-                for ligne_data in data['lignes']:
-                    product_id = (
-                        ligne_data['product'].id
-                        if hasattr(ligne_data['product'], 'id')
-                        else ligne_data['product']
-                    )
-                    quantity = Decimal(str(ligne_data['quantity']))
-
-                    stock_ligne = stock_lignes_map.get(product_id)
-                    if not stock_ligne:
-                        raise ValidationError(
-                            f"Le produit {product_id} n'est pas dans le stock du client"
-                        )
-                    if stock_ligne.quantity < quantity:
-                        raise ValidationError(
-                            f"Stock insuffisant pour {stock_ligne.product.name}. "
-                            f"Disponible : {stock_ligne.quantity}, Demandé : {quantity}"
-                        )
-
-                    unit_price_input = ligne_data.get('unit_price')
+                for ligne_data in lignes_data:
                     lignes_to_create.append(ClientDeliveryLigne(
-                        product_id=product_id,
-                        client_stock_ligne=stock_ligne,
-                        quantity=quantity,
-                        unit_price=(
-                            unit_price_input
-                            if unit_price_input is not None and unit_price_input > 0
-                            else stock_ligne.unit_price
-                        ),
+                        delivery=delivery,
+                        product=ligne_data['product'],
+                        variant=ligne_data.get('variant'),   # ✅ VARIANTES
+                        quantity=ligne_data['quantity'],
+                        unit_price=Decimal('0'),
+                        total_value=Decimal('0'),
                         notes=ligne_data.get('notes', ''),
                     ))
 
-                delivery = ClientDelivery.objects.create(
-                    client=client,
-                    client_stock=client_stock,
-                    recipient_name=data['recipient_name'],
-                    recipient_phone=data['recipient_phone'],
-                    recipient_address=data.get('recipient_address', ''),
-                    recipient_email=data.get('recipient_email', ''),
-                    recipient_notes=data.get('recipient_notes', ''),
-                    delivery_method=data.get('delivery_method', ''),
-                    carrier=data.get('carrier', ''),
-                    tracking_number=data.get('tracking_number', ''),
-                    vehicle_plate=data.get('vehicle_plate', ''),
-                    driver_name=data.get('driver_name', ''),
-                    driver_phone=data.get('driver_phone', ''),
-                    notes=data.get('notes', ''),
-                    client_notes=data.get('client_notes', ''),
-                    status='pending',
-                    created_by=request.user,
-                    created_by_client=False,
-                )
-
-                for ligne in lignes_to_create:
-                    ligne.delivery = delivery
                 ClientDeliveryLigne.objects.bulk_create(lignes_to_create)
+                delivery.total_quantity = sum(l.quantity for l in lignes_to_create)
 
-                delivery.recalculate_totals()
-
-                delivery = _delivery_queryset().get(pk=delivery.pk)
-
-                return Response({
-                    'status': 'success',
-                    'message': (
-                        f'Livraison {delivery.delivery_number} créée '
-                        f'pour {delivery.recipient_name}'
-                    ),
-                    'delivery': ClientDeliverySerializer(
-                        delivery, context={'request': request}
-                    ).data,
-                }, status=status.HTTP_201_CREATED)
-
-        except ValidationError as e:
-            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
-        except Exception as e:
-            logger.exception("Erreur création livraison")
-            return Response(
-                {"error": str(e)},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
-
-    @action(detail=True, methods=['post'], url_path='validate-request')
-    def validate_request(self, request, pk=None):
-        if not self._is_admin(request.user):
-            return self._forbidden()
-
-        try:
-            delivery = _delivery_queryset().get(id=pk)
-        except ClientDelivery.DoesNotExist:
-            return Response(
-                {"error": "Livraison non trouvée"},
-                status=status.HTTP_404_NOT_FOUND,
-            )
-
-        if delivery.status != 'pending':
-            return Response(
-                {"error": f"Impossible de valider (statut : {delivery.status})"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        serializer = ClientDeliveryValidateSerializer(data=request.data)
-        if not serializer.is_valid():
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-        data = serializer.validated_data
-
-        try:
-            with transaction.atomic():
-                client_stock = delivery.client_stock
-
-                for ligne in delivery.lignes.all():
-                    stock_ligne = ligne.client_stock_ligne
-                    if not stock_ligne:
-                        stock_ligne = ClientStockLigne.objects.filter(
-                            stock=client_stock, product=ligne.product
-                        ).first()
-                    if not stock_ligne:
-                        return Response(
-                            {"error": f"Produit {ligne.product.name} non trouvé"},
-                            status=status.HTTP_400_BAD_REQUEST,
-                        )
-                    if stock_ligne.quantity < ligne.quantity:
-                        return Response(
-                            {
-                                "error": (
-                                    f"Stock insuffisant pour {ligne.product.name}. "
-                                    f"Disponible : {stock_ligne.quantity}, "
-                                    f"Demandé : {ligne.quantity}"
-                                )
-                            },
-                            status=status.HTTP_400_BAD_REQUEST,
-                        )
-
-                for field in ['carrier', 'tracking_number', 'vehicle_plate',
-                              'driver_name', 'driver_phone', 'delivery_method']:
-                    if data.get(field):
-                        setattr(delivery, field, data[field])
-
-                note_line = (
-                    f"[VALIDÉE le {timezone.now().strftime('%Y-%m-%d %H:%M')} "
-                    f"par {request.user.email}]"
-                )
-                if data.get('notes'):
-                    note_line += f"\n{data['notes']}"
-
-                delivery.notes = (
-                    f"{delivery.notes}\n{note_line}"
-                    if delivery.notes else note_line
-                )
-
-                delivery.status = 'confirmed'
-                delivery.confirmed_date = timezone.now()
-                delivery.validated_by = request.user
-                delivery.save()
-
-                delivery = _delivery_queryset().get(pk=delivery.pk)
-
-                return Response({
-                    'status': 'success',
-                    'message': f'Demande {delivery.delivery_number} validée',
-                    'delivery': ClientDeliverySerializer(
-                        delivery, context={'request': request}
-                    ).data,
-                })
-
-        except Exception as e:
-            logger.exception("Erreur validation demande")
-            return Response(
-                {"error": str(e)},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
-
-    @action(detail=True, methods=['post'], url_path='reject-request')
-    def reject_request(self, request, pk=None):
-        if not self._is_admin(request.user):
-            return self._forbidden()
-
-        try:
-            delivery = ClientDelivery.objects.get(id=pk)
-        except ClientDelivery.DoesNotExist:
-            return Response(
-                {"error": "Livraison non trouvée"},
-                status=status.HTTP_404_NOT_FOUND,
-            )
-
-        if delivery.status != 'pending':
-            return Response(
-                {"error": f"Impossible de rejeter (statut : {delivery.status})"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        serializer = ClientDeliveryRejectSerializer(data=request.data)
-        if not serializer.is_valid():
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-        reason = serializer.validated_data['reason']
-
-        delivery.status = 'rejected'
-        delivery.rejection_reason = reason
-        delivery.validated_by = request.user
-
-        note_line = (
-            f"[REJETÉE le {timezone.now().strftime('%Y-%m-%d %H:%M')} "
-            f"par {request.user.email}]\nRaison : {reason}"
-        )
-        delivery.notes = (
-            f"{delivery.notes}\n{note_line}"
-            if delivery.notes else note_line
-        )
-        delivery.save()
+            delivery.save()
 
         delivery = _delivery_queryset().get(pk=delivery.pk)
-
         return Response({
             'status': 'success',
-            'message': f'Demande {delivery.delivery_number} rejetée',
+            'message': 'Demande mise à jour',
             'delivery': ClientDeliverySerializer(
                 delivery, context={'request': request}
             ).data,
         })
 
-    @action(detail=True, methods=['post'], url_path='start-delivery')
-    def start_delivery(self, request, pk=None):
-        if not self._is_admin(request.user):
-            return self._forbidden()
+    @action(detail=True, methods=['post'], url_path='cancel-request')
+    def cancel_request(self, request, pk=None):
+        if not self._is_client(request.user):
+            return Response(
+                {"error": "Accès réservé aux clients"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
 
+        client = self._get_client(request.user)
         try:
-            delivery = ClientDelivery.objects.get(id=pk)
+            delivery = ClientDelivery.objects.get(id=pk, client=client)
         except ClientDelivery.DoesNotExist:
             return Response(
                 {"error": "Livraison non trouvée"},
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        if delivery.status not in ['pending', 'confirmed']:
+        if not delivery.can_be_cancelled_by_client:
             return Response(
-                {"error": f"Impossible de démarrer (statut : {delivery.status})"},
+                {"error": "Cette livraison ne peut plus être annulée"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        for field in ['carrier', 'tracking_number', 'vehicle_plate',
-                      'driver_name', 'driver_phone', 'delivery_method']:
-            if request.data.get(field):
-                setattr(delivery, field, request.data[field])
-
-        if delivery.status == 'pending':
-            delivery.confirmed_date = timezone.now()
-            delivery.validated_by = request.user
-
-        delivery.status = 'in_transit'
-        delivery.shipped_date = timezone.now()
-        delivery.save()
-
-        delivery = _delivery_queryset().get(pk=delivery.pk)
-
-        return Response({
-            'status': 'success',
-            'message': f'Livraison {delivery.delivery_number} en cours',
-            'delivery': ClientDeliverySerializer(
-                delivery, context={'request': request}
-            ).data,
-        })
-
-    @action(detail=True, methods=['post'], url_path='confirm-delivery')
-    def confirm_delivery(self, request, pk=None):
-        if not self._is_admin(request.user):
-            return self._forbidden()
-
-        try:
-            delivery = _delivery_queryset().get(id=pk)
-        except ClientDelivery.DoesNotExist:
-            return Response(
-                {"error": "Livraison non trouvée"},
-                status=status.HTTP_404_NOT_FOUND,
-            )
-
-        if delivery.status not in ['confirmed', 'in_transit']:
-            return Response(
-                {"error": f"Impossible de confirmer (statut : {delivery.status})"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        try:
-            with transaction.atomic():
-                client_stock = delivery.client_stock
-
-                product_ids = [l.product_id for l in delivery.lignes.all()]
-                stock_lignes_map = {
-                    sl.product_id: sl
-                    for sl in ClientStockLigne.objects.filter(
-                        stock=client_stock, product_id__in=product_ids
-                    )
-                }
-
-                movements_to_create = []
-                lignes_to_update = []
-                stock_lignes_to_update = []
-
-                for ligne in delivery.lignes.all():
-                    stock_ligne = (
-                        ligne.client_stock_ligne
-                        or stock_lignes_map.get(ligne.product_id)
-                    )
-
-                    if not stock_ligne:
-                        raise ValidationError(
-                            f"Produit {ligne.product.name} non trouvé dans le stock client"
-                        )
-
-                    if stock_ligne.quantity < ligne.quantity:
-                        raise ValidationError(
-                            f"Stock insuffisant pour {ligne.product.name}. "
-                            f"Disponible : {stock_ligne.quantity}, "
-                            f"Demandé : {ligne.quantity}"
-                        )
-
-                    ligne.quantity_before = stock_ligne.quantity
-                    ligne.quantity_after = stock_ligne.quantity - ligne.quantity
-                    lignes_to_update.append(ligne)
-
-                    stock_ligne.quantity -= ligne.quantity
-                    stock_lignes_to_update.append(stock_ligne)
-
-                    movements_to_create.append(ClientStockMovement(
-                        client_stock=client_stock,
-                        product=ligne.product,
-                        movement_type='delivery',
-                        quantity=ligne.quantity,
-                        previous_quantity=ligne.quantity_before,
-                        new_quantity=ligne.quantity_after,
-                        unit_price=ligne.unit_price,
-                        reference=delivery.delivery_number,
-                        notes=(
-                            f"Livraison {delivery.delivery_number} → "
-                            f"{delivery.recipient_name} "
-                            f"({delivery.recipient_phone})"
-                        ),
-                        created_by=request.user,
-                    ))
-
-                if lignes_to_update:
-                    ClientDeliveryLigne.objects.bulk_update(
-                        lignes_to_update, ['quantity_before', 'quantity_after']
-                    )
-                if stock_lignes_to_update:
-                    ClientStockLigne.objects.bulk_update(
-                        stock_lignes_to_update, ['quantity']
-                    )
-                if movements_to_create:
-                    ClientStockMovement.objects.bulk_create(
-                        movements_to_create)
-
-                delivery.status = 'delivered'
-                delivery.delivered_date = timezone.now()
-                delivery.validated_by = request.user
-                delivery.save()
-
-                delivery = _delivery_queryset().get(pk=delivery.pk)
-
-                return Response({
-                    'status': 'success',
-                    'message': (
-                        f'Livraison {delivery.delivery_number} confirmée. '
-                        f'Stock client mis à jour.'
-                    ),
-                    'delivery': ClientDeliverySerializer(
-                        delivery, context={'request': request}
-                    ).data,
-                })
-
-        except ValidationError as e:
-            return Response(
-                {"error": str(e)},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        except Exception as e:
-            logger.exception("Erreur confirmation livraison")
-            return Response(
-                {"error": str(e)},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
-
-    @action(detail=True, methods=['post'], url_path='cancel')
-    def cancel_delivery(self, request, pk=None):
-        if not self._is_admin(request.user):
-            return self._forbidden()
-
-        try:
-            delivery = ClientDelivery.objects.get(id=pk)
-        except ClientDelivery.DoesNotExist:
-            return Response(
-                {"error": "Livraison non trouvée"},
-                status=status.HTTP_404_NOT_FOUND,
-            )
-
-        if delivery.status == 'delivered':
-            return Response(
-                {"error": "Impossible d'annuler une livraison effectuée"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        if delivery.status in ['cancelled', 'rejected']:
-            return Response(
-                {"error": f"Cette livraison est déjà '{delivery.status}'"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        reason = request.data.get('reason', '')
         delivery.status = 'cancelled'
-
-        note_line = (
-            f"[ANNULÉE le {timezone.now().strftime('%Y-%m-%d %H:%M')} "
-            f"par {request.user.email}]"
-        )
-        if reason:
-            note_line += f"\nRaison : {reason}"
-
-        delivery.notes = (
-            f"{delivery.notes}\n{note_line}"
-            if delivery.notes else note_line
-        )
-        delivery.save()
-
-        delivery = _delivery_queryset().get(pk=delivery.pk)
+        delivery.save(update_fields=['status', 'updated_at'])
 
         return Response({
             'status': 'success',
-            'message': f'Livraison {delivery.delivery_number} annulée',
-            'delivery': ClientDeliverySerializer(
-                delivery, context={'request': request}
-            ).data,
+            'message': 'Demande annulée',
+            'delivery_number': delivery.delivery_number,
         })
+
+    @action(detail=False, methods=['get'], url_path='stats')
+    def stats(self, request):
+        if not self._is_client(request.user):
+            return Response(
+                {"error": "Accès réservé aux clients"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        client = self._get_client(request.user)
+        if not client:
+            return Response(
+                {"error": "Profil client non trouvé"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        stats_qs = ClientDelivery.objects.filter(client=client)
+
+        return Response({
+            'total': stats_qs.count(),
+            'pending': stats_qs.filter(status='pending').count(),
+            'confirmed': stats_qs.filter(status='confirmed').count(),
+            'in_transit': stats_qs.filter(status='in_transit').count(),
+            'delivered': stats_qs.filter(status='delivered').count(),
+            'cancelled': stats_qs.filter(status='cancelled').count(),
+            'rejected': stats_qs.filter(status='rejected').count(),
+        })
+
+    def _generate_delivery_number(self):
+        year = date.today().year
+        count = ClientDelivery.objects.filter(
+            delivery_number__startswith=f"LIV-{year}-"
+        ).count() + 1
+        return f"LIV-{year}-{count:04d}"

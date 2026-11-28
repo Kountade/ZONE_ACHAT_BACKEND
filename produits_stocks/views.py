@@ -815,54 +815,91 @@ class LotViewSet(viewsets.ModelViewSet):
 # ============================================================
 # STOCK VIEWSET
 # ============================================================
-class StockViewSet(viewsets.ReadOnlyModelViewSet):
+# apps/produits_stocks/views.py
+
+class StockViewSet(viewsets.ModelViewSet):
     queryset = Stock.objects.all()
-    serializer_class = StockSerializer
     permission_classes = [permissions.IsAuthenticated]
     pagination_class = StockPagination
 
-    def get_queryset(self):
-        queryset = (Stock.objects
-                    .select_related('product', 'product__category',
-                                    'product__unit', 'warehouse', 'variant')
-                    .annotate(
-                        min_stock_annotated=Coalesce(
-                            'min_stock_override', 'product__min_stock'),
-                        max_stock_annotated=Coalesce(
-                            'max_stock_override', 'product__max_stock'),
-                    )
-                    .order_by('product__name'))
+    def get_serializer_class(self):
+        if self.action == 'list':
+            return StockSerializer
+        return StockDetailSerializer
 
+    def get_queryset(self):
+        queryset = (
+            Stock.objects
+            .select_related(
+                'product', 'product__category', 'product__unit',
+                'warehouse', 'variant',
+            )
+            .prefetch_related('variant__option_values__option')
+            .order_by('product__name', 'variant__sku')
+        )
+
+        # ✅ Filtre par produit
         product_id = self.request.query_params.get('product')
         if product_id:
             queryset = queryset.filter(product_id=product_id)
-        variant_id = self.request.query_params.get('variant')  # ✅ NOUVEAU
+
+        # ✅ Filtre par variante (ID précis)
+        variant_id = self.request.query_params.get('variant')
         if variant_id:
             queryset = queryset.filter(variant_id=variant_id)
+
+        # ✅ Filtre par SKU de variante
+        variant_sku = self.request.query_params.get('variant_sku')
+        if variant_sku:
+            queryset = queryset.filter(variant__sku__iexact=variant_sku)
+
+        # ✅ Filtre "avec / sans variantes"
+        has_variant = self.request.query_params.get('has_variant')
+        if has_variant == 'true':
+            queryset = queryset.filter(variant__isnull=False)
+        elif has_variant == 'false':
+            queryset = queryset.filter(variant__isnull=True)
+
+        # ✅ Filtre par entrepôt
         warehouse_id = self.request.query_params.get('warehouse')
         if warehouse_id:
             queryset = queryset.filter(warehouse_id=warehouse_id)
-        low_stock = self.request.query_params.get('low_stock')
-        if low_stock == 'true':
-            queryset = queryset.filter(quantity__lte=F('min_stock_annotated'))
+
+        # ✅ Filtre stock faible
+        if self.request.query_params.get('low_stock') == 'true':
+            queryset = queryset.annotate(
+                min_calc=Coalesce('min_stock_override', 'product__min_stock')
+            ).filter(quantity__lte=F('min_calc'), quantity__gt=0)
+
+        # ✅ Filtre rupture
+        if self.request.query_params.get('out_of_stock') == 'true':
+            queryset = queryset.filter(quantity=0)
+
+        # ✅ Filtre stock excessif
+        if self.request.query_params.get('over_stock') == 'true':
+            queryset = queryset.annotate(
+                max_calc=Coalesce('max_stock_override', 'product__max_stock')
+            ).filter(quantity__gte=F('max_calc'), max_calc__gt=0)
+
+        # ✅ Recherche (produit + code + SKU + label variante)
         search = self.request.query_params.get('search')
         if search:
             queryset = queryset.filter(
                 Q(product__name__icontains=search) |
                 Q(product__code__icontains=search) |
-                Q(variant__sku__icontains=search))
+                Q(product__barcode__icontains=search) |
+                Q(variant__sku__icontains=search) |
+                Q(variant__barcode__icontains=search) |
+                Q(variant__option_values__value__icontains=search)
+            ).distinct()
+
         return queryset
-
-    @action(detail=True, methods=['get'])
-    def detail(self, request, pk=None):
-        stock = self.get_object()
-        serializer = StockDetailSerializer(stock)
-        return Response(serializer.data)
-
 
 # ============================================================
 # STOCK MOVEMENT VIEWSET
 # ============================================================
+
+
 class StockMovementViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = StockMovement.objects.all()
     serializer_class = StockMovementSerializer

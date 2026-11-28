@@ -1,7 +1,8 @@
 # apps/ventes_clients/models.py
 # ============================================================
 # MODELS COMPLET OPTIMISÉ — LOGICIEL B
-# Index identiques au Logiciel A sur TOUS les modèles
+# ✅ Support complet des variantes (ProductVariant)
+# ✅ Index identiques au Logiciel A sur TOUS les modèles
 # ============================================================
 
 import logging
@@ -25,6 +26,7 @@ from produits_stocks.models import (
     Warehouse,
     Stock,
     StockMovement,
+    ProductVariant,   # ✅ AJOUT
 )
 
 logger = logging.getLogger(__name__)
@@ -46,9 +48,7 @@ def generate_number(model, field_name, prefix):
 
     last_object = (
         model.objects
-        .filter(**{
-            f"{field_name}__startswith": f"{prefix}-{year}-"
-        })
+        .filter(**{f"{field_name}__startswith": f"{prefix}-{year}-"})
         .order_by("-id")
         .first()
     )
@@ -402,7 +402,7 @@ class Devis(models.Model):
             super().save(*args, **kwargs)
 
     def convert_to_sale(self, user=None):
-        """Convertit le devis en vente."""
+        """Convertit le devis en vente (avec variantes)."""
         from .models import Vente, LigneVente
 
         if not self.warehouse:
@@ -452,10 +452,11 @@ class Devis(models.Model):
         )
         vente.save()
 
-        for ligne_devis in self.lignes.all():
+        for ligne_devis in self.lignes.select_related('variant').all():
             LigneVente.objects.create(
                 sale=vente,
                 product=ligne_devis.product,
+                variant=ligne_devis.variant,   # ✅ AJOUT : conserver la variante
                 quantity=ligne_devis.quantity,
                 unit_price=ligne_devis.unit_price,
                 discount=ligne_devis.discount,
@@ -489,6 +490,17 @@ class LigneDevis(models.Model):
         Product,
         on_delete=models.PROTECT
     )
+
+    # ✅ AJOUT : variante optionnelle
+    variant = models.ForeignKey(
+        ProductVariant,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="devis_lines",
+        verbose_name="Variante"
+    )
+
     quantity = models.PositiveIntegerField()
     unit_price = models.DecimalField(
         max_digits=10,
@@ -517,10 +529,12 @@ class LigneDevis(models.Model):
         indexes = [
             models.Index(fields=['devis'], name='lignedevis_devis_idx'),
             models.Index(fields=['product'], name='lignedevis_product_idx'),
+            models.Index(fields=['variant'], name='lignedevis_variant_idx'),   # ✅
         ]
 
     def __str__(self):
-        return f"{self.devis.devis_number} - {self.product.name}"
+        v = f" [{self.variant.sku}]" if self.variant_id else ""
+        return f"{self.devis.devis_number} - {self.product.name}{v}"
 
     def save(self, *args, **kwargs):
         if self.quantity <= 0:
@@ -767,46 +781,72 @@ class Vente(models.Model):
 
     @transaction.atomic
     def deduct_stock(self):
-        """Déduit le stock en consommant les lots FIFO."""
+        """Déduit le stock en consommant les lots FIFO (par variante)."""
         if not self.warehouse:
             raise ValidationError("L'entrepôt de vente est obligatoire.")
 
-        lines = list(self.lines.select_related("product").all())
+        lines = list(self.lines.select_related("product", "variant").all())
 
         if not lines:
             raise ValidationError(
                 "La vente doit contenir au moins un produit.")
 
+        # ===== VALIDATION =====
         for line in lines:
-            stock = Stock.objects.select_for_update().filter(
+            stock_qs = Stock.objects.select_for_update().filter(
                 product=line.product,
                 warehouse=self.warehouse
-            ).first()
+            )
+            # ✅ Filtrer sur la variante
+            if line.variant_id:
+                stock_qs = stock_qs.filter(variant_id=line.variant_id)
+            else:
+                stock_qs = stock_qs.filter(variant__isnull=True)
+
+            stock = stock_qs.first()
 
             if not stock:
-                raise ValidationError(
-                    f"Aucun stock trouvé pour {line.product.name}."
-                )
+                label = line.product.name
+                if line.variant_id:
+                    label += f" [{line.variant.sku}]"
+                raise ValidationError(f"Aucun stock trouvé pour {label}.")
 
             if stock.available_quantity < line.quantity:
+                label = line.product.name
+                if line.variant_id:
+                    label += f" [{line.variant.sku}]"
                 raise ValidationError(
-                    f"Stock insuffisant pour {line.product.name}. "
+                    f"Stock insuffisant pour {label}. "
                     f"Disponible : {stock.available_quantity}, "
                     f"Demandé : {line.quantity}."
                 )
 
+        # ===== DÉDUCTION =====
         for line in lines:
-            stock = Stock.objects.select_for_update().get(
+            stock_qs = Stock.objects.select_for_update().filter(
                 product=line.product,
                 warehouse=self.warehouse
             )
+            if line.variant_id:
+                stock_qs = stock_qs.filter(variant_id=line.variant_id)
+            else:
+                stock_qs = stock_qs.filter(variant__isnull=True)
+            stock = stock_qs.get()
 
-            lots = Lot.objects.select_for_update().filter(
+            lots_qs = Lot.objects.select_for_update().filter(
                 product=line.product,
                 warehouse=self.warehouse,
                 current_quantity__gt=0,
                 is_blocked=False
-            ).exclude(status="expired").order_by("expiry_date", "id")
+            ).exclude(status="expired")
+
+            # ✅ Filtrer les lots sur la variante
+            if line.variant_id:
+                lots_qs = lots_qs.filter(variant_id=line.variant_id)
+            else:
+                lots_qs = lots_qs.filter(variant__isnull=True)
+
+            lots = lots_qs.order_by("expiry_date", "id")
 
             remaining = line.quantity
 
@@ -843,6 +883,7 @@ class Vente(models.Model):
                 StockMovement.objects.create(
                     product=line.product,
                     lot=lot,
+                    variant=line.variant,   # ✅ AJOUT : variante
                     from_warehouse=self.warehouse,
                     to_warehouse=None,
                     movement_type="sale_out",
@@ -860,25 +901,40 @@ class Vente(models.Model):
                 remaining -= quantity
 
             if remaining > 0:
+                label = line.product.name
+                if line.variant_id:
+                    label += f" [{line.variant.sku}]"
                 raise ValidationError(
-                    f"Stock insuffisant pour {line.product.name}. "
+                    f"Stock insuffisant pour {label}. "
                     f"Reste à fournir : {remaining} unités."
                 )
 
+        # ===== MISE À JOUR STOCK =====
         for line in lines:
-            stock = Stock.objects.filter(
+            stock_qs = Stock.objects.filter(
                 product=line.product,
                 warehouse=self.warehouse
-            ).first()
+            )
+            if line.variant_id:
+                stock_qs = stock_qs.filter(variant_id=line.variant_id)
+            else:
+                stock_qs = stock_qs.filter(variant__isnull=True)
+            stock = stock_qs.first()
 
             if stock:
                 stock.update_quantity()
 
-                total_reserved = Lot.objects.filter(
+                lots_filter = Lot.objects.filter(
                     product=line.product,
                     warehouse=self.warehouse,
                     is_blocked=False
-                ).exclude(status='expired').aggregate(
+                ).exclude(status='expired')
+                if line.variant_id:
+                    lots_filter = lots_filter.filter(variant_id=line.variant_id)
+                else:
+                    lots_filter = lots_filter.filter(variant__isnull=True)
+
+                total_reserved = lots_filter.aggregate(
                     total=models.Sum('reserved_quantity')
                 )['total'] or 0
 
@@ -890,7 +946,7 @@ class Vente(models.Model):
 
     @transaction.atomic
     def restore_stock(self):
-        """Restaure le stock lors de l'annulation d'une vente."""
+        """Restaure le stock lors de l'annulation d'une vente (par variante)."""
         if not self.warehouse:
             return
 
@@ -898,7 +954,7 @@ class Vente(models.Model):
             reference_type="sale",
             reference_id=self.id,
             movement_type="sale_out"
-        ).select_related("product", "lot")
+        ).select_related("product", "lot", "variant")
 
         if not movements.exists():
             return
@@ -924,6 +980,7 @@ class Vente(models.Model):
             StockMovement.objects.create(
                 product=movement.product,
                 lot=lot,
+                variant=movement.variant,   # ✅ AJOUT : variante
                 from_warehouse=None,
                 to_warehouse=self.warehouse,
                 movement_type="return_in",
@@ -938,51 +995,75 @@ class Vente(models.Model):
                 created_by=self.created_by
             )
 
-        product_ids = movements.values_list("product_id", flat=True).distinct()
+        # ✅ Récupérer les combinaisons (produit, variante) uniques
+        stock_keys = set(
+            movements.values_list("product_id", "variant_id").distinct()
+        )
 
-        for product_id in product_ids:
-            stock = Stock.objects.filter(
+        for product_id, variant_id in stock_keys:
+            stock_qs = Stock.objects.filter(
                 product_id=product_id,
                 warehouse=self.warehouse
-            ).first()
+            )
+            if variant_id:
+                stock_qs = stock_qs.filter(variant_id=variant_id)
+            else:
+                stock_qs = stock_qs.filter(variant__isnull=True)
+            stock = stock_qs.first()
 
             if stock:
                 stock.update_quantity()
 
-                total_reserved = Lot.objects.filter(
+                lots_filter = Lot.objects.filter(
                     product_id=product_id,
                     warehouse=self.warehouse,
                     is_blocked=False
-                ).exclude(status='expired').aggregate(
+                ).exclude(status='expired')
+                if variant_id:
+                    lots_filter = lots_filter.filter(variant_id=variant_id)
+                else:
+                    lots_filter = lots_filter.filter(variant__isnull=True)
+
+                total_reserved = lots_filter.aggregate(
                     total=models.Sum('reserved_quantity')
                 )['total'] or 0
 
                 stock.reserved_quantity = total_reserved
                 stock.save(update_fields=['reserved_quantity', 'last_update'])
 
-        for product_id in product_ids:
+        for product_id, _ in stock_keys:
             product = Product.objects.filter(id=product_id).first()
             if product:
                 product.update_status()
 
     def get_stock_details(self):
-        """Méthode de débogage pour afficher les détails du stock."""
+        """Méthode de débogage pour afficher les détails du stock (par variante)."""
         if not self.warehouse:
             return {"error": "Aucun entrepôt associé"}
 
         details = []
-        for line in self.lines.select_related("product").all():
-            stock = Stock.objects.filter(
+        for line in self.lines.select_related("product", "variant").all():
+            stock_qs = Stock.objects.filter(
                 product=line.product,
                 warehouse=self.warehouse
-            ).first()
+            )
+            if line.variant_id:
+                stock_qs = stock_qs.filter(variant_id=line.variant_id)
+            else:
+                stock_qs = stock_qs.filter(variant__isnull=True)
+            stock = stock_qs.first()
 
-            lots = Lot.objects.filter(
+            lots_qs = Lot.objects.filter(
                 product=line.product,
                 warehouse=self.warehouse,
                 current_quantity__gt=0,
                 is_blocked=False
-            ).exclude(status="expired").order_by("expiry_date")
+            ).exclude(status="expired")
+            if line.variant_id:
+                lots_qs = lots_qs.filter(variant_id=line.variant_id)
+            else:
+                lots_qs = lots_qs.filter(variant__isnull=True)
+            lots = lots_qs.order_by("expiry_date")
 
             lots_details = [
                 {
@@ -998,6 +1079,8 @@ class Vente(models.Model):
             details.append({
                 "product": line.product.name,
                 "product_code": line.product.code,
+                "variant_sku": line.variant.sku if line.variant else None,
+                "variant_label": line.variant.label if line.variant else None,
                 "quantity_sold": line.quantity,
                 "stock_quantity": stock.quantity if stock else 0,
                 "stock_available": stock.available_quantity if stock else 0,
@@ -1108,7 +1191,7 @@ class Vente(models.Model):
 # ============================================================
 
 class LigneVente(models.Model):
-    """Ligne de vente avec gestion du type de prix (détail/gros)."""
+    """Ligne de vente avec gestion du type de prix (détail/gros) et variantes."""
 
     sale = models.ForeignKey(
         'Vente',
@@ -1127,6 +1210,16 @@ class LigneVente(models.Model):
         null=True,
         blank=True,
         verbose_name="Lot"
+    )
+
+    # ✅ AJOUT : variante optionnelle
+    variant = models.ForeignKey(
+        'produits_stocks.ProductVariant',
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="sale_lines",
+        verbose_name="Variante"
     )
 
     quantity = models.PositiveIntegerField(verbose_name="Quantité")
@@ -1174,12 +1267,14 @@ class LigneVente(models.Model):
             models.Index(fields=['sale'], name='lignevente_sale_idx'),
             models.Index(fields=['product'], name='lignevente_product_idx'),
             models.Index(fields=['lot'], name='lignevente_lot_idx'),
+            models.Index(fields=['variant'], name='lignevente_variant_idx'),  # ✅
         ]
 
     def __str__(self):
+        v = f" [{self.variant.sku}]" if self.variant_id else ""
         return (
             f"{self.sale.invoice_number} - "
-            f"{self.product.name} "
+            f"{self.product.name}{v} "
             f"({self.quantity} x {self.unit_price})"
         )
 
@@ -1196,7 +1291,8 @@ class LigneVente(models.Model):
     @property
     def tax_amount(self):
         if self.tax_rate > 0:
-            return (self.subtotal - self.discount) * (self.tax_rate / Decimal("100"))
+            return (self.subtotal - self.discount) * (
+                self.tax_rate / Decimal("100"))
         return Decimal("0.00")
 
     @property
@@ -1205,7 +1301,8 @@ class LigneVente(models.Model):
 
     @property
     def price_type_display(self):
-        return dict(self.PRICE_TYPE_CHOICES).get(self.price_type, self.price_type)
+        return dict(self.PRICE_TYPE_CHOICES).get(
+            self.price_type, self.price_type)
 
     def calculate_total(self):
         subtotal = Decimal(self.quantity) * self.unit_price
@@ -1232,6 +1329,12 @@ class LigneVente(models.Model):
             self.sale.calculate_totals()
 
     def get_product_price(self):
+        # ✅ Si variante, utiliser le prix effectif
+        if self.variant_id:
+            if self.price_type == 'gros':
+                return (self.variant.effective_wholesale_price
+                        or self.variant.effective_selling_price)
+            return self.variant.effective_selling_price
         if self.price_type == 'gros':
             return self.product.wholesale_price or self.product.selling_price
         return self.product.selling_price
@@ -1247,6 +1350,9 @@ class LigneVente(models.Model):
             'product_id': self.product.id,
             'product_name': self.product.name,
             'product_code': self.product.code,
+            'variant_id': self.variant_id,
+            'variant_sku': self.variant.sku if self.variant else None,
+            'variant_label': self.variant.label if self.variant else None,
             'lot_number': self.lot.lot_number if self.lot else None,
             'quantity': self.quantity,
             'unit_price': float(self.unit_price),
@@ -1489,18 +1595,23 @@ class Paiement(models.Model):
 
         if self.caisse_destination and self.compte_destination:
             raise ValidationError(
-                "Vous ne pouvez choisir qu'une seule destination : caisse OU compte bancaire."
+                "Vous ne pouvez choisir qu'une seule destination : "
+                "caisse OU compte bancaire."
             )
 
         if self.facture and self.facture.sale and self.facture.sale.warehouse:
             warehouse = self.facture.sale.warehouse
-            if self.caisse_destination and self.caisse_destination.warehouse != warehouse:
+            if (self.caisse_destination
+                    and self.caisse_destination.warehouse != warehouse):
                 raise ValidationError(
-                    "La caisse choisie n'appartient pas à l'entrepôt de la vente."
+                    "La caisse choisie n'appartient pas à "
+                    "l'entrepôt de la vente."
                 )
-            if self.compte_destination and self.compte_destination.warehouse != warehouse:
+            if (self.compte_destination
+                    and self.compte_destination.warehouse != warehouse):
                 raise ValidationError(
-                    "Le compte bancaire choisi n'appartient pas à l'entrepôt de la vente."
+                    "Le compte bancaire choisi n'appartient pas "
+                    "à l'entrepôt de la vente."
                 )
 
     def generate_qr_code(self):
@@ -1612,222 +1723,58 @@ class Avoir(models.Model):
     )
     reason = models.TextField(
         verbose_name="Raison",
-        help_text="Motif de l'avoir (retour, remboursement, etc.)"
+        help_text="Motif de l'avoir (retour, remboursement...)"
     )
-    date = models.DateField(auto_now_add=True, verbose_name="Date")
-    notes = models.TextField(blank=True, verbose_name="Notes internes")
+    date = models.DateTimeField(
+        auto_now_add=True,
+        verbose_name="Date de création"
+    )
+    notes = models.TextField(
+        blank=True,
+        verbose_name="Notes internes"
+    )
 
     restore_stock = models.BooleanField(
         default=False,
-        verbose_name="Stock restauré",
-        help_text="Indique si le stock a été restauré suite à cet avoir"
+        verbose_name="Restaurer le stock"
     )
     stock_restored_at = models.DateTimeField(
-        null=True, blank=True,
-        verbose_name="Date de restauration du stock"
+        null=True,
+        blank=True,
+        verbose_name="Stock restauré le"
     )
 
     created_by = models.ForeignKey(
-        "users.CustomUser",
+        CustomUser,
         on_delete=models.SET_NULL,
-        null=True, blank=True,
+        null=True,
+        blank=True,
         related_name="avoirs_created",
         verbose_name="Créé par"
     )
-    created_at = models.DateTimeField(
-        auto_now_add=True, verbose_name="Créé le")
-    updated_at = models.DateTimeField(auto_now=True, verbose_name="Modifié le")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         verbose_name = "Avoir"
         verbose_name_plural = "Avoirs"
-        ordering = ["-date", "-id"]
+        ordering = ["-date"]
         indexes = [
-            models.Index(fields=["avoir_number"], name='avoir_number_idx'),
-            models.Index(fields=["client", "-date"],
-                         name='avoir_client_date_idx'),
-            models.Index(fields=["type"], name='avoir_type_idx'),
-            models.Index(fields=["sale"], name='avoir_sale_idx'),
+            models.Index(fields=['-date'], name='avoir_date_idx'),
+            models.Index(fields=['client', '-date'], name='avoir_client_date_idx'),
+            models.Index(fields=['sale'], name='avoir_sale_idx'),
+            models.Index(fields=['type'], name='avoir_type_idx'),
         ]
 
     def __str__(self):
-        return (
-            f"{self.avoir_number} - "
-            f"{self.client.name if self.client else 'N/A'} - "
-            f"{self.amount:,.0f} FCFA"
-        )
+        return f"{self.avoir_number} - {self.client.name} ({self.amount} FCFA)"
 
     def save(self, *args, **kwargs):
         if not self.avoir_number:
-            last_avoir = Avoir.objects.order_by("-id").first()
-            if last_avoir and last_avoir.avoir_number:
-                try:
-                    num = int(last_avoir.avoir_number.split("-")[-1]) + 1
-                except (ValueError, IndexError):
-                    num = 1
-            else:
-                num = 1
-            self.avoir_number = f"AV-{date.today().year}-{num:04d}"
+            self.avoir_number = generate_number(
+                Avoir, "avoir_number", "AV"
+            )
         super().save(*args, **kwargs)
-
-    @property
-    def type_display(self):
-        return self.get_type_display()
-
-    @property
-    def is_refund(self):
-        return self.type == "refund"
-
-    @property
-    def is_return(self):
-        return self.type == "return"
-
-    @property
-    def can_restore_stock(self):
-        return (
-            self.sale is not None
-            and self.type in ["refund", "return"]
-            and not self.restore_stock
-            and self.lignes.exists()
-        )
-
-    @property
-    def nombre_produits(self):
-        return self.lignes.count()
-
-    @property
-    def quantite_totale(self):
-        return self.lignes.aggregate(
-            total=models.Sum("quantity")
-        )["total"] or 0
-
-    def recalculate_amount(self):
-        total = self.lignes.aggregate(
-            total=models.Sum("total")
-        )["total"] or 0
-        self.amount = total
-        self.save(update_fields=["amount", "updated_at"])
-        return total
-
-    def restore_partial_stock(self, user=None):
-        """Restaure le stock UNIQUEMENT pour les produits retournés."""
-        from produits_stocks.models import Stock, StockMovement
-
-        if not self.sale:
-            return {"success": False, "message": "Aucune vente associée", "details": []}
-
-        if not self.sale.warehouse:
-            return {"success": False, "message": "Aucun entrepôt défini", "details": []}
-
-        if self.restore_stock:
-            return {"success": False, "message": "Stock déjà restauré", "details": []}
-
-        if not self.lignes.exists():
-            return {"success": False, "message": "Aucune ligne à restaurer", "details": []}
-
-        warehouse = self.sale.warehouse
-        details = []
-
-        for ligne in self.lignes.select_related("product", "ligne_vente").all():
-            try:
-                lot_origine = None
-                if ligne.ligne_vente:
-                    lot_origine = getattr(ligne.ligne_vente, "lot", None)
-
-                quantite_retour = int(ligne.quantity)
-
-                ancienne_qte_lot = None
-                nouvelle_qte_lot = None
-
-                if lot_origine:
-                    ancienne_qte_lot = lot_origine.current_quantity
-                    lot_origine.current_quantity += quantite_retour
-                    lot_origine.save(update_fields=["current_quantity"])
-                    nouvelle_qte_lot = lot_origine.current_quantity
-
-                stock, _ = Stock.objects.get_or_create(
-                    product=ligne.product,
-                    warehouse=warehouse,
-                    defaults={"quantity": 0, "reserved_quantity": 0},
-                )
-
-                ancienne_qte_stock = stock.quantity
-
-                if lot_origine:
-                    stock.update_quantity()
-                else:
-                    stock.quantity += quantite_retour
-                    stock.save(update_fields=["quantity", "last_update"])
-
-                nouvelle_qte_stock = stock.quantity
-
-                movement = StockMovement.objects.create(
-                    product=ligne.product,
-                    lot=lot_origine,
-                    from_warehouse=None,
-                    to_warehouse=warehouse,
-                    movement_type="return_in",
-                    quantity=quantite_retour,
-                    previous_quantity=ancienne_qte_lot or ancienne_qte_stock,
-                    new_quantity=nouvelle_qte_lot or nouvelle_qte_stock,
-                    reference_type="avoir",
-                    reference_id=self.id,
-                    reference_number=self.avoir_number,
-                    reason=f"Retour avoir {self.avoir_number}",
-                    notes=(
-                        f"Retour partiel via avoir {self.avoir_number} - "
-                        f"{self.reason[:200]}"
-                    ),
-                    created_by=user,
-                )
-
-                details.append({
-                    "product_id": ligne.product.id,
-                    "product_name": ligne.product.name,
-                    "product_code": getattr(ligne.product, "code", ""),
-                    "quantity": float(ligne.quantity),
-                    "lot_id": lot_origine.id if lot_origine else None,
-                    "lot_number": lot_origine.lot_number if lot_origine else None,
-                    "stock_before": ancienne_qte_stock,
-                    "stock_after": nouvelle_qte_stock,
-                    "movement_id": movement.id,
-                    "movement_type": movement.movement_type,
-                    "movement_type_display": movement.get_movement_type_display(),
-                })
-
-            except Exception as e:
-                logger.exception(
-                    f"❌ Erreur restauration pour {ligne.product.name}"
-                )
-                details.append({
-                    "product_id": ligne.product.id,
-                    "product_name": ligne.product.name,
-                    "quantity": float(ligne.quantity),
-                    "error": str(e),
-                })
-
-        self.restore_stock = True
-        self.stock_restored_at = timezone.now()
-        self.save(update_fields=["restore_stock",
-                  "stock_restored_at", "updated_at"])
-
-        nb_ok = len([d for d in details if "error" not in d])
-        nb_err = len([d for d in details if "error" in d])
-
-        if nb_err > 0:
-            return {
-                "success": True,
-                "message": f"Stock restauré pour {nb_ok} produit(s), {nb_err} erreur(s)",
-                "details": details,
-                "errors": nb_err,
-            }
-
-        return {
-            "success": True,
-            "message": f"Stock restauré pour {nb_ok} produit(s)",
-            "details": details,
-            "errors": 0,
-        }
 
 
 # ============================================================
@@ -1835,57 +1782,73 @@ class Avoir(models.Model):
 # ============================================================
 
 class LigneAvoir(models.Model):
-    """Produit retourné dans un avoir."""
+    """Ligne d'un avoir (retour de produit)."""
 
     avoir = models.ForeignKey(
         Avoir,
         on_delete=models.CASCADE,
         related_name="lignes",
+        verbose_name="Avoir"
     )
     product = models.ForeignKey(
-        "produits_stocks.Product",
+        Product,
         on_delete=models.PROTECT,
-        related_name="lignes_avoir",
+        verbose_name="Produit"
     )
+
+    # ✅ AJOUT : variante optionnelle
+    variant = models.ForeignKey(
+        ProductVariant,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="avoir_lines",
+        verbose_name="Variante"
+    )
+
     ligne_vente = models.ForeignKey(
-        "ventes_clients.LigneVente",
+        LigneVente,
         on_delete=models.SET_NULL,
-        null=True, blank=True,
-        related_name="lignes_avoir",
+        null=True,
+        blank=True,
+        related_name="avoirs",
+        verbose_name="Ligne de vente d'origine"
     )
-    quantity = models.DecimalField(
-        max_digits=10, decimal_places=2,
-        verbose_name="Quantité retournée",
-    )
+
+    quantity = models.PositiveIntegerField(verbose_name="Quantité retournée")
     unit_price = models.DecimalField(
-        max_digits=12, decimal_places=2,
-        verbose_name="Prix unitaire",
+        max_digits=10, decimal_places=2, verbose_name="Prix unitaire"
     )
     discount = models.DecimalField(
-        max_digits=12, decimal_places=2,
-        default=0, verbose_name="Remise",
+        max_digits=10, decimal_places=2,
+        default=Decimal("0.00"), verbose_name="Remise"
     )
     total = models.DecimalField(
-        max_digits=12, decimal_places=2,
-        default=0, verbose_name="Total ligne",
+        max_digits=10, decimal_places=2,
+        default=Decimal("0.00"), verbose_name="Total ligne"
     )
-    notes = models.TextField(blank=True)
+    notes = models.TextField(blank=True, verbose_name="Notes")
+
     created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         verbose_name = "Ligne d'avoir"
         verbose_name_plural = "Lignes d'avoir"
-        ordering = ["id"]
+        ordering = ['id']
         indexes = [
             models.Index(fields=['avoir'], name='ligneavoir_avoir_idx'),
             models.Index(fields=['product'], name='ligneavoir_product_idx'),
+            models.Index(fields=['variant'], name='ligneavoir_variant_idx'),  # ✅
         ]
 
     def __str__(self):
-        return f"{self.product.name} x {self.quantity:g} - {self.total:,.0f} FCFA"
+        v = f" [{self.variant.sku}]" if self.variant_id else ""
+        return f"{self.avoir.avoir_number} - {self.product.name}{v} x{self.quantity}"
 
     def save(self, *args, **kwargs):
-        self.total = (self.quantity * self.unit_price) - (self.discount or 0)
+        subtotal = Decimal(self.quantity) * self.unit_price
+        self.total = max(Decimal("0.00"), subtotal - self.discount)
         super().save(*args, **kwargs)
 
 
@@ -1894,19 +1857,23 @@ class LigneAvoir(models.Model):
 # ============================================================
 
 class Taxe(models.Model):
-    name = models.CharField(max_length=100)
-    rate = models.DecimalField(max_digits=5, decimal_places=2)
-    is_default = models.BooleanField(default=False)
-    is_active = models.BooleanField(default=True)
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
+    """Modèle de taxe (TVA, etc.)."""
+
+    name = models.CharField(max_length=100, verbose_name="Nom")
+    rate = models.DecimalField(
+        max_digits=5, decimal_places=2, verbose_name="Taux (%)"
+    )
+    is_default = models.BooleanField(
+        default=False, verbose_name="Taux par défaut"
+    )
+    is_active = models.BooleanField(
+        default=True, verbose_name="Active"
+    )
 
     class Meta:
         verbose_name = "Taxe"
         verbose_name_plural = "Taxes"
-        indexes = [
-            models.Index(fields=['is_active'], name='taxe_active_idx'),
-        ]
+        ordering = ['name']
 
     def __str__(self):
         return f"{self.name} ({self.rate}%)"
@@ -1917,240 +1884,159 @@ class Taxe(models.Model):
 # ============================================================
 
 class Remise(models.Model):
+    """Remise applicables aux clients."""
+
     TYPE_CHOICES = (
         ("percentage", "Pourcentage"),
         ("amount", "Montant fixe"),
     )
 
-    name = models.CharField(max_length=100)
-    type = models.CharField(max_length=20, choices=TYPE_CHOICES)
-    value = models.DecimalField(max_digits=10, decimal_places=2)
+    name = models.CharField(max_length=100, verbose_name="Nom")
+    type = models.CharField(
+        max_length=20, choices=TYPE_CHOICES,
+        default="percentage", verbose_name="Type"
+    )
+    value = models.DecimalField(
+        max_digits=10, decimal_places=2, verbose_name="Valeur"
+    )
     min_purchase = models.DecimalField(
-        max_digits=12, decimal_places=2, default=Decimal("0.00")
+        max_digits=12, decimal_places=2, default=0,
+        verbose_name="Achat minimum"
     )
     start_date = models.DateField(null=True, blank=True)
     end_date = models.DateField(null=True, blank=True)
     is_active = models.BooleanField(default=True)
-    clients = models.ManyToManyField(Client, blank=True)
+    clients = models.ManyToManyField(
+        Client, blank=True, related_name="remises"
+    )
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         verbose_name = "Remise"
         verbose_name_plural = "Remises"
-        indexes = [
-            models.Index(fields=['is_active'], name='remise_active_idx'),
-        ]
+        ordering = ['name']
 
     def __str__(self):
-        suffix = "%" if self.type == "percentage" else " FCFA"
-        return f"{self.name} - {self.value}{suffix}"
-
-    def is_valid(self):
-        today = date.today()
-        if not self.is_active:
-            return False
-        if self.start_date and today < self.start_date:
-            return False
-        if self.end_date and today > self.end_date:
-            return False
-        return True
+        return f"{self.name} ({self.value})"
 
 
 # ============================================================
-# CLIENT WALLET
+# CLIENT WALLET (Porte-monnaie)
 # ============================================================
 
 class ClientWallet(models.Model):
-    """Porte-monnaie électronique du client."""
+    """Porte-monnaie électronique d'un client."""
 
     client = models.OneToOneField(
         Client,
         on_delete=models.CASCADE,
-        related_name='wallet',
+        related_name="wallet",
         verbose_name="Client"
     )
     balance = models.DecimalField(
-        max_digits=12, decimal_places=2,
-        default=Decimal('0.00'),
-        verbose_name="Solde disponible"
+        max_digits=12, decimal_places=2, default=Decimal("0.00"),
+        verbose_name="Solde"
     )
     total_deposits = models.DecimalField(
-        max_digits=12, decimal_places=2,
-        default=Decimal('0.00'),
-        verbose_name="Total des dépôts"
+        max_digits=12, decimal_places=2, default=Decimal("0.00"),
+        verbose_name="Total dépôts"
     )
     total_used = models.DecimalField(
-        max_digits=12, decimal_places=2,
-        default=Decimal('0.00'),
+        max_digits=12, decimal_places=2, default=Decimal("0.00"),
         verbose_name="Total utilisé"
     )
-    is_active = models.BooleanField(default=True, verbose_name="Wallet actif")
+    is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         verbose_name = "Porte-monnaie client"
         verbose_name_plural = "Porte-monnaie clients"
-        indexes = [
-            models.Index(fields=['-created_at'], name='wallet_created_idx'),
-            models.Index(fields=['is_active'], name='wallet_active_idx'),
-        ]
 
     def __str__(self):
-        return f"{self.client.name} - {self.balance:,.0f} FCFA"
-
-    @transaction.atomic
-    def credit(self, amount, source, reference, notes='', created_by=None):
-        if amount <= 0:
-            raise ValidationError("Le montant doit être supérieur à zéro")
-
-        self.balance += amount
-        self.total_deposits += amount
-        self.save()
-
-        WalletTransaction.objects.create(
-            wallet=self,
-            type='credit',
-            amount=amount,
-            source=source,
-            reference=reference,
-            notes=notes,
-            balance_after=self.balance,
-            created_by=created_by
-        )
-
-        return self.balance
-
-    @transaction.atomic
-    def debit(self, amount, source, reference, notes='', created_by=None):
-        if amount <= 0:
-            raise ValidationError("Le montant doit être supérieur à zéro")
-
-        if amount > self.balance:
-            raise ValidationError(
-                f"Solde insuffisant. Disponible : {self.balance:,.0f} FCFA"
-            )
-
-        self.balance -= amount
-        self.total_used += amount
-        self.save()
-
-        WalletTransaction.objects.create(
-            wallet=self,
-            type='debit',
-            amount=amount,
-            source=source,
-            reference=reference,
-            notes=notes,
-            balance_after=self.balance,
-            created_by=created_by
-        )
-
-        return self.balance
+        return f"{self.client.name} - {self.balance} FCFA"
 
 
 class WalletTransaction(models.Model):
-    """Historique des transactions du wallet."""
+    """Transaction sur un porte-monnaie."""
 
-    TRANSACTION_TYPES = (
-        ('credit', 'Crédit'),
-        ('debit', 'Débit'),
+    TYPE_CHOICES = (
+        ("deposit", "Dépôt"),
+        ("withdrawal", "Retrait"),
+        ("payment", "Paiement"),
+        ("refund", "Remboursement"),
     )
 
     SOURCE_CHOICES = (
-        ('deposit', 'Dépôt en espèces'),
-        ('payment', 'Paiement facture'),
-        ('avoir', 'Avoir commercial'),
-        ('refund', 'Remboursement'),
-        ('transfer', 'Transfert'),
-        ('adjustment', 'Ajustement'),
+        ("manual", "Manuel"),
+        ("sale", "Vente"),
+        ("refund", "Remboursement"),
     )
 
     wallet = models.ForeignKey(
         ClientWallet,
         on_delete=models.CASCADE,
-        related_name='transactions'
+        related_name="transactions"
     )
-    type = models.CharField(max_length=10, choices=TRANSACTION_TYPES)
+    type = models.CharField(max_length=20, choices=TYPE_CHOICES)
     amount = models.DecimalField(max_digits=12, decimal_places=2)
-    source = models.CharField(max_length=20, choices=SOURCE_CHOICES)
-    reference = models.CharField(
-        max_length=100, blank=True, verbose_name="Référence"
+    source = models.CharField(
+        max_length=20, choices=SOURCE_CHOICES, default="manual"
     )
-    notes = models.TextField(blank=True, verbose_name="Notes")
-    balance_after = models.DecimalField(
-        max_digits=12, decimal_places=2,
-        verbose_name="Solde après transaction"
-    )
+    reference = models.CharField(max_length=100, blank=True)
+    notes = models.TextField(blank=True)
+    balance_after = models.DecimalField(max_digits=12, decimal_places=2)
     created_at = models.DateTimeField(auto_now_add=True)
     created_by = models.ForeignKey(
         CustomUser,
         on_delete=models.SET_NULL,
         null=True,
-        blank=True,
-        related_name='wallet_transactions'
+        blank=True
     )
 
     class Meta:
-        verbose_name = "Transaction wallet"
-        verbose_name_plural = "Transactions wallet"
-        ordering = ['-created_at']
-        indexes = [
-            models.Index(fields=['wallet', '-created_at'],
-                         name='wallettx_wallet_date_idx'),
-            models.Index(fields=['type'], name='wallettx_type_idx'),
-            models.Index(fields=['source'], name='wallettx_source_idx'),
-        ]
+        verbose_name = "Transaction porte-monnaie"
+        verbose_name_plural = "Transactions porte-monnaie"
+        ordering = ["-created_at"]
 
     def __str__(self):
-        return f"{self.get_type_display()} - {self.amount:,.0f} FCFA"
+        return f"{self.wallet.client.name} - {self.type} {self.amount}"
 
 
 # ============================================================
-# STOCK CLIENT (MARCHANDISES DÉPOSÉES CHEZ LE CLIENT)
+# STOCK CLIENT
 # ============================================================
 
 class ClientStock(models.Model):
-    """
-    Stock de marchandises déposées chez un client.
-    ⚠️ DIFFÉRENT de Stock (produits_stocks).
-    """
+    """Stock de marchandises déposées chez un client."""
+
     client = models.OneToOneField(
         Client,
         on_delete=models.CASCADE,
-        related_name='client_stock',
+        related_name="client_stock",
         verbose_name="Client"
     )
-    is_active = models.BooleanField(default=True, verbose_name="Stock actif")
-    notes = models.TextField(blank=True, verbose_name="Notes")
-
+    is_active = models.BooleanField(default=True)
+    notes = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         verbose_name = "Stock client"
         verbose_name_plural = "Stocks clients"
-        ordering = ['-updated_at']
-        indexes = [
-            models.Index(fields=['-updated_at'],
-                         name='clientstock_updated_idx'),
-            models.Index(fields=['is_active'], name='clientstock_active_idx'),
-        ]
 
     def __str__(self):
         return f"Stock de {self.client.name}"
 
     @property
     def total_quantity(self):
-        return self.lignes.aggregate(
-            total=models.Sum('quantity')
-        )['total'] or Decimal('0')
+        return sum(l.quantity for l in self.lignes.all()) or 0
 
     @property
     def total_value(self):
         return sum(
-            (ligne.total_value for ligne in self.lignes.all()),
-            Decimal('0')
+            (l.quantity * l.unit_price for l in self.lignes.all()),
+            Decimal("0.00")
         )
 
     @property
@@ -2159,155 +2045,128 @@ class ClientStock(models.Model):
 
 
 class ClientStockLigne(models.Model):
-    """Ligne de stock client : un produit avec sa quantité."""
+    """Ligne du stock client (par produit + variante)."""
 
     stock = models.ForeignKey(
         ClientStock,
         on_delete=models.CASCADE,
-        related_name='lignes',
-        verbose_name="Stock client"
+        related_name="lignes"
     )
-    product = models.ForeignKey(
-        'produits_stocks.Product',
+    product = models.ForeignKey(Product, on_delete=models.PROTECT)
+
+    # ✅ AJOUT : variante optionnelle
+    variant = models.ForeignKey(
+        ProductVariant,
         on_delete=models.PROTECT,
-        related_name='client_stock_lignes',
-        verbose_name="Produit"
+        null=True,
+        blank=True,
+        related_name="client_stock_lines",
+        verbose_name="Variante"
     )
+
     quantity = models.DecimalField(
-        max_digits=12, decimal_places=2, default=0,
-        verbose_name="Quantité"
+        max_digits=12, decimal_places=2, default=Decimal("0.00")
     )
     unit_price = models.DecimalField(
-        max_digits=12, decimal_places=2, default=0,
-        verbose_name="Prix unitaire de référence"
+        max_digits=12, decimal_places=2, default=Decimal("0.00")
     )
-    notes = models.TextField(blank=True, verbose_name="Notes")
-
+    notes = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        verbose_name = "Ligne de stock client"
-        verbose_name_plural = "Lignes de stock client"
-        unique_together = [['stock', 'product']]
-        ordering = ['product__name']
+        verbose_name = "Ligne stock client"
+        verbose_name_plural = "Lignes stock client"
+        unique_together = [['stock', 'product', 'variant']]
         indexes = [
-            models.Index(fields=['stock'], name='csl_stock_idx'),
-            models.Index(fields=['product'], name='csl_product_idx'),
             models.Index(fields=['stock', 'product'],
-                         name='csl_stock_product_idx'),
+                         name='clientstockline_stock_prod_idx'),
+            models.Index(fields=['variant'],
+                         name='clientstockline_variant_idx'),
         ]
 
     def __str__(self):
-        return f"{self.product.name} x {self.quantity}"
+        v = f" [{self.variant.sku}]" if self.variant_id else ""
+        return f"{self.stock.client.name} - {self.product.name}{v}: {self.quantity}"
 
     @property
     def total_value(self):
         return self.quantity * self.unit_price
 
 
-# ============================================================
-# MOUVEMENT DE STOCK CLIENT
-# ============================================================
-
 class ClientStockMovement(models.Model):
-    """
-    Mouvement de stock client (entrée/sortie).
-    """
+    """Mouvement de stock client."""
 
     TYPE_CHOICES = (
-        ('deposit', 'Dépôt'),
-        ('withdrawal', 'Retrait'),
-        ('adjustment', 'Ajustement'),
-        ('sale', 'Vente au client'),
-        ('return', 'Retour client'),
-        ('delivery', 'Livraison vers destinataire'),
+        ("deposit", "Dépôt"),
+        ("withdrawal", "Retrait"),
+        ("adjustment", "Ajustement"),
     )
 
     client_stock = models.ForeignKey(
         ClientStock,
         on_delete=models.CASCADE,
-        related_name='movements',
-        verbose_name="Stock client"
+        related_name="movements"
     )
-    product = models.ForeignKey(
-        'produits_stocks.Product',
+    product = models.ForeignKey(Product, on_delete=models.PROTECT)
+
+    # ✅ AJOUT : variante optionnelle
+    variant = models.ForeignKey(
+        ProductVariant,
         on_delete=models.PROTECT,
-        related_name='client_stock_movements',
-        verbose_name="Produit"
+        null=True,
+        blank=True,
+        related_name="client_stock_movements",
+        verbose_name="Variante"
     )
-    movement_type = models.CharField(
-        max_length=20,
-        choices=TYPE_CHOICES,
-        verbose_name="Type de mouvement"
-    )
-    quantity = models.DecimalField(
-        max_digits=12, decimal_places=2,
-        verbose_name="Quantité"
-    )
+
+    movement_type = models.CharField(max_length=20, choices=TYPE_CHOICES)
+    quantity = models.DecimalField(max_digits=12, decimal_places=2)
     previous_quantity = models.DecimalField(
-        max_digits=12, decimal_places=2, default=0,
-        verbose_name="Quantité précédente"
+        max_digits=12, decimal_places=2, default=Decimal("0.00")
     )
     new_quantity = models.DecimalField(
-        max_digits=12, decimal_places=2, default=0,
-        verbose_name="Nouvelle quantité"
+        max_digits=12, decimal_places=2, default=Decimal("0.00")
     )
     unit_price = models.DecimalField(
-        max_digits=12, decimal_places=2, default=0,
-        verbose_name="Prix unitaire"
+        max_digits=12, decimal_places=2, default=Decimal("0.00")
     )
-    reference = models.CharField(
-        max_length=100, blank=True, verbose_name="Référence"
-    )
-    notes = models.TextField(blank=True, verbose_name="Notes")
+    reference = models.CharField(max_length=100, blank=True)
+    notes = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
     created_by = models.ForeignKey(
         CustomUser,
         on_delete=models.SET_NULL,
         null=True,
-        blank=True,
-        related_name='client_stock_movements_created',
-        verbose_name="Créé par"
+        blank=True
     )
-    created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        verbose_name = "Mouvement de stock client"
-        verbose_name_plural = "Mouvements de stock client"
-        ordering = ['-created_at']
+        verbose_name = "Mouvement stock client"
+        verbose_name_plural = "Mouvements stock client"
+        ordering = ["-created_at"]
         indexes = [
             models.Index(fields=['client_stock', '-created_at'],
-                         name='csm_stock_date_idx'),
-            models.Index(fields=['product', '-created_at'],
-                         name='csm_product_date_idx'),
-            models.Index(fields=['movement_type'], name='csm_type_idx'),
+                         name='clientmov_stock_date_idx'),
+            models.Index(fields=['variant'],
+                         name='clientmov_variant_idx'),
         ]
 
     def __str__(self):
-        return (
-            f"{self.get_movement_type_display()} - "
-            f"{self.product.name} x {self.quantity}"
-        )
+        v = f" [{self.variant.sku}]" if self.variant_id else ""
+        return f"{self.client_stock.client.name} - {self.movement_type} {self.product.name}{v}"
 
     @property
     def is_incoming(self):
-        return self.movement_type in ['deposit', 'return', 'adjustment']
+        return self.movement_type in ['deposit']
 
     @property
     def is_outgoing(self):
-        return self.movement_type in ['withdrawal', 'sale', 'delivery']
+        return self.movement_type in ['withdrawal']
 
     @property
     def quantity_signed(self):
-        if self.is_incoming:
-            return self.quantity
-        elif self.is_outgoing:
-            return -self.quantity
-        return self.quantity
-
-    @property
-    def type_display(self):
-        return self.get_movement_type_display()
+        return self.quantity if self.is_incoming else -self.quantity
 
 
 # ============================================================
@@ -2315,129 +2174,85 @@ class ClientStockMovement(models.Model):
 # ============================================================
 
 class ClientDelivery(models.Model):
-    """
-    Livraison des produits stockés chez le client vers un destinataire.
-    """
+    """Livraison de marchandises à un client."""
 
     STATUS_CHOICES = (
-        ('pending', 'En attente de validation'),
-        ('confirmed', 'Validée'),
-        ('in_transit', 'En cours de livraison'),
-        ('delivered', 'Livré'),
-        ('cancelled', 'Annulé'),
-        ('rejected', 'Rejetée'),
+        ("pending", "En attente"),
+        ("confirmed", "Confirmée"),
+        ("in_transit", "En transit"),
+        ("delivered", "Livrée"),
+        ("cancelled", "Annulée"),
+        ("rejected", "Rejetée"),
     )
 
-    delivery_number = models.CharField(
-        max_length=50, unique=True,
-        verbose_name="Numéro de livraison"
+    DELIVERY_METHOD_CHOICES = (
+        ("pickup", "Retrait sur place"),
+        ("delivery", "Livraison"),
+        ("carrier", "Transporteur"),
     )
+
+    delivery_number = models.CharField(max_length=50, unique=True)
     client = models.ForeignKey(
         Client,
-        on_delete=models.PROTECT,
-        related_name='client_deliveries',
-        verbose_name="Client (source du stock)"
+        on_delete=models.CASCADE,
+        related_name="deliveries"
     )
     client_stock = models.ForeignKey(
         ClientStock,
-        on_delete=models.CASCADE,
-        related_name='deliveries',
-        verbose_name="Stock client concerné"
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True
     )
+    created_by_client = models.BooleanField(default=False)
 
-    recipient_name = models.CharField(
-        max_length=200, verbose_name="Nom du destinataire"
-    )
-    recipient_phone = models.CharField(
-        max_length=20, verbose_name="Téléphone du destinataire"
-    )
-    recipient_address = models.TextField(
-        blank=True, verbose_name="Adresse de livraison"
-    )
-    recipient_email = models.EmailField(
-        blank=True, verbose_name="Email du destinataire"
-    )
-    recipient_notes = models.TextField(
-        blank=True, verbose_name="Notes sur le destinataire"
-    )
+    recipient_name = models.CharField(max_length=200)
+    recipient_phone = models.CharField(max_length=20)
+    recipient_address = models.TextField(blank=True)
+    recipient_email = models.EmailField(blank=True)
+    recipient_notes = models.TextField(blank=True)
 
     status = models.CharField(
-        max_length=20,
-        choices=STATUS_CHOICES,
-        default='pending',
-        verbose_name="Statut"
+        max_length=20, choices=STATUS_CHOICES, default="pending"
     )
 
-    request_date = models.DateTimeField(
-        auto_now_add=True, verbose_name="Date de la demande"
-    )
-    confirmed_date = models.DateTimeField(
-        null=True, blank=True, verbose_name="Date de validation"
-    )
-    shipped_date = models.DateTimeField(
-        null=True, blank=True, verbose_name="Date d'expédition"
-    )
-    delivered_date = models.DateTimeField(
-        null=True, blank=True, verbose_name="Date de livraison"
-    )
-
-    created_by_client = models.BooleanField(
-        default=False,
-        verbose_name="Créée par le client",
-        help_text="True si la demande a été créée par le client lui-même"
-    )
+    request_date = models.DateTimeField(auto_now_add=True)
+    confirmed_date = models.DateTimeField(null=True, blank=True)
+    shipped_date = models.DateTimeField(null=True, blank=True)
+    delivered_date = models.DateTimeField(null=True, blank=True)
+    rejection_reason = models.TextField(blank=True)
 
     delivery_method = models.CharField(
-        max_length=50, blank=True, verbose_name="Mode de livraison"
+        max_length=50, blank=True
     )
-    carrier = models.CharField(
-        max_length=100, blank=True, verbose_name="Transporteur"
-    )
-    tracking_number = models.CharField(
-        max_length=100, blank=True, verbose_name="Numéro de suivi"
-    )
-    vehicle_plate = models.CharField(
-        max_length=50, blank=True, verbose_name="Immatriculation véhicule"
-    )
-    driver_name = models.CharField(
-        max_length=100, blank=True, verbose_name="Nom du chauffeur"
-    )
-    driver_phone = models.CharField(
-        max_length=20, blank=True, verbose_name="Téléphone du chauffeur"
-    )
+    carrier = models.CharField(max_length=100, blank=True)
+    tracking_number = models.CharField(max_length=100, blank=True)
+    vehicle_plate = models.CharField(max_length=50, blank=True)
+    driver_name = models.CharField(max_length=100, blank=True)
+    driver_phone = models.CharField(max_length=20, blank=True)
 
     total_quantity = models.DecimalField(
-        max_digits=12, decimal_places=2, default=0,
-        verbose_name="Quantité totale"
+        max_digits=12, decimal_places=2, default=Decimal("0.00")
     )
     total_value = models.DecimalField(
-        max_digits=12, decimal_places=2, default=0,
-        verbose_name="Valeur totale"
+        max_digits=12, decimal_places=2, default=Decimal("0.00")
     )
 
-    notes = models.TextField(blank=True, verbose_name="Notes internes")
-    client_notes = models.TextField(
-        blank=True, verbose_name="Message au client")
-
-    rejection_reason = models.TextField(
-        blank=True,
-        verbose_name="Raison du rejet",
-        help_text="Raison pour laquelle la demande a été rejetée (admin)"
-    )
+    notes = models.TextField(blank=True)
+    client_notes = models.TextField(blank=True)
 
     created_by = models.ForeignKey(
         CustomUser,
         on_delete=models.SET_NULL,
-        null=True, blank=True,
-        related_name='client_deliveries_created',
-        verbose_name="Créé par"
+        null=True,
+        blank=True,
+        related_name="deliveries_created"
     )
     validated_by = models.ForeignKey(
         CustomUser,
         on_delete=models.SET_NULL,
-        null=True, blank=True,
-        related_name='client_deliveries_validated',
-        verbose_name="Validé par"
+        null=True,
+        blank=True,
+        related_name="deliveries_validated"
     )
 
     created_at = models.DateTimeField(auto_now_add=True)
@@ -2446,39 +2261,17 @@ class ClientDelivery(models.Model):
     class Meta:
         verbose_name = "Livraison client"
         verbose_name_plural = "Livraisons client"
-        ordering = ['-created_at']
+        ordering = ["-request_date"]
         indexes = [
-            models.Index(fields=['client', '-created_at'],
-                         name='cd_client_date_idx'),
-            models.Index(fields=['status', '-created_at'],
-                         name='cd_status_date_idx'),
-            models.Index(fields=['delivery_number'], name='cd_number_idx'),
-            models.Index(fields=['created_by_client'],
-                         name='cd_by_client_idx'),
+            models.Index(fields=['-request_date'],
+                         name='delivery_request_idx'),
+            models.Index(fields=['status'], name='delivery_status_idx'),
+            models.Index(fields=['client', '-request_date'],
+                         name='delivery_client_date_idx'),
         ]
 
     def __str__(self):
-        return (
-            f"{self.delivery_number} - {self.client.name} "
-            f"→ {self.recipient_name} ({self.get_status_display()})"
-        )
-
-    def save(self, *args, **kwargs):
-        if not self.delivery_number:
-            last = ClientDelivery.objects.order_by('-id').first()
-            if last and last.delivery_number:
-                try:
-                    num = int(last.delivery_number.split('-')[-1]) + 1
-                except (ValueError, IndexError):
-                    num = 1
-            else:
-                num = 1
-            self.delivery_number = f"LIV-{date.today().year}-{num:04d}"
-        super().save(*args, **kwargs)
-
-    @property
-    def status_display(self):
-        return self.get_status_display()
+        return f"{self.delivery_number} - {self.recipient_name}"
 
     @property
     def is_pending(self):
@@ -2506,19 +2299,19 @@ class ClientDelivery(models.Model):
 
     @property
     def can_be_edited_by_client(self):
-        return self.created_by_client and self.status == 'pending'
+        return self.status == 'pending' and self.created_by_client
 
     @property
     def can_be_cancelled_by_client(self):
-        return self.created_by_client and self.status in ['pending', 'confirmed']
+        return self.status in ['pending', 'confirmed'] and self.created_by_client
 
     @property
     def can_be_validated(self):
-        return self.status == 'pending'
+        return self.status == 'pending' and not self.created_by_client
 
     @property
     def can_be_rejected(self):
-        return self.status == 'pending'
+        return self.status == 'pending' and not self.created_by_client
 
     @property
     def can_be_started(self):
@@ -2526,119 +2319,65 @@ class ClientDelivery(models.Model):
 
     @property
     def can_be_confirmed(self):
-        return self.status in ['confirmed', 'in_transit']
+        return self.status == 'in_transit'
 
-    def recalculate_totals(self):
-        total_qty = self.lignes.aggregate(
-            total=models.Sum('quantity')
-        )['total'] or Decimal('0')
-
-        total_val = self.lignes.aggregate(
-            total=models.Sum('total_value')
-        )['total'] or Decimal('0')
-
-        self.total_quantity = total_qty
-        self.total_value = total_val
-        self.save(update_fields=['total_quantity',
-                  'total_value', 'updated_at'])
-
-    def mark_as_confirmed(self, user=None):
-        self.status = 'confirmed'
-        self.confirmed_date = timezone.now()
-        if user:
-            self.validated_by = user
-        self.save(update_fields=[
-                  'status', 'confirmed_date', 'validated_by', 'updated_at'])
-
-    def mark_as_rejected(self, user=None, reason=''):
-        self.status = 'rejected'
-        self.rejection_reason = reason
-        if user:
-            self.validated_by = user
-        self.save(update_fields=[
-                  'status', 'rejection_reason', 'validated_by', 'updated_at'])
-
-    def mark_as_in_transit(self, user=None):
-        self.status = 'in_transit'
-        self.shipped_date = timezone.now()
-        self.save(update_fields=['status', 'shipped_date', 'updated_at'])
-
-    def mark_as_delivered(self, user=None):
-        self.status = 'delivered'
-        self.delivered_date = timezone.now()
-        if user:
-            self.validated_by = user
-        self.save(update_fields=[
-                  'status', 'delivered_date', 'validated_by', 'updated_at'])
-
-    def mark_as_cancelled(self, reason=''):
-        self.status = 'cancelled'
-        if reason:
-            self.notes = (self.notes or '') + f"\n[ANNULÉE] {reason}"
-        self.save(update_fields=['status', 'notes', 'updated_at'])
-
-
-# ============================================================
-# LIGNE DE LIVRAISON CLIENT
-# ============================================================
 
 class ClientDeliveryLigne(models.Model):
-    """Ligne de livraison (produit + quantité retirés du stock client)."""
+    """Ligne de livraison client."""
 
     delivery = models.ForeignKey(
         ClientDelivery,
         on_delete=models.CASCADE,
-        related_name='lignes',
-        verbose_name="Livraison"
+        related_name="lignes"
     )
-    product = models.ForeignKey(
-        'produits_stocks.Product',
+    product = models.ForeignKey(Product, on_delete=models.PROTECT)
+
+    # ✅ AJOUT : variante optionnelle
+    variant = models.ForeignKey(
+        ProductVariant,
         on_delete=models.PROTECT,
-        related_name='client_delivery_lignes',
-        verbose_name="Produit"
+        null=True,
+        blank=True,
+        related_name="delivery_lines",
+        verbose_name="Variante"
     )
+
     client_stock_ligne = models.ForeignKey(
         ClientStockLigne,
         on_delete=models.SET_NULL,
         null=True,
-        blank=True,
-        related_name='delivery_lignes',
-        verbose_name="Ligne de stock client"
+        blank=True
     )
-    quantity = models.DecimalField(
-        max_digits=12, decimal_places=2,
-        verbose_name="Quantité"
-    )
+
+    quantity = models.DecimalField(max_digits=12, decimal_places=2)
     unit_price = models.DecimalField(
-        max_digits=12, decimal_places=2, default=0,
-        verbose_name="Prix unitaire"
+        max_digits=12, decimal_places=2, default=Decimal("0.00")
     )
     total_value = models.DecimalField(
-        max_digits=12, decimal_places=2, default=0,
-        verbose_name="Valeur totale"
+        max_digits=12, decimal_places=2, default=Decimal("0.00")
     )
     quantity_before = models.DecimalField(
-        max_digits=12, decimal_places=2, default=0,
-        verbose_name="Quantité avant livraison"
+        max_digits=12, decimal_places=2, default=Decimal("0.00")
     )
     quantity_after = models.DecimalField(
-        max_digits=12, decimal_places=2, default=0,
-        verbose_name="Quantité après livraison"
+        max_digits=12, decimal_places=2, default=Decimal("0.00")
     )
+
     notes = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        verbose_name = "Ligne de livraison client"
-        verbose_name_plural = "Lignes de livraison client"
+        verbose_name = "Ligne de livraison"
+        verbose_name_plural = "Lignes de livraison"
         ordering = ['id']
         indexes = [
-            models.Index(fields=['delivery'], name='cdl_delivery_idx'),
-            models.Index(fields=['product'], name='cdl_product_idx'),
+            models.Index(fields=['delivery'], name='deliveryline_del_idx'),
+            models.Index(fields=['variant'], name='deliveryline_variant_idx'),
         ]
 
     def __str__(self):
-        return f"{self.product.name} x {self.quantity}"
+        v = f" [{self.variant.sku}]" if self.variant_id else ""
+        return f"{self.delivery.delivery_number} - {self.product.name}{v}"
 
     def save(self, *args, **kwargs):
         self.total_value = self.quantity * self.unit_price

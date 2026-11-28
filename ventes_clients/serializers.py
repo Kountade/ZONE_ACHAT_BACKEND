@@ -3,6 +3,7 @@
 # SERIALIZERS COMPLET — LOGICIEL B
 # ✅ ZÉRO N+1 — Optimisé pour 10 000+ lignes < 1s
 # ✅ FIX : total des lignes calculé AVANT bulk_create
+# ✅ Support complet des variantes (ProductVariant)
 # ============================================================
 
 from django.db import models
@@ -12,7 +13,7 @@ from django.db import transaction
 from datetime import date
 from decimal import Decimal
 
-from produits_stocks.models import Product
+from produits_stocks.models import Product, ProductVariant   # ✅ AJOUT ProductVariant
 from produits_stocks.serializers import ProductListSerializer, LotListSerializer
 
 from .models import (
@@ -56,6 +57,46 @@ def _compute_line_total(quantity, unit_price, discount):
     return max(Decimal('0.00'), (qty * price) - disc)
 
 
+def _resolve_variant(data):
+    """
+    ✅ Résout variant_id → variant et valide la cohérence avec product.
+    Retourne le variant résolu (ou None).
+    """
+    product = data.get('product')
+    variant = data.get('variant')
+    variant_id = data.pop('variant_id', None)
+
+    # Si variant_id fourni sans variant, le résoudre
+    if variant_id and not variant:
+        try:
+            variant = ProductVariant.objects.get(id=variant_id)
+            data['variant'] = variant
+        except ProductVariant.DoesNotExist:
+            raise serializers.ValidationError(
+                {"variant_id": "Variante non trouvée."}
+            )
+
+    # Cohérence variant ↔ product
+    if variant and product and variant.product_id != product.id:
+        raise serializers.ValidationError(
+            {"variant": "La variante n'appartient pas à ce produit."}
+        )
+
+    # Produit à variantes → variant obligatoire
+    if product and product.has_variants and not variant:
+        raise serializers.ValidationError({
+            "variant_id": "Ce produit a des variantes, sélectionnez une variante."
+        })
+
+    # Produit sans variantes → pas de variant autorisé
+    if product and not product.has_variants and variant:
+        raise serializers.ValidationError({
+            "variant": "Ce produit n'a pas de variantes."
+        })
+
+    return variant
+
+
 # ============================================================
 # CLIENT
 # ============================================================
@@ -87,27 +128,45 @@ class ClientListSerializer(serializers.ModelSerializer):
 
 
 # ============================================================
-# DEVIS
+# DEVIS — LIGNES
 # ============================================================
 
 class LigneDevisSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source='product.name', read_only=True)
     product_code = serializers.CharField(source='product.code', read_only=True)
 
+    # ✅ AJOUT : infos variante en lecture
+    variant = serializers.IntegerField(source='variant_id', read_only=True)
+    variant_sku = serializers.CharField(source='variant.sku', read_only=True)
+    variant_label = serializers.CharField(source='variant.label', read_only=True)
+
     class Meta:
         model = LigneDevis
         fields = [
             'id', 'product', 'product_name', 'product_code',
+            'variant', 'variant_sku', 'variant_label',   # ✅ AJOUT
             'quantity', 'unit_price', 'discount', 'tax_rate', 'total', 'notes'
         ]
         read_only_fields = ['id', 'total']
 
 
 class LigneDevisCreateSerializer(serializers.ModelSerializer):
+    # ✅ AJOUT : accepter la variante (2 formats possibles)
+    variant = serializers.PrimaryKeyRelatedField(
+        queryset=ProductVariant.objects.all(),
+        required=False, allow_null=True, write_only=True
+    )
+    variant_id = serializers.IntegerField(
+        required=False, allow_null=True, write_only=True
+    )
+
     class Meta:
         model = LigneDevis
-        fields = ['product', 'quantity', 'unit_price',
-                  'discount', 'tax_rate', 'notes']
+        fields = [
+            'product', 'variant', 'variant_id',   # ✅ AJOUT
+            'quantity', 'unit_price',
+            'discount', 'tax_rate', 'notes'
+        ]
 
     def validate_quantity(self, value):
         if value <= 0:
@@ -121,13 +180,24 @@ class LigneDevisCreateSerializer(serializers.ModelSerializer):
                 "Le prix unitaire doit être supérieur à 0")
         return value
 
+    def validate(self, data):
+        variant = _resolve_variant(data)
+        product = data.get('product')
+
+        # ✅ Prix par défaut selon variante/produit
+        if not data.get('unit_price'):
+            if variant:
+                data['unit_price'] = variant.effective_selling_price
+            elif product:
+                data['unit_price'] = product.selling_price
+        return data
+
+
+# ============================================================
+# DEVIS — LIST / DETAIL / CREATE
+# ============================================================
 
 class DevisListSerializer(serializers.ModelSerializer):
-    """
-    ✅ Anti-N+1 :
-    - select_related('client', 'warehouse') côté vue
-    - get_has_been_converted utilise la FK `sale` (déjà chargée via select_related)
-    """
     client_name = serializers.CharField(source='client.name', read_only=True)
     status_display = serializers.CharField(
         source='get_status_display', read_only=True)
@@ -237,11 +307,17 @@ class DevisCreateSerializer(serializers.ModelSerializer):
     def validate_lignes(self, value):
         if not value:
             raise serializers.ValidationError("Au moins un produit est requis")
-        product_ids = [line.get('product')
-                       for line in value if line.get('product')]
-        if len(product_ids) != len(set(product_ids)):
+        # ✅ Clé unique = (product, variant)
+        keys = []
+        for line in value:
+            pid = line.get('product')
+            pid = pid.id if hasattr(pid, 'id') else pid
+            vid = line.get('variant')
+            vid = vid.id if hasattr(vid, 'id') else line.get('variant_id')
+            keys.append((pid, vid))
+        if len(keys) != len(set(keys)):
             raise serializers.ValidationError(
-                "Un produit ne peut apparaître qu'une seule fois dans le devis."
+                "Chaque combinaison (produit, variante) doit être unique dans le devis."
             )
         return value
 
@@ -267,7 +343,6 @@ class DevisCreateSerializer(serializers.ModelSerializer):
             **validated_data
         )
 
-        # ✅ FIX : calculer total AVANT bulk_create
         lignes_to_create = []
         for line_data in lignes_data:
             line_total = _compute_line_total(
@@ -320,7 +395,7 @@ class DevisStatusUpdateSerializer(serializers.Serializer):
 
 
 # ============================================================
-# LIGNE VENTE
+# LIGNE VENTE — LECTURE
 # ============================================================
 
 class LigneVenteSerializer(serializers.ModelSerializer):
@@ -329,6 +404,12 @@ class LigneVenteSerializer(serializers.ModelSerializer):
     lot_number = serializers.CharField(source='lot.lot_number', read_only=True)
     price_type_display = serializers.CharField(
         source='get_price_type_display', read_only=True)
+
+    # ✅ AJOUT : infos variante en lecture
+    variant = serializers.IntegerField(source='variant_id', read_only=True)
+    variant_sku = serializers.CharField(source='variant.sku', read_only=True)
+    variant_label = serializers.CharField(source='variant.label', read_only=True)
+
     subtotal = serializers.ReadOnlyField()
     tax_amount = serializers.ReadOnlyField()
     total_without_tax = serializers.ReadOnlyField()
@@ -337,6 +418,7 @@ class LigneVenteSerializer(serializers.ModelSerializer):
         model = LigneVente
         fields = [
             'id', 'product', 'product_name', 'product_code',
+            'variant', 'variant_sku', 'variant_label',   # ✅ AJOUT
             'lot', 'lot_number',
             'quantity', 'unit_price',
             'price_type', 'price_type_display',
@@ -347,7 +429,20 @@ class LigneVenteSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'total']
 
 
+# ============================================================
+# LIGNE VENTE — CRÉATION
+# ============================================================
+
 class LigneVenteCreateSerializer(serializers.ModelSerializer):
+    # ✅ AJOUT : accepter la variante (2 formats possibles)
+    variant = serializers.PrimaryKeyRelatedField(
+        queryset=ProductVariant.objects.all(),
+        required=False, allow_null=True, write_only=True
+    )
+    variant_id = serializers.IntegerField(
+        required=False, allow_null=True, write_only=True
+    )
+
     price_type = serializers.ChoiceField(
         choices=[
             ('detail', 'Prix de détail'),
@@ -361,7 +456,8 @@ class LigneVenteCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = LigneVente
         fields = [
-            'product', 'lot', 'quantity', 'unit_price',
+            'product', 'variant', 'variant_id', 'lot',   # ✅ AJOUT
+            'quantity', 'unit_price',
             'discount', 'tax_rate', 'notes', 'price_type'
         ]
 
@@ -378,36 +474,37 @@ class LigneVenteCreateSerializer(serializers.ModelSerializer):
         return value
 
     def validate(self, data):
+        variant = _resolve_variant(data)
         product = data.get('product')
         price_type = data.get('price_type', 'detail')
 
-        if product:
-            if price_type == 'gros' and not product.wholesale_price:
-                raise serializers.ValidationError(
-                    f"Le produit {product.name} n'a pas de prix de gros défini."
-                )
-            if not data.get('unit_price'):
-                data['unit_price'] = (
-                    product.wholesale_price or product.selling_price
-                    if price_type == 'gros'
-                    else product.selling_price
-                )
+        # ✅ Validation prix de gros
+        if not variant and product and price_type == 'gros' and not product.wholesale_price:
+            raise serializers.ValidationError(
+                f"Le produit {product.name} n'a pas de prix de gros défini."
+            )
+
+        # ✅ Prix par défaut selon variante/produit + type de prix
+        if not data.get('unit_price'):
+            if variant:
+                if price_type == 'gros' and variant.effective_wholesale_price:
+                    data['unit_price'] = variant.effective_wholesale_price
+                else:
+                    data['unit_price'] = variant.effective_selling_price
+            elif product:
+                if price_type == 'gros':
+                    data['unit_price'] = (
+                        product.wholesale_price or product.selling_price)
+                else:
+                    data['unit_price'] = product.selling_price
         return data
 
 
 # ============================================================
-# VENTE
+# VENTE — LIST
 # ============================================================
 
 class VenteListSerializer(serializers.ModelSerializer):
-    """
-    ✅ Anti-N+1 :
-    - `has_facture` : utilise l'annotation `has_invoice_annotated`
-      OU le prefetch `invoices`. Aucune requête.
-    - `from_devis` : utilise le prefetch `devis_source`.
-    - `client_name` : select_related côté vue.
-    - `warehouse_name` : select_related côté vue.
-    """
     client_name = serializers.CharField(source='client.name', read_only=True)
     status_display = serializers.CharField(
         source='get_status_display', read_only=True)
@@ -446,14 +543,11 @@ class VenteListSerializer(serializers.ModelSerializer):
         return obj.devis_source.filter(status='converted').exists()
 
 
+# ============================================================
+# VENTE — DETAIL
+# ============================================================
+
 class VenteDetailSerializer(serializers.ModelSerializer):
-    """
-    ✅ Anti-N+1 :
-    - `payments` : prefetch `invoices__paiements__...`
-    - `factures` : prefetch `invoices`
-    - `client_*` : select_related('client')
-    - `from_devis` : prefetch `devis_source`
-    """
     client_name = serializers.CharField(source='client.name', read_only=True)
     client_phone = serializers.CharField(source='client.phone', read_only=True)
     client_email = serializers.CharField(source='client.email', read_only=True)
@@ -531,11 +625,11 @@ class VenteDetailSerializer(serializers.ModelSerializer):
         return obj.devis_source.filter(status='converted').exists()
 
 
+# ============================================================
+# VENTE — CREATE
+# ============================================================
+
 class VenteCreateSerializer(serializers.ModelSerializer):
-    """
-    ✅ FIX : calcule le total de chaque ligne AVANT bulk_create.
-    (bulk_create ne passe PAS par LigneVente.save() qui calcule normalement total.)
-    """
     lines = LigneVenteCreateSerializer(many=True)
 
     class Meta:
@@ -556,14 +650,18 @@ class VenteCreateSerializer(serializers.ModelSerializer):
     def validate_lines(self, value):
         if not value:
             raise serializers.ValidationError("Au moins un produit est requis")
-        product_ids = []
+        # ✅ Clé unique = (product_id, variant_id)
+        keys = []
         for line in value:
             pid = line.get('product')
-            if pid:
-                product_ids.append(pid.id if hasattr(pid, 'id') else pid)
-        if len(product_ids) != len(set(product_ids)):
+            pid = pid.id if hasattr(pid, 'id') else pid
+            vid = line.get('variant')
+            vid = vid.id if hasattr(vid, 'id') else line.get('variant_id')
+            keys.append((pid, vid))
+        if len(keys) != len(set(keys)):
             raise serializers.ValidationError(
-                "Un produit ne peut apparaître qu'une seule fois dans la vente.")
+                "Chaque combinaison (produit, variante) doit être unique dans la vente."
+            )
         return value
 
     def validate_warehouse(self, value):
@@ -602,7 +700,6 @@ class VenteCreateSerializer(serializers.ModelSerializer):
             **validated_data
         )
 
-        # ✅ FIX : calculer total AVANT bulk_create
         lignes_to_create = []
         for line_data in lines_data:
             line_total = _compute_line_total(
@@ -610,13 +707,15 @@ class VenteCreateSerializer(serializers.ModelSerializer):
                 line_data.get('unit_price'),
                 line_data.get('discount'),
             )
-            # Retirer 'price_type' (write_only, non stocké)
-            data = {k: v for k, v in line_data.items() if k != 'price_type'}
+            # ✅ Retirer les champs write_only non stockés
+            data = {k: v for k, v in line_data.items()
+                    if k not in ('price_type', 'variant_id')}
+            # data contient déjà 'variant' si fourni
 
             lignes_to_create.append(
                 LigneVente(
                     sale=vente,
-                    total=line_total,   # ✅ total calculé
+                    total=line_total,
                     **data
                 )
             )
@@ -630,10 +729,11 @@ class VenteCreateSerializer(serializers.ModelSerializer):
         return vente
 
 
+# ============================================================
+# VENTE — UPDATE
+# ============================================================
+
 class VenteUpdateSerializer(serializers.ModelSerializer):
-    """
-    ✅ FIX : calcule le total de chaque ligne AVANT bulk_create.
-    """
     lines = LigneVenteCreateSerializer(many=True, required=False)
 
     class Meta:
@@ -650,14 +750,16 @@ class VenteUpdateSerializer(serializers.ModelSerializer):
             return value
         if not value:
             raise serializers.ValidationError("Au moins un produit est requis")
-        product_ids = []
+        keys = []
         for line in value:
             pid = line.get('product')
-            if pid:
-                product_ids.append(pid.id if hasattr(pid, 'id') else pid)
-        if len(product_ids) != len(set(product_ids)):
+            pid = pid.id if hasattr(pid, 'id') else pid
+            vid = line.get('variant')
+            vid = vid.id if hasattr(vid, 'id') else line.get('variant_id')
+            keys.append((pid, vid))
+        if len(keys) != len(set(keys)):
             raise serializers.ValidationError(
-                "Un produit ne peut apparaître qu'une seule fois dans la vente.")
+                "Chaque combinaison (produit, variante) doit être unique.")
         return value
 
     @transaction.atomic
@@ -671,7 +773,6 @@ class VenteUpdateSerializer(serializers.ModelSerializer):
         if lines_data is not None:
             instance.lines.all().delete()
 
-            # ✅ FIX : calculer total AVANT bulk_create
             lignes_to_create = []
             for line_data in lines_data:
                 line_total = _compute_line_total(
@@ -679,13 +780,13 @@ class VenteUpdateSerializer(serializers.ModelSerializer):
                     line_data.get('unit_price'),
                     line_data.get('discount'),
                 )
-                data = {k: v for k, v in line_data.items() if k !=
-                        'price_type'}
+                data = {k: v for k, v in line_data.items()
+                        if k not in ('price_type', 'variant_id')}
 
                 lignes_to_create.append(
                     LigneVente(
                         sale=instance,
-                        total=line_total,   # ✅ total calculé
+                        total=line_total,
                         **data
                     )
                 )
@@ -717,13 +818,6 @@ class VenteStatusUpdateSerializer(serializers.Serializer):
 # ============================================================
 
 class FactureSerializer(serializers.ModelSerializer):
-    """
-    ✅ Anti-N+1 :
-    - `paiements` : prefetch('paiements__...') côté vue
-    - `client_name` : select_related('client')
-    - `sale_number` : select_related('sale')
-    - `remaining_amount` : ReadOnlyField (déjà calculé)
-    """
     client_name = serializers.CharField(source='client.name', read_only=True)
     sale_number = serializers.CharField(
         source='sale.invoice_number', read_only=True)
@@ -824,11 +918,6 @@ class FactureCreateSerializer(serializers.ModelSerializer):
 # ============================================================
 
 class PaiementSerializer(serializers.ModelSerializer):
-    """
-    ✅ Anti-N+1 :
-    - select_related('facture__client', 'caisse_destination',
-      'compte_destination', 'received_by') côté vue
-    """
     method_display = serializers.CharField(
         source='get_method_display', read_only=True)
     received_by_name = serializers.CharField(
@@ -979,20 +1068,35 @@ class LigneAvoirSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source="product.name", read_only=True)
     product_code = serializers.CharField(source="product.code", read_only=True)
 
+    # ✅ AJOUT
+    variant = serializers.IntegerField(source='variant_id', read_only=True)
+    variant_sku = serializers.CharField(source='variant.sku', read_only=True)
+    variant_label = serializers.CharField(source='variant.label', read_only=True)
+
     class Meta:
         model = LigneAvoir
         fields = [
             "id", "product", "product_name", "product_code",
+            "variant", "variant_sku", "variant_label",   # ✅ AJOUT
             "ligne_vente", "quantity", "unit_price",
             "discount", "total", "notes",
         ]
 
 
 class LigneAvoirCreateSerializer(serializers.ModelSerializer):
+    # ✅ AJOUT
+    variant = serializers.PrimaryKeyRelatedField(
+        queryset=ProductVariant.objects.all(),
+        required=False, allow_null=True, write_only=True
+    )
+    variant_id = serializers.IntegerField(
+        required=False, allow_null=True, write_only=True
+    )
+
     class Meta:
         model = LigneAvoir
         fields = [
-            "product", "ligne_vente",
+            "product", "variant", "variant_id", "ligne_vente",   # ✅ AJOUT
             "quantity", "unit_price", "discount", "notes",
         ]
 
@@ -1000,6 +1104,10 @@ class LigneAvoirCreateSerializer(serializers.ModelSerializer):
         if value <= 0:
             raise serializers.ValidationError("La quantité doit être > 0")
         return value
+
+    def validate(self, data):
+        _resolve_variant(data)
+        return data
 
 
 class AvoirSerializer(serializers.ModelSerializer):
@@ -1033,12 +1141,6 @@ class AvoirSerializer(serializers.ModelSerializer):
 
 
 class AvoirCreateSerializer(serializers.ModelSerializer):
-    """
-    ✅ Anti-N+1 dans `validate` :
-    - 1 requête pour toutes les lignes de la vente
-    - 1 requête pour tous les retours cumulés
-    ✅ FIX : total LigneAvoir calculé AVANT bulk_create.
-    """
     lignes = LigneAvoirCreateSerializer(many=True, required=False)
     restore_stock = serializers.BooleanField(
         default=False, write_only=True, required=False
@@ -1081,19 +1183,25 @@ class AvoirCreateSerializer(serializers.ModelSerializer):
             })
 
         if lignes and sale:
-            product_ids = [l["product"].id for l in lignes]
-            if len(product_ids) != len(set(product_ids)):
+            # ✅ Clé unique = (product, variant)
+            keys = []
+            for l in lignes:
+                pid = l["product"].id
+                vid = l.get("variant")
+                vid = vid.id if hasattr(vid, 'id') else l.get("variant_id")
+                keys.append((pid, vid))
+
+            if len(keys) != len(set(keys)):
                 raise serializers.ValidationError({
-                    "lignes": "Un produit ne peut apparaître qu'une seule fois"
+                    "lignes": "Chaque combinaison (produit, variante) doit être unique."
                 })
 
-            # ✅ 1 SEULE requête : toutes les lignes de la vente
-            vente_lignes_map = {
-                vl.product_id: vl
-                for vl in sale.lines.select_related('product').all()
-            }
+            # ✅ Map : (product_id, variant_id) → vente_ligne
+            vente_lignes_map = {}
+            for vl in sale.lines.select_related('product').all():
+                vente_lignes_map[(vl.product_id, vl.variant_id)] = vl
 
-            # ✅ 1 SEULE requête : tous les retours cumulés
+            # ✅ Retours cumulés par ligne
             ligne_vente_ids = [vl.id for vl in vente_lignes_map.values()]
             deja_map = {}
             if ligne_vente_ids:
@@ -1109,18 +1217,30 @@ class AvoirCreateSerializer(serializers.ModelSerializer):
             for l in lignes:
                 product = l["product"]
                 qty = l["quantity"]
-                vente_ligne = vente_lignes_map.get(product.id)
+                variant = l.get("variant")
+                vid = variant.id if hasattr(variant, 'id') else l.get("variant_id")
 
+                label = product.name
+                if vid:
+                    try:
+                        v = ProductVariant.objects.get(id=vid)
+                        label += f" [{v.sku}]"
+                    except ProductVariant.DoesNotExist:
+                        raise serializers.ValidationError({
+                            "lignes": f"Variante {vid} introuvable."
+                        })
+
+                vente_ligne = vente_lignes_map.get((product.id, vid))
                 if not vente_ligne:
                     raise serializers.ValidationError({
-                        "lignes": f"{product.name} n'est pas dans la vente"
+                        "lignes": f"{label} n'est pas dans la vente"
                     })
 
                 if qty > vente_ligne.quantity:
                     raise serializers.ValidationError({
                         "lignes": (
                             f"Quantité ({qty}) > vendue "
-                            f"({vente_ligne.quantity}) pour {product.name}"
+                            f"({vente_ligne.quantity}) pour {label}"
                         )
                     })
 
@@ -1129,7 +1249,7 @@ class AvoirCreateSerializer(serializers.ModelSerializer):
                     raise serializers.ValidationError({
                         "lignes": (
                             f"Retours cumulés ({deja + qty}) > vendue "
-                            f"({vente_ligne.quantity}) pour {product.name}"
+                            f"({vente_ligne.quantity}) pour {label}"
                         )
                     })
 
@@ -1150,7 +1270,6 @@ class AvoirCreateSerializer(serializers.ModelSerializer):
 
         avoir = Avoir.objects.create(**validated_data)
 
-        # ✅ FIX : calculer total AVANT bulk_create
         lignes_to_create = []
         for ligne_data in lignes_data:
             ligne_total = _compute_line_total(
@@ -1158,11 +1277,13 @@ class AvoirCreateSerializer(serializers.ModelSerializer):
                 ligne_data.get("unit_price"),
                 ligne_data.get("discount"),
             )
+            # ✅ Retirer variant_id (write_only)
+            data = {k: v for k, v in ligne_data.items() if k != "variant_id"}
             lignes_to_create.append(
                 LigneAvoir(
                     avoir=avoir,
-                    total=ligne_total,   # ✅ total calculé
-                    **{k: v for k, v in ligne_data.items() if k != "total"}
+                    total=ligne_total,
+                    **data
                 )
             )
 
@@ -1240,6 +1361,7 @@ class SalesTrendSerializer(serializers.Serializer):
 class TopProductsSerializer(serializers.Serializer):
     product_id = serializers.IntegerField()
     product_name = serializers.CharField()
+    variant_sku = serializers.CharField(required=False, allow_null=True)   # ✅
     quantity_sold = serializers.IntegerField()
     total_amount = serializers.DecimalField(max_digits=15, decimal_places=2)
 
@@ -1380,12 +1502,19 @@ class ClientStockLigneSerializer(serializers.ModelSerializer):
     product_code = serializers.CharField(source='product.code', read_only=True)
     product_unit = serializers.CharField(
         source='product.unit.symbol', read_only=True, allow_null=True)
+
+    # ✅ AJOUT
+    variant = serializers.IntegerField(source='variant_id', read_only=True)
+    variant_sku = serializers.CharField(source='variant.sku', read_only=True)
+    variant_label = serializers.CharField(source='variant.label', read_only=True)
+
     total_value = serializers.ReadOnlyField()
 
     class Meta:
         model = ClientStockLigne
         fields = [
             'id', 'product', 'product_name', 'product_code', 'product_unit',
+            'variant', 'variant_sku', 'variant_label',   # ✅ AJOUT
             'quantity', 'unit_price', 'total_value', 'notes',
             'created_at', 'updated_at'
         ]
@@ -1400,6 +1529,11 @@ class ClientStockMovementSerializer(serializers.ModelSerializer):
     created_by_name = serializers.SerializerMethodField()
     client_name = serializers.CharField(
         source='client_stock.client.name', read_only=True)
+
+    # ✅ AJOUT
+    variant = serializers.IntegerField(source='variant_id', read_only=True)
+    variant_sku = serializers.CharField(source='variant.sku', read_only=True)
+
     is_incoming = serializers.ReadOnlyField()
     is_outgoing = serializers.ReadOnlyField()
     quantity_signed = serializers.ReadOnlyField()
@@ -1409,6 +1543,7 @@ class ClientStockMovementSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'client_stock', 'client_name',
             'product', 'product_name', 'product_code',
+            'variant', 'variant_sku',   # ✅ AJOUT
             'movement_type', 'movement_type_display',
             'quantity', 'previous_quantity', 'new_quantity',
             'unit_price', 'reference', 'notes',
@@ -1446,6 +1581,7 @@ class ClientStockSerializer(serializers.ModelSerializer):
 class ClientStockDepositSerializer(serializers.Serializer):
     client_id = serializers.IntegerField(required=True)
     product_id = serializers.IntegerField(required=True)
+    variant_id = serializers.IntegerField(required=False, allow_null=True)   # ✅
     quantity = serializers.DecimalField(
         max_digits=12, decimal_places=2, required=True, min_value=Decimal('0.01')
     )
@@ -1464,10 +1600,36 @@ class ClientStockDepositSerializer(serializers.Serializer):
             raise serializers.ValidationError(f"Produit {value} non trouvé")
         return value
 
+    def validate(self, data):
+        # ✅ Cohérence variant ↔ product
+        product_id = data['product_id']
+        variant_id = data.get('variant_id')
+        if variant_id:
+            try:
+                variant = ProductVariant.objects.get(id=variant_id)
+                if variant.product_id != product_id:
+                    raise serializers.ValidationError({
+                        "variant_id": "La variante n'appartient pas à ce produit."
+                    })
+            except ProductVariant.DoesNotExist:
+                raise serializers.ValidationError(
+                    {"variant_id": "Variante non trouvée."})
+        else:
+            try:
+                product = Product.objects.get(id=product_id)
+                if product.has_variants:
+                    raise serializers.ValidationError({
+                        "variant_id": "Ce produit a des variantes, sélectionnez une variante."
+                    })
+            except Product.DoesNotExist:
+                pass
+        return data
+
 
 class ClientStockWithdrawalSerializer(serializers.Serializer):
     client_id = serializers.IntegerField(required=True)
     product_id = serializers.IntegerField(required=True)
+    variant_id = serializers.IntegerField(required=False, allow_null=True)   # ✅
     quantity = serializers.DecimalField(
         max_digits=12, decimal_places=2, required=True, min_value=Decimal('0.01')
     )
@@ -1476,8 +1638,19 @@ class ClientStockWithdrawalSerializer(serializers.Serializer):
     def validate(self, data):
         try:
             stock = ClientStock.objects.get(client_id=data['client_id'])
-            ligne = ClientStockLigne.objects.get(
-                stock=stock, product_id=data['product_id'])
+            variant_id = data.get('variant_id')
+            if variant_id:
+                ligne = ClientStockLigne.objects.get(
+                    stock=stock,
+                    product_id=data['product_id'],
+                    variant_id=variant_id
+                )
+            else:
+                ligne = ClientStockLigne.objects.get(
+                    stock=stock,
+                    product_id=data['product_id'],
+                    variant__isnull=True
+                )
             if ligne.quantity < data['quantity']:
                 raise serializers.ValidationError({
                     'quantity': f"Stock insuffisant. Disponible : {ligne.quantity}"
@@ -1487,7 +1660,7 @@ class ClientStockWithdrawalSerializer(serializers.Serializer):
                 "Ce client n'a pas de stock enregistré")
         except ClientStockLigne.DoesNotExist:
             raise serializers.ValidationError(
-                "Ce produit n'est pas dans le stock du client")
+                "Ce produit/variante n'est pas dans le stock du client")
         return data
 
 
@@ -1501,11 +1674,17 @@ class ClientDeliveryLigneSerializer(serializers.ModelSerializer):
     product_unit = serializers.CharField(
         source='product.unit.symbol', read_only=True, allow_null=True)
 
+    # ✅ AJOUT
+    variant = serializers.IntegerField(source='variant_id', read_only=True)
+    variant_sku = serializers.CharField(source='variant.sku', read_only=True)
+    variant_label = serializers.CharField(source='variant.label', read_only=True)
+
     class Meta:
         model = ClientDeliveryLigne
         fields = [
             'id',
             'product', 'product_name', 'product_code', 'product_unit',
+            'variant', 'variant_sku', 'variant_label',   # ✅ AJOUT
             'client_stock_ligne',
             'quantity', 'unit_price', 'total_value',
             'quantity_before', 'quantity_after',
@@ -1517,9 +1696,21 @@ class ClientDeliveryLigneSerializer(serializers.ModelSerializer):
 
 
 class ClientDeliveryLigneCreateSerializer(serializers.ModelSerializer):
+    # ✅ AJOUT
+    variant = serializers.PrimaryKeyRelatedField(
+        queryset=ProductVariant.objects.all(),
+        required=False, allow_null=True, write_only=True
+    )
+    variant_id = serializers.IntegerField(
+        required=False, allow_null=True, write_only=True
+    )
+
     class Meta:
         model = ClientDeliveryLigne
-        fields = ['product', 'quantity', 'unit_price', 'notes']
+        fields = [
+            'product', 'variant', 'variant_id',   # ✅ AJOUT
+            'quantity', 'unit_price', 'notes'
+        ]
 
     def validate_quantity(self, value):
         if value is None or value <= 0:
@@ -1532,6 +1723,10 @@ class ClientDeliveryLigneCreateSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 "Le prix unitaire ne peut pas être négatif")
         return value
+
+    def validate(self, data):
+        _resolve_variant(data)
+        return data
 
 
 class ClientDeliverySerializer(serializers.ModelSerializer):
@@ -1643,14 +1838,16 @@ class ClientDeliveryCreateSerializer(serializers.Serializer):
     def validate_lignes(self, value):
         if not value:
             raise serializers.ValidationError("Au moins un produit est requis")
-        product_ids = [
-            ligne['product'].id if hasattr(ligne['product'], 'id')
-            else ligne['product']
-            for ligne in value
-        ]
-        if len(product_ids) != len(set(product_ids)):
+        # ✅ Clé unique = (product, variant)
+        keys = []
+        for ligne in value:
+            pid = ligne['product'].id if hasattr(ligne['product'], 'id') else ligne['product']
+            vid = ligne.get('variant')
+            vid = vid.id if hasattr(vid, 'id') else ligne.get('variant_id')
+            keys.append((pid, vid))
+        if len(keys) != len(set(keys)):
             raise serializers.ValidationError(
-                "Un produit ne peut apparaître qu'une seule fois.")
+                "Chaque combinaison (produit, variante) doit être unique.")
         return value
 
 
@@ -1671,15 +1868,28 @@ class ClientDeliveryStatusUpdateSerializer(serializers.Serializer):
 # ============================================================
 
 class ClientDeliveryLigneRequestSerializer(serializers.ModelSerializer):
+    # ✅ AJOUT
+    variant = serializers.PrimaryKeyRelatedField(
+        queryset=ProductVariant.objects.all(),
+        required=False, allow_null=True, write_only=True
+    )
+    variant_id = serializers.IntegerField(
+        required=False, allow_null=True, write_only=True
+    )
+
     class Meta:
         model = ClientDeliveryLigne
-        fields = ['product', 'quantity', 'notes']
+        fields = ['product', 'variant', 'variant_id', 'quantity', 'notes']
 
     def validate_quantity(self, value):
         if value is None or value <= 0:
             raise serializers.ValidationError(
                 "La quantité doit être supérieure à 0")
         return value
+
+    def validate(self, data):
+        _resolve_variant(data)
+        return data
 
 
 class ClientDeliveryRequestCreateSerializer(serializers.Serializer):
@@ -1704,14 +1914,15 @@ class ClientDeliveryRequestCreateSerializer(serializers.Serializer):
     def validate_lignes(self, value):
         if not value:
             raise serializers.ValidationError("Au moins un produit est requis")
-        product_ids = [
-            ligne['product'].id if hasattr(ligne['product'], 'id')
-            else ligne['product']
-            for ligne in value
-        ]
-        if len(product_ids) != len(set(product_ids)):
+        keys = []
+        for ligne in value:
+            pid = ligne['product'].id if hasattr(ligne['product'], 'id') else ligne['product']
+            vid = ligne.get('variant')
+            vid = vid.id if hasattr(vid, 'id') else ligne.get('variant_id')
+            keys.append((pid, vid))
+        if len(keys) != len(set(keys)):
             raise serializers.ValidationError(
-                "Un produit ne peut apparaître qu'une seule fois.")
+                "Chaque combinaison (produit, variante) doit être unique.")
         return value
 
 
